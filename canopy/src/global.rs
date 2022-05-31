@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc;
 
-use crate::{event::Event, poll::Poller, KeyMap};
+use crate::{event::Event, poll::Poller, KeyMap, Node};
 
 pub(crate) struct GlobalState {
     /// A counter that is incremented every time focus changes. The current focus
@@ -25,10 +25,11 @@ pub(crate) struct GlobalState {
 
     pub event_tx: mpsc::Sender<Event>,
     pub event_rx: Option<mpsc::Receiver<Event>>,
+    pub root: Box<dyn Node>,
 }
 
 impl GlobalState {
-    fn new() -> Self {
+    fn new(root: Box<dyn Node>) -> Self {
         let (tx, rx) = mpsc::channel();
         GlobalState {
             focus_gen: 1,
@@ -39,12 +40,20 @@ impl GlobalState {
             event_tx: tx,
             event_rx: Some(rx),
             keymap: KeyMap::new(),
+            root,
         }
     }
 }
 
 thread_local! {
-    static STATE: RefCell<Option<GlobalState>> = RefCell::new(Some(GlobalState::new()));
+    static STATE: RefCell<Option<GlobalState>> = RefCell::new(None);
+}
+
+pub(crate) fn init(r: Box<dyn Node>) {
+    STATE.with(move |x| {
+        let mut f = x.borrow_mut();
+        *f = Some(GlobalState::new(r));
+    });
 }
 
 /// Operate on the global state. This function will panic if state is uninitialized.
