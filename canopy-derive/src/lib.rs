@@ -47,6 +47,7 @@ impl quote::ToTokens for ReturnTypes {
 
 #[derive(Debug)]
 struct Command {
+    node: String,
     command: String,
     docs: String,
     ret: ReturnTypes,
@@ -64,9 +65,32 @@ impl Command {
             }
         }
     }
+
+    fn py_method_ident(&self) -> syn::Ident {
+        syn::Ident::new(&self.py_method_name(), proc_macro2::Span::call_site())
+    }
+
+    /// The Python function name for this command
+    fn py_method_name(&self) -> String {
+        format!("py_{}_{}", self.node, self.command)
+    }
+
+    /// Generate the Python method stub for a command invocation
+    fn py_method(&self) -> proc_macro2::TokenStream {
+        let ident = syn::Ident::new(&self.py_method_name(), proc_macro2::Span::call_site());
+        let cmd = self.command.clone();
+        let q = quote! {
+            #[pyo3::pyfunction]
+            #[pyo3(name = #cmd)]
+            fn #ident() {
+                println!(#cmd)
+            }
+        };
+        q.into()
+    }
 }
 
-fn parse_command_method(method: &syn::ImplItemMethod) -> Option<Command> {
+fn parse_command_method(node_name: &str, method: &syn::ImplItemMethod) -> Option<Command> {
     let mut is_command = false;
     let mut docs = vec![];
 
@@ -91,6 +115,7 @@ fn parse_command_method(method: &syn::ImplItemMethod) -> Option<Command> {
     }
     if is_command {
         Some(Command {
+            node: node_name.to_string(),
             command: method.sig.ident.to_string(),
             docs: docs.join("\n"),
             ret,
@@ -125,7 +150,7 @@ pub fn derive_commands(
     let mut commands = vec![];
     for i in input.items {
         if let syn::ImplItem::Method(m) = i {
-            if let Some(command) = parse_command_method(&m) {
+            if let Some(command) = parse_command_method(&default_node_name, &m) {
                 commands.push(command);
             }
         }
@@ -136,7 +161,15 @@ pub fn derive_commands(
     let rets: Vec<ReturnTypes> = commands.iter().map(|x| x.ret).collect();
     let invoke: Vec<proc_macro2::TokenStream> = commands.iter().map(|x| x.invocation()).collect();
 
+    let py_methods: Vec<proc_macro2::TokenStream> =
+        commands.iter().map(|x| x.py_method()).collect();
+
+    let py_method_names: Vec<String> = commands.iter().map(|x| x.py_method_name()).collect();
+    let py_method_idents: Vec<syn::Ident> = commands.iter().map(|x| x.py_method_ident()).collect();
+
     let expanded = quote! {
+        #(#py_methods)*
+
         impl #impl_generics canopy::commands::CommandNode for #name #where_clause {
             fn default_commands() -> Vec<canopy::commands::CommandDefinition> {
                 vec![#(canopy::commands::CommandDefinition {
@@ -169,12 +202,20 @@ pub fn derive_commands(
                 };
                 Ok(())
             }
+            fn py_module(py: pyo3::Python<'_>) -> canopy::Result<&pyo3::types::PyModule> {
+                let m = pyo3::types::PyModule::new(py, "foo").map_err(|e| canopy::Error::Python(e.to_string()))?;
+                #(
+                    m.add_function(pyo3::wrap_pyfunction!(#py_method_idents, m).unwrap()).unwrap();
+                )*
+                Ok(m)
+            }
         }
     };
     let out = quote! {
         #orig
         #expanded
     };
+    println!("{}", out.to_string());
     out.into()
 }
 

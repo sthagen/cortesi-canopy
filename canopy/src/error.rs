@@ -1,3 +1,4 @@
+use pyo3;
 use std::{
     fmt::Display,
     sync::{mpsc, MutexGuard, PoisonError},
@@ -41,6 +42,9 @@ pub enum Error {
 
     #[error("script run error")]
     Script(String),
+
+    #[error("python script run error")]
+    Python(String),
 
     /// No result was generated on node traversal
     #[error("no result")]

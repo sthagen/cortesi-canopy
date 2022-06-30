@@ -61,14 +61,21 @@ pub(crate) struct ScriptHost {
     engine: rhai::Engine,
     scripts: HashMap<ScriptId, Script>,
     current_id: u64,
+    py_modules: pyo3::Py<pyo3::types::PyDict>,
 }
 
 impl ScriptHost {
     pub fn new() -> Self {
+        let py_modules = pyo3::Python::with_gil(|py| {
+            let dict: pyo3::Py<pyo3::types::PyDict> = pyo3::types::PyDict::new(py).into();
+            dict
+        });
+
         ScriptHost {
             engine: rhai::Engine::new(),
             scripts: HashMap::new(),
             current_id: 0,
+            py_modules,
         }
     }
 

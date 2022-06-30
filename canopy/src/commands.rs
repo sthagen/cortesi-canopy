@@ -1,3 +1,4 @@
+use pyo3;
 use std::collections::HashMap;
 
 use crate::{postorder, preorder, Core, Error, Node, NodeId, NodeName, Result, StatefulNode, Walk};
@@ -60,6 +61,11 @@ pub trait CommandNode: StatefulNode {
 
     /// Dispatch a command to this node.
     fn dispatch(&mut self, c: &mut dyn Core, cmd: &CommandInvocation) -> Result<()>;
+
+    /// Dispatch a command to this node.
+    fn py_module(py: pyo3::Python<'_>) -> Result<&pyo3::types::PyModule>
+    where
+        Self: Sized;
 }
 
 /// Dispatch a command relative to a node. This searches the node tree for a

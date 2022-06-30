@@ -16,3 +16,4 @@ litrs = "0.2.3"
 
 [dev-dependencies]
 canopy = { path = "../canopy" }
+pyo3 = "0.16.5"
