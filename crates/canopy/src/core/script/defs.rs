@@ -12,12 +12,16 @@ use crate::{
 /// Static Luau preamble shared by every canopy app.
 const PREAMBLE: &str = include_str!("../../../luau/preamble.d.luau");
 
-/// Render the complete Luau definition file for the current command set.
-pub fn render_definitions(
+/// Return the static Luau preamble declaring the base canopy API surface.
+pub(crate) fn preamble() -> &'static str {
+    PREAMBLE
+}
+
+/// Group node-dispatched command specs by owner, including default-binding owners.
+pub(crate) fn owner_command_specs(
     commands: &CommandSet,
     default_binding_owners: &BTreeSet<String>,
-    fixtures: &[FixtureInfo],
-) -> String {
+) -> BTreeMap<String, Vec<&'static CommandSpec>> {
     let mut owners: BTreeMap<String, Vec<&'static CommandSpec>> = BTreeMap::new();
     for (_, spec) in commands.iter() {
         let CommandDispatchKind::Node { owner } = spec.dispatch else {
@@ -28,6 +32,66 @@ pub fn render_definitions(
     for owner in default_binding_owners {
         owners.entry(owner.clone()).or_default();
     }
+    for specs in owners.values_mut() {
+        specs.sort_by_key(|spec| spec.id.0);
+    }
+    owners
+}
+
+/// Render one owner's `declare` block for its sorted command specs.
+pub(crate) fn render_owner_declaration(
+    owner: &str,
+    specs: &[&'static CommandSpec],
+    has_default_bindings: bool,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("--- Commands for widget \"{owner}\"\n"));
+    output.push_str(&format!("declare {}: {{\n", luau_global_owner_name(owner)));
+
+    for spec in specs {
+        if let Some(short) = spec.doc.short {
+            output.push_str(&format!("    --- {short}\n"));
+        }
+        if let Some(long) = spec.doc.long {
+            for line in long.lines().filter(|line| !line.trim().is_empty()) {
+                if spec.doc.short.is_some_and(|short| short == line.trim()) {
+                    continue;
+                }
+                output.push_str(&format!("    --- {}\n", line.trim()));
+            }
+        }
+        for param in spec
+            .params
+            .iter()
+            .filter(|param| param.kind == CommandParamKind::User)
+        {
+            if let Some(doc) = param.doc {
+                output.push_str(&format!("    --- @param {} {doc}\n", param.name));
+            }
+        }
+        output.push_str("    ");
+        output.push_str(spec.name);
+        output.push_str(": ");
+        output.push_str(&render_function_type(spec));
+        output.push_str(",\n");
+    }
+
+    if has_default_bindings {
+        output.push_str("    --- Register this widget's default bindings.\n");
+        output.push_str("    default_bindings: () -> (),\n");
+    }
+
+    output.push_str("}\n");
+    output
+}
+
+/// Render the complete Luau definition file for the current command set.
+pub fn render_definitions(
+    commands: &CommandSet,
+    default_binding_owners: &BTreeSet<String>,
+    fixtures: &[FixtureInfo],
+) -> String {
+    let owners = owner_command_specs(commands, default_binding_owners);
 
     let mut output = String::from(PREAMBLE);
     if !output.ends_with('\n') {
@@ -44,45 +108,11 @@ pub fn render_definitions(
 
     for (owner, specs) in owners {
         output.push('\n');
-        output.push_str(&format!("--- Commands for widget \"{owner}\"\n"));
-        output.push_str(&format!("declare {}: {{\n", luau_global_owner_name(&owner)));
-
-        let mut specs = specs;
-        specs.sort_by_key(|spec| spec.id.0);
-        for spec in specs {
-            if let Some(short) = spec.doc.short {
-                output.push_str(&format!("    --- {short}\n"));
-            }
-            if let Some(long) = spec.doc.long {
-                for line in long.lines().filter(|line| !line.trim().is_empty()) {
-                    if spec.doc.short.is_some_and(|short| short == line.trim()) {
-                        continue;
-                    }
-                    output.push_str(&format!("    --- {}\n", line.trim()));
-                }
-            }
-            for param in spec
-                .params
-                .iter()
-                .filter(|param| param.kind == CommandParamKind::User)
-            {
-                if let Some(doc) = param.doc {
-                    output.push_str(&format!("    --- @param {} {doc}\n", param.name));
-                }
-            }
-            output.push_str("    ");
-            output.push_str(spec.name);
-            output.push_str(": ");
-            output.push_str(&render_function_type(spec));
-            output.push_str(",\n");
-        }
-
-        if default_binding_owners.contains(&owner) {
-            output.push_str("    --- Register this widget's default bindings.\n");
-            output.push_str("    default_bindings: () -> (),\n");
-        }
-
-        output.push_str("}\n");
+        output.push_str(&render_owner_declaration(
+            &owner,
+            &specs,
+            default_binding_owners.contains(&owner),
+        ));
     }
 
     output

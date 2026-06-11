@@ -108,27 +108,38 @@ MCP evaluation returns:
 
 ## Typechecking
 
-`Canopy::check_script(source)` always exists. It finalizes the API if needed and
-returns a `ScriptCheckResult`.
+`Canopy::check_script(source)` checks Luau source against the finalized canopy API
+using the oxau type checker and returns a `ScriptCheckResult`. Checking is available
+unconditionally on every build target.
 
-When Luau typechecking is available, diagnostics use source-bound `error` or
-`warning` severities. Error diagnostics fail MCP evaluation before execution.
-
-When typechecking is unavailable for the build target, `check_script` returns one
-`unavailable` diagnostic at line and column `0`. That diagnostic is informational and
-does not fail evaluation.
+Diagnostics use source-bound `error` or `warning` severities. Error diagnostics fail
+MCP evaluation before execution.
 
 Debug builds typecheck scripts before compiling them after API finalization. Release
 builds skip that enforcement.
 
+## The VM, sandboxing, and limits
+
+Scripts run on the oxau Luau VM, a pure-Rust implementation. The VM is built once at
+API finalization from a validated surface: the static preamble plus per-owner command
+declarations are audited against the host functions actually registered, so the typed
+surface and the runtime surface cannot drift apart. The VM is sandboxed: globals are
+frozen, and each compiled script runs in its own chunk environment, so global writes
+in one script are not visible to another. Runtime compilation (`loadstring`) and
+`require` are not available.
+
+Every script invocation runs under resource ceilings: a gas (instruction) budget
+bounds runaway loops even without an explicit timeout, and a memory cap bounds
+script allocations. Exhausting either fails the script with a runtime error.
+
 ## Timeouts
 
-MCP timeouts are cooperative. Canopy installs a temporary Luau VM interrupt before
-script execution and removes it afterward. The interrupt fails evaluation once the
-deadline has passed and Luau reaches an interrupt boundary.
+MCP timeouts are wall-clock watchdogs layered per invocation on top of the gas
+budget. The watchdog cancels execution at the next VM safepoint; the failure
+surfaces as a structured `ScriptTimeout` error.
 
 Timeouts do not kill a thread or process. Rust callbacks must return to Luau before
-the deadline can be observed. A long native callback can therefore run past the
+the cancellation can be observed. A long native callback can therefore run past the
 requested timeout. Infinite Luau loops time out with `state = "timed_out"` and
 `error.type = "timeout"`.
 

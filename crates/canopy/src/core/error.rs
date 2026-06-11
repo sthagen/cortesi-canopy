@@ -124,6 +124,13 @@ pub enum Error {
     /// Script execution failure.
     Script(String),
 
+    /// Script execution exceeded its cooperative timeout.
+    #[error("script evaluation exceeded {timeout_ms}ms")]
+    ScriptTimeout {
+        /// Requested timeout in milliseconds.
+        timeout_ms: u64,
+    },
+
     /// No result was generated on node traversal.
     #[error("no result")]
     NoResult,

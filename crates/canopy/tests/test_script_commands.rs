@@ -98,7 +98,7 @@ mod tests {
             assert_eq!(target.value, 99);
         });
 
-        harness.script(r#"script_target.set_optional({ count = 14 })"#)?;
+        harness.script(r#"canopy.cmd("script_target::set_optional", { count = 14 })"#)?;
         harness.with_root_widget::<ScriptTarget, _>(|target| {
             assert_eq!(target.value, 14);
         });

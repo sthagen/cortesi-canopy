@@ -3,8 +3,6 @@ pub mod key;
 /// Mouse event types.
 pub mod mouse;
 
-use std::sync::mpsc;
-
 use crate::{NodeId, geom::Size};
 
 /// This enum represents all the event types that drive the application.
@@ -23,29 +21,7 @@ pub enum Event {
     /// Terminal has lost focus
     FocusLost,
     /// Cut and paste
-    #[allow(dead_code)]
     Paste(String),
     /// Internal wake event used to service queued automation work.
     Wake,
-}
-
-/// An emitter that is polled by the application to retrieve events.
-#[allow(dead_code)]
-pub(crate) struct EventSource {
-    /// Event receiver channel.
-    rx: mpsc::Receiver<Event>,
-}
-
-#[allow(dead_code)]
-impl EventSource {
-    /// Construct a new event source.
-    pub fn new(rx: mpsc::Receiver<Event>) -> Self {
-        Self { rx }
-    }
-
-    /// Retrieve the next event, blocking until an event is received or the
-    /// underlying channel closes.
-    pub fn next(&self) -> Result<Event, mpsc::RecvError> {
-        self.rx.recv()
-    }
 }

@@ -16,6 +16,13 @@ use crate::{
     script::{AppEvaluator, AppFactory, ScriptEvalRequest, app_factory, evaluate_live},
 };
 
+/// Build an MCP tool result with structured and text JSON payloads.
+fn json_tool_result(value: &serde_json::Value) -> CallToolResult {
+    CallToolResult::new()
+        .with_structured_content(value.clone())
+        .with_text_content(value.to_string())
+}
+
 /// Minimal stdio MCP server for canopy automation.
 #[derive(Clone)]
 struct CanopyMcpServer {
@@ -54,10 +61,7 @@ impl CanopyMcpServer {
     #[tool]
     /// Evaluate a Luau script against a fresh headless canopy app instance.
     async fn script_eval(&self, params: ScriptEvalRequest) -> ToolResult<CallToolResult> {
-        Ok(self
-            .evaluator
-            .evaluate_with_timeout(&params)
-            .to_tool_result())
+        Ok(self.evaluator.evaluate(&params).to_tool_result())
     }
 
     #[tool]
@@ -79,9 +83,7 @@ impl CanopyMcpServer {
             .map_err(|error| ToolError::internal(error.to_string()))?;
         let value = serde_json::to_value(fixtures)
             .map_err(|error| ToolError::internal(error.to_string()))?;
-        Ok(CallToolResult::new()
-            .with_structured_content(value.clone())
-            .with_text_content(value.to_string()))
+        Ok(json_tool_result(&value))
     }
 }
 
@@ -118,9 +120,7 @@ impl LiveCanopyMcpServer {
                 .map_err(|error| ToolError::internal(error.to_string()))?;
         let value = serde_json::to_value(fixtures)
             .map_err(|error| ToolError::internal(error.to_string()))?;
-        Ok(CallToolResult::new()
-            .with_structured_content(value.clone())
-            .with_text_content(value.to_string()))
+        Ok(json_tool_result(&value))
     }
 
     #[tool]
@@ -137,9 +137,7 @@ impl LiveCanopyMcpServer {
         })
         .map_err(|error| ToolError::internal(error.to_string()))?;
         let value = json!({ "applied": applied_name });
-        Ok(CallToolResult::new()
-            .with_structured_content(value.clone())
-            .with_text_content(value.to_string()))
+        Ok(json_tool_result(&value))
     }
 }
 
@@ -255,22 +253,34 @@ pub fn serve_uds(
 #[cfg(test)]
 mod tests {
     use canopy::{
-        ReadContext, command, derive_commands, error::Result as CanopyResult, prelude::*,
+        Fixture, ReadContext, command, derive_commands, error::Result as CanopyResult, prelude::*,
     };
 
     use super::*;
 
-    struct EchoNode;
+    struct EchoNode {
+        value: i32,
+    }
 
     #[derive_commands]
     impl EchoNode {
         fn new() -> Self {
-            Self
+            Self { value: 0 }
         }
 
         #[command]
         fn ping(&self) -> &'static str {
             "pong"
+        }
+
+        #[command]
+        fn set(&mut self, value: i32) {
+            self.value = value;
+        }
+
+        #[command]
+        fn get(&self) -> i32 {
+            self.value
         }
     }
 
@@ -294,6 +304,11 @@ mod tests {
         canopy_mcp_server(app_factory(|| {
             let mut canopy = Canopy::new();
             EchoNode::load(&mut canopy)?;
+            canopy.register_fixture(Fixture::new(
+                "seeded",
+                "Set echo_node to a known value",
+                |canopy| canopy.eval_script("echo_node.set(41)"),
+            ))?;
             canopy.finalize_api()?;
             let root_id = canopy.root_id();
             canopy
@@ -337,6 +352,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn script_eval_applies_headless_fixture() {
+        let result = server()
+            .script_eval(ScriptEvalRequest {
+                script: "return echo_node.get()".to_string(),
+                fixture: Some("seeded".to_string()),
+                timeout_ms: None,
+            })
+            .await
+            .expect("script_eval");
+        let payload = result.structured_content.expect("structured content");
+        assert_eq!(payload["success"], serde_json::Value::Bool(true));
+        assert_eq!(payload["value"], serde_json::Value::from(41));
+    }
+
+    #[tokio::test]
+    async fn fixtures_returns_registered_fixture_metadata() {
+        let result = server().fixtures().await.expect("fixtures");
+        let payload = result.structured_content.expect("structured content");
+        assert_eq!(
+            payload[0]["name"],
+            serde_json::Value::String("seeded".into())
+        );
+        assert_eq!(
+            payload[0]["description"],
+            serde_json::Value::String("Set echo_node to a known value".into())
+        );
+    }
+
+    #[tokio::test]
     async fn script_eval_reports_typecheck_errors() {
         let result = server()
             .script_eval(ScriptEvalRequest {
@@ -352,29 +396,14 @@ mod tests {
             payload["state"],
             serde_json::Value::String("failed".to_string())
         );
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(
-                payload["error"]["type"],
-                serde_json::Value::String("typecheck".to_string())
-            );
-            assert!(
-                payload["diagnostics"]
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-            );
-        }
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(
-                payload["error"]["type"],
-                serde_json::Value::String("runtime".to_string())
-            );
-            assert!(
-                payload["diagnostics"].as_array().is_some_and(|items| items
-                    .iter()
-                    .any(|item| item["severity"] == "unavailable"))
-            );
-        }
+        assert_eq!(
+            payload["error"]["type"],
+            serde_json::Value::String("typecheck".to_string())
+        );
+        assert!(
+            payload["diagnostics"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
     }
 }

@@ -432,7 +432,7 @@ impl Session {
     }
 
     /// Evaluate one Luau script through the session.
-    async fn eval(&mut self, mut request: ScriptEvalRequest) -> Result<ScriptEvalOutcome> {
+    async fn eval(&self, mut request: ScriptEvalRequest) -> Result<ScriptEvalOutcome> {
         if self.kind == SessionKind::Headless && request.fixture.is_none() {
             request.fixture = self.default_fixture.clone();
         }
@@ -443,7 +443,7 @@ impl Session {
     }
 
     /// Request the rendered `.d.luau` API text.
-    async fn api(&mut self) -> Result<String> {
+    async fn api(&self) -> Result<String> {
         let result = self.client.call_tool("script_api", ()).await?;
         result
             .text()
@@ -452,7 +452,7 @@ impl Session {
     }
 
     /// Request the fixture catalog.
-    async fn fixtures(&mut self) -> Result<Vec<FixtureInfo>> {
+    async fn fixtures(&self) -> Result<Vec<FixtureInfo>> {
         Ok(self.client.call_tool_structured("fixtures", ()).await?)
     }
 
@@ -695,7 +695,7 @@ async fn run_command(config: LoadedConfig, args: RunArgs) -> Result<()> {
 /// Execute `canopyctl smoke`.
 async fn smoke_command(config: LoadedConfig, args: SmokeArgs) -> Result<()> {
     let command = config.headless_command(&args.command)?;
-    let mut session = Session::spawn_headless(&command).await?;
+    let session = Session::spawn_headless(&command).await?;
     let suite_dir = config.smoke_suite_dir(args.suite.as_deref());
     let scripts = collect_smoke_scripts(&suite_dir, &args.scripts)?;
     let timeout_ms = config.smoke_timeout_ms(args.timeout_ms);
@@ -755,7 +755,7 @@ fn smoke_test_name(suite_dir: &Path, script_path: &Path) -> String {
 /// Execute `canopyctl fixtures`.
 async fn fixtures_command(config: LoadedConfig, args: SpawnArgs) -> Result<()> {
     let command = config.headless_command(&args.command)?;
-    let mut session = Session::spawn_headless(&command).await?;
+    let session = Session::spawn_headless(&command).await?;
     for fixture in session.fixtures().await? {
         println!("{}\t{}", fixture.name, fixture.description);
     }
@@ -768,7 +768,7 @@ async fn eval_command(config: LoadedConfig, args: EvalArgs) -> Result<()> {
         bail!("pass exactly one of -f/--file or an inline SCRIPT");
     }
     let command = config.headless_command(&args.command)?;
-    let mut session = Session::spawn_headless(&command).await?;
+    let session = Session::spawn_headless(&command).await?;
     let script = read_eval_script(args.file.as_deref(), args.script.as_deref())?;
     let outcome = session
         .eval(ScriptEvalRequest {
@@ -787,7 +787,7 @@ async fn eval_command(config: LoadedConfig, args: EvalArgs) -> Result<()> {
 /// Execute `canopyctl api`.
 async fn api_command(config: LoadedConfig, args: SpawnArgs) -> Result<()> {
     let command = config.headless_command(&args.command)?;
-    let mut session = Session::spawn_headless(&command).await?;
+    let session = Session::spawn_headless(&command).await?;
     print!("{}", session.api().await?);
     Ok(())
 }
