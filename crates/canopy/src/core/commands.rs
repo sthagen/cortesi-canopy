@@ -11,10 +11,14 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use crate::{
-    CommandEnum, Context,
-    core::{Core, NodeId, context::CoreContext},
+    Context, ViewContext,
+    core::{
+        Core, NodeId,
+        context::{CoreContext, CoreViewContext},
+        world::WidgetOperation,
+    },
+    error::Result as CoreResult,
     event::{Event, mouse::MouseEvent},
-    geom::Direction,
 };
 
 /// Canonical dynamic representation for command arguments and return values.
@@ -38,73 +42,6 @@ pub enum ArgValue {
     Array(Vec<Self>),
     /// Map value.
     Map(BTreeMap<String, Self>),
-}
-
-/// Direction for focus movement commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, CommandEnum)]
-pub enum FocusDirection {
-    /// Move to the next focusable node.
-    Next,
-    /// Move to the previous focusable node.
-    Prev,
-    /// Move focus up.
-    Up,
-    /// Move focus down.
-    Down,
-    /// Move focus left.
-    Left,
-    /// Move focus right.
-    Right,
-}
-
-/// Direction for zoom commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, CommandEnum)]
-pub enum ZoomDirection {
-    /// Zoom in.
-    In,
-    /// Zoom out.
-    Out,
-}
-
-impl ToArgValue for Direction {
-    fn to_arg_value(self) -> ArgValue {
-        ArgValue::String(
-            match self {
-                Self::Up => "Up",
-                Self::Down => "Down",
-                Self::Left => "Left",
-                Self::Right => "Right",
-            }
-            .to_string(),
-        )
-    }
-}
-
-impl FromArgValue for Direction {
-    fn from_arg_value(v: &ArgValue) -> Result<Self, CommandError> {
-        if let ArgValue::String(s) = v {
-            if s.eq_ignore_ascii_case("Up") {
-                return Ok(Self::Up);
-            }
-            if s.eq_ignore_ascii_case("Down") {
-                return Ok(Self::Down);
-            }
-            if s.eq_ignore_ascii_case("Left") {
-                return Ok(Self::Left);
-            }
-            if s.eq_ignore_ascii_case("Right") {
-                return Ok(Self::Right);
-            }
-            return Err(CommandError::Conversion {
-                param: "direction".to_string(),
-                message: format!("unknown direction: {}", s),
-            });
-        }
-        Err(CommandError::Conversion {
-            param: "direction".to_string(),
-            message: "expected string for direction".to_string(),
-        })
-    }
 }
 
 impl ArgValue {
@@ -488,12 +425,6 @@ macro_rules! impl_number_command_type {
 
 impl_number_command_type!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
 
-impl CommandType for Direction {
-    fn luau_ty() -> declaration::Type {
-        declaration::Type::literals(["Up", "Down", "Left", "Right"])
-    }
-}
-
 impl<T: CommandType> CommandType for Option<T> {
     fn luau_ty() -> declaration::Type {
         T::luau_ty().optional()
@@ -545,6 +476,8 @@ pub struct DeclRegistry<'a> {
     builder: &'a mut module::Builder,
     /// Names currently being declared during this registration pass.
     seen: HashSet<declaration::Text>,
+    /// Register alias names as external types that another module declares.
+    extern_only: bool,
 }
 
 impl<'a> DeclRegistry<'a> {
@@ -553,6 +486,19 @@ impl<'a> DeclRegistry<'a> {
         Self {
             builder,
             seen: HashSet::new(),
+            extern_only: false,
+        }
+    }
+
+    /// Wrap a builder whose dependent types another module declares.
+    ///
+    /// Every alias registers as an external type name, so the surface has one
+    /// definition of each type.
+    pub(crate) fn extern_module(builder: &'a mut module::Builder) -> Self {
+        Self {
+            builder,
+            seen: HashSet::new(),
+            extern_only: true,
         }
     }
 
@@ -564,9 +510,14 @@ impl<'a> DeclRegistry<'a> {
         self.seen.insert(name.to_string().into())
     }
 
-    /// Registers an alias declaration.
+    /// Registers an alias declaration, or its name as an external type when
+    /// another module declares it.
     pub fn alias(&mut self, alias: declaration::Alias) {
-        self.builder.alias(alias);
+        if self.extern_only {
+            self.builder.extern_ty(alias.name.into_owned());
+        } else {
+            self.builder.alias(alias);
+        }
     }
 
     /// Registers an external type name.
@@ -598,10 +549,12 @@ fn arg_value_to_json(value: &ArgValue, node_json: NodeJson) -> Result<JsonValue,
                     "NodeId is not representable as JSON",
                 ));
             }
-            NodeJson::Token => JsonValue::Object(JsonMap::from_iter([
-                ("type".to_string(), JsonValue::String("NodeId".to_string())),
-                ("token".to_string(), JsonValue::String(format!("{id:?}"))),
-            ])),
+            NodeJson::Token => JsonValue::Object(
+                node_token_fields(*id)
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), JsonValue::String(value)))
+                    .collect(),
+            ),
         },
         ArgValue::Array(values) => JsonValue::Array(
             values
@@ -626,6 +579,19 @@ enum NodeJson {
     Reject,
     /// Render node handles as opaque reporting tokens.
     Token,
+}
+
+/// Render the external automation token for a node handle.
+pub(crate) fn node_token(node_id: NodeId) -> String {
+    format!("{node_id:?}")
+}
+
+/// Build the external automation token record for a node handle.
+pub(crate) fn node_token_fields(node_id: NodeId) -> [(&'static str, String); 2] {
+    [
+        ("type", "NodeId".to_string()),
+        ("token", node_token(node_id)),
+    ]
 }
 
 /// Convert a JSON value into ArgValue for serde interop.
@@ -766,7 +732,7 @@ impl PartialEq for CommandTypeSpec {
 impl Eq for CommandTypeSpec {}
 
 /// Static metadata for a command parameter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct CommandParamSpec {
     /// Parameter name for named argument binding.
     pub name: &'static str,
@@ -776,6 +742,83 @@ pub struct CommandParamSpec {
     pub ty: CommandTypeSpec,
     /// Whether the parameter is optional.
     pub optional: bool,
+    /// Required event context, supplied by the injection type.
+    pub requirement: Option<fn() -> Option<CommandRequirement>>,
+}
+
+impl PartialEq for CommandParamSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.kind == other.kind
+            && self.ty == other.ty
+            && self.optional == other.optional
+            && self.requirement.and_then(|f| f()) == other.requirement.and_then(|f| f())
+    }
+}
+impl Eq for CommandParamSpec {}
+
+/// Event context required by a command parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandRequirement {
+    /// An originating input event.
+    Event,
+    /// An originating mouse event.
+    Mouse,
+    /// An originating list row.
+    ListRow,
+}
+
+impl CommandRequirement {
+    /// Return the stable scripting label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Mouse => "mouse",
+            Self::ListRow => "list_row",
+        }
+    }
+}
+
+/// Current command eligibility, separate from authorization and resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandStatus {
+    /// The action can currently run.
+    Enabled,
+    /// The action cannot run, with a user-facing reason.
+    Disabled(String),
+}
+
+impl CommandStatus {
+    /// Return the stable scripting label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled(_) => "disabled",
+        }
+    }
+}
+
+/// Read-only, erased command eligibility hook.
+pub type StatusFn = fn(&dyn Any, &dyn ViewContext) -> CoreResult<CommandStatus>;
+
+/// Policy for resolving a command owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandTarget {
+    /// Require this exact node to own the command.
+    Exact(NodeId),
+    /// Search this subtree, then its ancestors.
+    From(NodeId),
+    /// Search from the current focus when invoked.
+    Focus,
+}
+
+/// Stored action with an optional explicit target policy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandAction {
+    /// Command and its encoded arguments.
+    pub invocation: CommandInvocation,
+    /// Omission uses the caller's route origin.
+    pub target: Option<CommandTarget>,
 }
 
 /// Static metadata for a command return type.
@@ -794,6 +837,12 @@ pub type InvokeFn = fn(
     inv: &CommandInvocation,
 ) -> Result<ArgValue, CommandError>;
 
+/// Erased argument check signature.
+///
+/// The check applies the arity bounds and parameter conversions of the
+/// command's invoke function. It needs no target, context, or call.
+pub type CheckFn = fn(args: &CommandArgs) -> Result<(), CommandError>;
+
 /// Command dispatch routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandDispatchKind {
@@ -804,6 +853,16 @@ pub enum CommandDispatchKind {
         /// Owner node name.
         owner: &'static str,
     },
+}
+
+impl CommandDispatchKind {
+    /// Return the owner name for node-routed commands.
+    pub fn owner(&self) -> Option<&'static str> {
+        match self {
+            Self::Node { owner } => Some(owner),
+            Self::Free => None,
+        }
+    }
 }
 
 /// Static metadata for a command.
@@ -823,6 +882,10 @@ pub struct CommandSpec {
     pub doc: Option<&'static str>,
     /// Erased invoke entrypoint.
     pub invoke: InvokeFn,
+    /// Erased argument check entrypoint.
+    pub check: CheckFn,
+    /// Optional read-only node eligibility hook.
+    pub status: Option<StatusFn>,
 }
 
 /// Resolution of a command dispatch target.
@@ -830,6 +893,11 @@ pub struct CommandSpec {
 pub enum CommandResolution {
     /// Command is free (no target).
     Free,
+    /// Command targets the specified owner without searching.
+    Exact {
+        /// Target node ID.
+        target: NodeId,
+    },
     /// Command would dispatch to a node in the focus subtree.
     Subtree {
         /// Target node ID.
@@ -843,12 +911,16 @@ pub enum CommandResolution {
 }
 
 /// Command availability from a given focus context.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CommandAvailability<'a> {
     /// Command specification.
     pub spec: &'a CommandSpec,
     /// Resolution if the command has a target, or `None` if no target exists.
     pub resolution: Option<CommandResolution>,
+    /// Eligibility for a resolved command.
+    pub status: Option<CommandStatus>,
+    /// Required context absent at inspection time.
+    pub missing_requirements: Vec<CommandRequirement>,
 }
 
 impl CommandResolution {
@@ -856,7 +928,9 @@ impl CommandResolution {
     pub fn target(self) -> Option<NodeId> {
         match self {
             Self::Free => None,
-            Self::Subtree { target } | Self::Ancestor { target } => Some(target),
+            Self::Exact { target } | Self::Subtree { target } | Self::Ancestor { target } => {
+                Some(target)
+            }
         }
     }
 }
@@ -867,16 +941,43 @@ pub(crate) struct CommandResolver<'a> {
     core: &'a Core,
     /// Starting node for command dispatch.
     start: NodeId,
+    /// Explicit target resolution policy.
+    target: CommandTarget,
 }
 
 impl<'a> CommandResolver<'a> {
-    /// Construct a resolver for commands dispatched from `start`.
-    pub(crate) fn new(core: &'a Core, start: NodeId) -> Self {
-        Self { core, start }
+    /// Construct a resolver for an explicit target policy.
+    pub(crate) fn for_target(core: &'a Core, target: CommandTarget) -> Self {
+        let start = match target {
+            CommandTarget::Exact(node) | CommandTarget::From(node) => node,
+            CommandTarget::Focus => core.focus.unwrap_or(core.root),
+        };
+        Self {
+            core,
+            start,
+            target,
+        }
     }
 
     /// Resolve a command specification to the target dispatch would use.
     pub(crate) fn resolve(&self, spec: &CommandSpec) -> Option<CommandResolution> {
+        if let CommandTarget::Exact(node) = self.target {
+            return match spec.dispatch {
+                CommandDispatchKind::Node { owner }
+                    if self
+                        .core
+                        .nodes
+                        .get(node)
+                        .is_some_and(|node| node.name == owner) =>
+                {
+                    Some(CommandResolution::Exact { target: node })
+                }
+                _ => None,
+            };
+        }
+        if !self.core.nodes.contains_key(self.start) {
+            return None;
+        }
         match spec.dispatch {
             CommandDispatchKind::Free => Some(CommandResolution::Free),
             CommandDispatchKind::Node { owner } => self.resolve_owner(owner),
@@ -913,15 +1014,30 @@ impl<'a> CommandResolver<'a> {
     }
 
     /// Return availability for every registered command.
-    pub(crate) fn availability(&self) -> Vec<CommandAvailability<'a>> {
+    pub(crate) fn availability(&self) -> CoreResult<Vec<CommandAvailability<'a>>> {
         self.core
             .commands
             .iter()
-            .map(|(_, spec)| CommandAvailability {
-                spec,
-                resolution: self.resolve(spec),
-            })
+            .map(|(_, spec)| self.availability_for(spec))
             .collect()
+    }
+
+    /// Inspect one command using the same resolution and eligibility rules.
+    pub(crate) fn availability_for(
+        &self,
+        spec: &'a CommandSpec,
+    ) -> CoreResult<CommandAvailability<'a>> {
+        let resolution = self.resolve(spec);
+        let status = match resolution {
+            Some(resolution) => Some(status_at(self.core, spec, resolution)?),
+            None => None,
+        };
+        Ok(CommandAvailability {
+            spec,
+            resolution,
+            status,
+            missing_requirements: missing_requirements(self.core, spec),
+        })
     }
 }
 
@@ -943,6 +1059,12 @@ impl CommandSpec {
             && self.ret == other.ret
             && self.doc == other.doc
             && ptr::fn_addr_eq(self.invoke, other.invoke)
+            && ptr::fn_addr_eq(self.check, other.check)
+            && match (self.status, other.status) {
+                (Some(a), Some(b)) => ptr::fn_addr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     /// Build a call to this command with no arguments.
@@ -955,6 +1077,7 @@ impl CommandSpec {
         CommandCall {
             spec: self,
             args: args.into(),
+            target: None,
         }
     }
 }
@@ -966,9 +1089,25 @@ pub struct CommandCall {
     spec: &'static CommandSpec,
     /// Argument payload for invocation.
     args: CommandArgs,
+    /// Optional explicit target policy.
+    target: Option<CommandTarget>,
 }
 
 impl CommandCall {
+    /// Bind this call to a target policy.
+    pub fn with_target(mut self, target: CommandTarget) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Preserve both arguments and target when storing an action.
+    pub fn action(self) -> CommandAction {
+        CommandAction {
+            target: self.target,
+            invocation: self.invocation(),
+        }
+    }
+
     /// Convert into an invocation.
     pub fn invocation(self) -> CommandInvocation {
         CommandInvocation {
@@ -986,13 +1125,6 @@ pub(crate) struct CommandSet {
 }
 
 impl CommandSet {
-    /// Construct an empty command set.
-    pub fn new() -> Self {
-        Self {
-            commands: BTreeMap::new(),
-        }
-    }
-
     /// Add a command batch atomically.
     ///
     /// Repeating an equivalent definition is idempotent. A conflicting
@@ -1095,6 +1227,24 @@ pub enum CommandError {
         id: NodeId,
     },
 
+    /// An exact target does not own the requested node command.
+    #[error("node {node:?} does not own command {id} (expected {expected:?})")]
+    WrongOwner {
+        /// Requested command identifier.
+        id: String,
+        /// Requested exact node.
+        node: NodeId,
+        /// Required owner, absent for a free command.
+        expected: Option<String>,
+    },
+    /// Eligibility changed or the action was already disabled.
+    #[error("command {id} is disabled: {reason}")]
+    Disabled {
+        /// Requested command identifier.
+        id: String,
+        /// Current disabled reason.
+        reason: String,
+    },
     /// Incorrect number of arguments.
     #[error("arity mismatch: expected {expected}, got {got}")]
     ArityMismatch {
@@ -1206,6 +1356,11 @@ impl CommandError {
 
 /// Trait for injectable parameters.
 pub trait Inject: Sized {
+    /// Required event context, if this injection depends on one.
+    fn requirement() -> Option<CommandRequirement> {
+        None
+    }
+
     /// Inject a value from the context, or `None` when the context has none.
     fn inject(ctx: &dyn Context) -> Option<Self>;
 }
@@ -1214,33 +1369,48 @@ impl<T> Inject for Option<T>
 where
     T: Inject,
 {
+    fn requirement() -> Option<CommandRequirement> {
+        T::requirement()
+    }
+
     fn inject(ctx: &dyn Context) -> Option<Self> {
         Some(T::inject(ctx))
     }
 }
 
 /// Context passed to list row injections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ListRowContext {
     /// Owning list node id.
     pub list: NodeId,
     /// Row index.
     pub index: usize,
+    /// Stable collection key for this row.
+    pub key: ArgValue,
 }
 
 impl Inject for MouseEvent {
+    fn requirement() -> Option<CommandRequirement> {
+        Some(CommandRequirement::Mouse)
+    }
     fn inject(ctx: &dyn Context) -> Option<Self> {
         ctx.current_mouse_event()
     }
 }
 
 impl Inject for ListRowContext {
+    fn requirement() -> Option<CommandRequirement> {
+        Some(CommandRequirement::ListRow)
+    }
     fn inject(ctx: &dyn Context) -> Option<Self> {
         ctx.current_list_row()
     }
 }
 
 impl Inject for Event {
+    fn requirement() -> Option<CommandRequirement> {
+        Some(CommandRequirement::Event)
+    }
     fn inject(ctx: &dyn Context) -> Option<Self> {
         ctx.current_event().cloned()
     }
@@ -1298,10 +1468,28 @@ pub fn normalize_named_args<'a>(
     Ok(normalized)
 }
 
-/// Dispatch a command relative to a node.
-pub(crate) fn dispatch(
+/// Resolve and invoke using one explicit target policy.
+pub(crate) fn dispatch_target(
     core: &mut Core,
-    current_id: NodeId,
+    target: CommandTarget,
+    inv: &CommandInvocation,
+) -> Result<ArgValue, CommandError> {
+    let checkpoint = core.begin_dispatch();
+    let result = dispatch_target_inner(core, target, inv);
+    let completion = core.finish_dispatch(checkpoint, result.is_ok());
+    match result {
+        Ok(value) => {
+            completion.map_err(CommandError::execution)?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Invoke one command inside an established completion boundary.
+fn dispatch_target_inner(
+    core: &mut Core,
+    target: CommandTarget,
     inv: &CommandInvocation,
 ) -> Result<ArgValue, CommandError> {
     let spec = core
@@ -1310,27 +1498,97 @@ pub(crate) fn dispatch(
         .ok_or_else(|| CommandError::UnknownCommand {
             id: inv.id.0.to_string(),
         })?;
-
     validate_node_args(core, &inv.args)?;
-
-    let resolution = CommandResolver::new(core, current_id).resolve(spec);
-
+    let resolver = CommandResolver::for_target(core, target);
+    let start = resolver.start;
+    let resolution = checked_resolution(&resolver, spec)?;
     match resolution {
-        Some(CommandResolution::Free) => {
-            let mut ctx = CoreContext::new(core, current_id);
+        CommandResolution::Free => {
+            let mut ctx = CoreContext::new(core, start);
             (spec.invoke)(None, &mut ctx, inv)
         }
-        Some(CommandResolution::Subtree { target } | CommandResolution::Ancestor { target }) => {
-            dispatch_on_node(core, target, spec, inv)
-        }
-        None => match spec.dispatch {
-            CommandDispatchKind::Free => unreachable!("free commands always resolve"),
-            CommandDispatchKind::Node { owner } => Err(CommandError::NoTarget {
-                id: inv.id.0.to_string(),
-                owner: owner.to_string(),
-            }),
-        },
+        resolved => dispatch_on_node(core, resolved.target().expect("node resolution"), spec, inv),
     }
+}
+
+/// Reject stale and wrong exact owners before invocation or inspection.
+fn checked_resolution(
+    resolver: &CommandResolver<'_>,
+    spec: &CommandSpec,
+) -> Result<CommandResolution, CommandError> {
+    if !resolver.core.nodes.contains_key(resolver.start) {
+        return Err(CommandError::InvalidNode { id: resolver.start });
+    }
+    resolver.resolve(spec).ok_or_else(|| match resolver.target {
+        CommandTarget::Exact(node) => CommandError::WrongOwner {
+            id: spec.id.0.to_string(),
+            node,
+            expected: spec.dispatch.owner().map(str::to_string),
+        },
+        _ => CommandError::NoTarget {
+            id: spec.id.0.to_string(),
+            owner: spec.dispatch.owner().unwrap_or_default().to_string(),
+        },
+    })
+}
+
+/// Report unavailable action targets as disabled without hiding hook failures.
+pub(crate) fn command_status(
+    core: &Core,
+    target: CommandTarget,
+    inv: &CommandInvocation,
+) -> CoreResult<CommandStatus> {
+    let Some(spec) = core.commands.get(inv.id.0) else {
+        return Ok(CommandStatus::Disabled(
+            CommandError::UnknownCommand {
+                id: inv.id.0.to_string(),
+            }
+            .to_string(),
+        ));
+    };
+    let resolution = match checked_resolution(&CommandResolver::for_target(core, target), spec) {
+        Ok(resolution) => resolution,
+        Err(error) => return Ok(CommandStatus::Disabled(error.to_string())),
+    };
+    status_at(core, spec, resolution)
+}
+
+/// Run the optional read-only hook on a resolved owner.
+fn status_at(
+    core: &Core,
+    spec: &CommandSpec,
+    resolution: CommandResolution,
+) -> CoreResult<CommandStatus> {
+    let (Some(status), Some(node)) = (spec.status, resolution.target()) else {
+        return Ok(CommandStatus::Enabled);
+    };
+    core.with_widget(
+        node,
+        WidgetOperation::access("command status"),
+        |widget, core| status(widget as &dyn Any, &CoreViewContext::new(core, node)),
+    )?
+}
+
+/// Find required injections absent in the current invocation scope.
+fn missing_requirements(core: &Core, spec: &CommandSpec) -> Vec<CommandRequirement> {
+    let scope = core.current_command_scope();
+    let mut missing = Vec::new();
+    for requirement in spec
+        .params
+        .iter()
+        .filter(|p| !p.optional)
+        .filter_map(|p| p.requirement.and_then(|f| f()))
+    {
+        let present = scope.is_some_and(|scope| match requirement {
+            CommandRequirement::Event => scope.event.is_some(),
+            CommandRequirement::Mouse => scope.mouse.is_some(),
+            CommandRequirement::ListRow => scope.list_row.is_some(),
+        });
+        if !present && !missing.contains(&requirement) {
+            missing.push(requirement);
+        }
+    }
+    missing
 }
 
 /// Dispatch a node-routed command to a resolved node.
@@ -1341,6 +1599,15 @@ fn dispatch_on_node(
     inv: &CommandInvocation,
 ) -> Result<ArgValue, CommandError> {
     core.with_widget_ctx(node_id, |widget, ctx| {
+        if let Some(status) = spec.status
+            && let CommandStatus::Disabled(reason) =
+                status(widget as &dyn Any, ctx).map_err(CommandError::execution)?
+        {
+            return Err(CommandError::Disabled {
+                id: spec.id.0.to_string(),
+                reason,
+            });
+        }
         (spec.invoke)(Some(widget as &mut dyn Any), ctx, inv)
     })
     .map_err(CommandError::execution)?
@@ -1391,6 +1658,70 @@ mod tests {
     use serde::{Serialize, ser};
 
     use super::*;
+    use crate::{Widget, core::id::testing_node_id, error::Error, state::NodeName};
+
+    struct StatusOwner;
+
+    impl Widget for StatusOwner {
+        fn name(&self) -> NodeName {
+            NodeName::convert("status_owner")
+        }
+    }
+
+    /// Fail inside eligibility to distinguish callback errors from resolution.
+    fn failed_status(_widget: &dyn Any, _view: &dyn ViewContext) -> CoreResult<CommandStatus> {
+        Err(Error::Invalid("eligibility hook failed".into()))
+    }
+
+    static FAILING_STATUS: CommandSpec = CommandSpec {
+        id: CommandId("status_owner.action"),
+        name: "action",
+        dispatch: CommandDispatchKind::Node {
+            owner: "status_owner",
+        },
+        params: &[],
+        ret: CommandReturnSpec::Unit,
+        doc: None,
+        invoke: registry_invoke,
+        check: registry_check,
+        status: Some(failed_status),
+    };
+
+    static FAILING_COMMANDS: &[&CommandSpec] = &[&FAILING_STATUS];
+
+    #[test]
+    fn command_status_disables_resolution_failures_but_preserves_hook_errors() -> CoreResult<()> {
+        let mut core = Core::new();
+        core.commands.add(FAILING_COMMANDS)?;
+        let owner = core.create_detached(StatusOwner)?;
+        let missing = core.create_detached(StatusOwner)?;
+        core.remove_subtree(missing)?;
+        let invocation = CommandInvocation {
+            id: FAILING_STATUS.id,
+            args: CommandArgs::default(),
+        };
+        let context = CoreViewContext::new(&core, core.root);
+        assert!(matches!(
+            context.command_status(CommandTarget::Exact(missing), &invocation)?,
+            CommandStatus::Disabled(_)
+        ));
+        assert!(matches!(
+            context.command_status(CommandTarget::Exact(core.root), &invocation)?,
+            CommandStatus::Disabled(_)
+        ));
+        assert!(
+            matches!(context.command_status(CommandTarget::Exact(owner), &invocation), Err(Error::Invalid(message)) if message == "eligibility hook failed")
+        );
+        let unknown = CommandInvocation {
+            id: CommandId("unknown.action"),
+            args: CommandArgs::default(),
+        };
+        assert!(matches!(
+            context.command_status(CommandTarget::Exact(owner), &unknown)?,
+            CommandStatus::Disabled(_)
+        ));
+        Ok(())
+    }
 
     fn registry_invoke(
         _target: Option<&mut dyn Any>,
@@ -1398,6 +1729,10 @@ mod tests {
         _invocation: &CommandInvocation,
     ) -> Result<ArgValue, CommandError> {
         Ok(ArgValue::Null)
+    }
+
+    fn registry_check(_args: &CommandArgs) -> Result<(), CommandError> {
+        Ok(())
     }
 
     static REGISTRY_A: CommandSpec = CommandSpec {
@@ -1408,6 +1743,8 @@ mod tests {
         ret: CommandReturnSpec::Unit,
         doc: Some("a"),
         invoke: registry_invoke,
+        check: registry_check,
+        status: None,
     };
     static REGISTRY_A_CONFLICT: CommandSpec = CommandSpec {
         id: CommandId("registry.a"),
@@ -1417,6 +1754,8 @@ mod tests {
         ret: CommandReturnSpec::Unit,
         doc: Some("conflict"),
         invoke: registry_invoke,
+        check: registry_check,
+        status: None,
     };
     static REGISTRY_B: CommandSpec = CommandSpec {
         id: CommandId("registry.b"),
@@ -1426,6 +1765,8 @@ mod tests {
         ret: CommandReturnSpec::Unit,
         doc: None,
         invoke: registry_invoke,
+        check: registry_check,
+        status: None,
     };
     static REGISTRY_A_BATCH: &[&CommandSpec] = &[&REGISTRY_A];
     static REGISTRY_CONFLICT_BATCH: &[&CommandSpec] = &[&REGISTRY_B, &REGISTRY_A_CONFLICT];
@@ -1435,7 +1776,7 @@ mod tests {
 
     #[test]
     fn command_batches_are_atomic_conflict_aware_and_idempotent() {
-        let mut commands = CommandSet::new();
+        let mut commands = CommandSet::default();
         commands.add(REGISTRY_A_BATCH).unwrap();
 
         let error = commands.add(REGISTRY_CONFLICT_BATCH).unwrap_err();
@@ -1456,13 +1797,15 @@ mod tests {
         let mut reverse = Core::new();
         reverse.commands.add(REGISTRY_REVERSE_BATCH).unwrap();
 
-        let forward_ids = CommandResolver::new(&forward, forward.root)
+        let forward_ids = CommandResolver::for_target(&forward, CommandTarget::From(forward.root))
             .availability()
+            .unwrap()
             .into_iter()
             .map(|item| item.spec.id.0)
             .collect::<Vec<_>>();
-        let reverse_ids = CommandResolver::new(&reverse, reverse.root)
+        let reverse_ids = CommandResolver::for_target(&reverse, CommandTarget::From(reverse.root))
             .availability()
+            .unwrap()
             .into_iter()
             .map(|item| item.spec.id.0)
             .collect::<Vec<_>>();
@@ -1522,7 +1865,7 @@ mod tests {
 
     #[test]
     fn node_arg_json_requires_external_mode() {
-        let value = ArgValue::Node(NodeId::default());
+        let value = ArgValue::Node(testing_node_id());
 
         assert!(arg_value_to_json(&value, NodeJson::Reject).is_err());
 

@@ -1,9 +1,10 @@
 use super::Core;
 use crate::{
-    ChangeOutcome,
+    ChangeOutcome, FocusDirection, RevealAlign,
     core::{id::NodeId, widget_access},
     error::{Error, Result},
-    geom::{Direction, RectI32},
+    geom::RectI32,
+    layout::Display,
     path::Path,
 };
 
@@ -39,11 +40,20 @@ impl Core {
     pub(crate) fn transition_focus(&mut self, target: Option<NodeId>) -> Result<ChangeOutcome> {
         if let Some(node) = target {
             self.validate_attached_node(node)?;
+            if !self.interaction_admits(node) {
+                return Err(Error::InvalidOperation(
+                    "node is outside the active modal".into(),
+                ));
+            }
         }
         if self.focus == target {
             Ok(ChangeOutcome::Unchanged)
         } else {
             self.focus = target;
+            if let Some(node) = target {
+                self.queue_node_reveal(node, RevealAlign::Nearest);
+            }
+            self.invalidate(crate::Invalidation::Paint);
             Ok(ChangeOutcome::Changed)
         }
     }
@@ -62,7 +72,7 @@ impl Core {
     /// Return the focus path for the subtree under `root`.
     pub fn focus_path(&self, root: NodeId) -> Path {
         self.focus
-            .map_or_else(Path::empty, |focus| self.node_path(root, focus))
+            .map_or_else(Path::empty, |focus| self.path_of(root, focus))
     }
 
     /// Collect the focusable leaves under `root` in pre-order.
@@ -111,8 +121,17 @@ impl Core {
         self.transition_focus(find_last_focusable(self, root))
     }
 
+    /// Move focus within the subtree at `root`.
+    pub fn focus_move(&mut self, root: NodeId, direction: FocusDirection) -> Result<ChangeOutcome> {
+        match direction {
+            FocusDirection::Next => self.focus_next(root),
+            FocusDirection::Prev => self.focus_prev(root),
+            direction => self.focus_dir(root, direction),
+        }
+    }
+
     /// Move focus in a specified direction within the subtree at root.
-    pub fn focus_dir(&mut self, root: NodeId, dir: Direction) -> Result<ChangeOutcome> {
+    fn focus_dir(&mut self, root: NodeId, dir: FocusDirection) -> Result<ChangeOutcome> {
         let focusables = self.focusable_leaves(root);
 
         let current = match self.focus {
@@ -148,14 +167,28 @@ impl Core {
         }
     }
 
-    /// Ensure the focus invariant is satisfied.
+    /// Ensure focus rests on an attached, visible node that accepts focus and
+    /// has a view.
+    ///
+    /// Layout runs this once it publishes views, so focus leaves a node that
+    /// layout gave no area.
     pub fn ensure_focus_valid(&mut self, removed_root: Option<NodeId>) -> Result<ChangeOutcome> {
+        self.repair_focus(removed_root, true)
+    }
+
+    /// Move focus off a node that is detached, hidden, or refuses focus. With
+    /// `require_view`, also move it off a node without a view.
+    fn repair_focus(
+        &mut self,
+        removed_root: Option<NodeId>,
+        require_view: bool,
+    ) -> Result<ChangeOutcome> {
         let Some(focus) = self.focus else {
             self.focus_hint = None;
             return Ok(ChangeOutcome::Unchanged);
         };
 
-        if self.is_attached_to_root(focus) && is_focus_candidate(self, focus, true) {
+        if self.is_attached_to_root(focus) && can_retain_focus(self, focus, require_view) {
             self.focus_hint = None;
             return Ok(ChangeOutcome::Unchanged);
         }
@@ -210,11 +243,17 @@ impl Core {
     fn transition_mouse_capture(&mut self, target: Option<NodeId>) -> Result<ChangeOutcome> {
         if let Some(node) = target {
             self.validate_attached_node(node)?;
+            if !self.interaction_admits(node) {
+                return Err(Error::InvalidOperation(
+                    "node is outside the active modal".into(),
+                ));
+            }
         }
         if self.mouse_capture == target {
             Ok(ChangeOutcome::Unchanged)
         } else {
             self.mouse_capture = target;
+            self.invalidate(crate::Invalidation::Semantics);
             Ok(ChangeOutcome::Changed)
         }
     }
@@ -233,7 +272,10 @@ impl Core {
 
     /// Ensure focus and mouse capture invariants after structural changes.
     pub fn ensure_invariants(&mut self, removed_root: Option<NodeId>) -> Result<()> {
-        self.ensure_focus_valid(removed_root)?;
+        // Views are stale between layouts, and a node added or shown since the
+        // last layout has none, so a structural change does not judge focus by
+        // its view. The next layout does.
+        self.repair_focus(removed_root, false)?;
         self.ensure_mouse_capture_valid()?;
         self.debug_assert_tree_invariants();
         Ok(())
@@ -378,51 +420,82 @@ fn nearest_focusable_ancestor_with(
 
 /// Return whether the node is focusable, respecting hidden and view
 /// requirements.
-fn is_focus_candidate(core: &Core, node_id: NodeId, require_view: bool) -> bool {
+pub(super) fn is_focus_candidate(core: &Core, node_id: NodeId, require_view: bool) -> bool {
+    is_focus_position_valid(core, node_id, require_view)
+        && widget_access::accepts_focus(core, node_id)
+}
+
+/// Return whether the current focus can remain on this node.
+///
+/// A widget cannot answer `accept_focus` while its callback owns the slot. Its
+/// established focus remains valid until the callback returns and acceptance
+/// can be checked again. Structural and interaction constraints never defer.
+fn can_retain_focus(core: &Core, node_id: NodeId, require_view: bool) -> bool {
+    is_focus_position_valid(core, node_id, require_view)
+        && widget_access::focus_acceptance(core, node_id).unwrap_or(true)
+}
+
+/// Return whether focus may occupy this node apart from widget acceptance.
+fn is_focus_position_valid(core: &Core, node_id: NodeId, require_view: bool) -> bool {
+    if !core.interaction_admits(node_id) {
+        return false;
+    }
     let Some(node) = core.nodes.get(node_id) else {
         return false;
     };
-    if node.hidden {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let Some(ancestor) = core.nodes.get(id) else {
+            return false;
+        };
+        if ancestor.hidden || ancestor.layout.display == Display::None {
+            return false;
+        }
+        current = ancestor.parent;
+    }
+    if require_view && node.view.is_empty() {
         return false;
     }
-    if require_view && node.view.is_zero() {
-        return false;
-    }
-    widget_access::accepts_focus(core, node_id)
+    true
 }
 
 /// Return the focus sort key for a candidate, or `None` if it is not in `dir`.
 fn focus_dir_key(
-    dir: Direction,
+    dir: FocusDirection,
     current_rect: RectI32,
     current_center: (i64, i64),
     rect: RectI32,
 ) -> Option<u64> {
     let center = rect.center();
     match dir {
-        Direction::Right => (center.0 > current_center.0 && rect.overlaps_vertical(current_rect))
-            .then(|| {
+        FocusDirection::Right => {
+            (center.0 > current_center.0 && rect.overlaps_vertical(current_rect)).then(|| {
                 let edge_dist = (rect.left() - current_rect.right()).max(0) as u64;
                 let vert_center_dist = current_center.1.abs_diff(center.1);
                 edge_dist * 10000 + vert_center_dist
-            }),
-        Direction::Left => (center.0 < current_center.0 && rect.overlaps_vertical(current_rect))
-            .then(|| {
+            })
+        }
+        FocusDirection::Left => {
+            (center.0 < current_center.0 && rect.overlaps_vertical(current_rect)).then(|| {
                 let edge_dist = (current_rect.left() - rect.right()).max(0) as u64;
                 let vert_center_dist = current_center.1.abs_diff(center.1);
                 edge_dist * 10000 + vert_center_dist
-            }),
-        Direction::Down => (center.1 > current_center.1 && rect.overlaps_horizontal(current_rect))
-            .then(|| {
+            })
+        }
+        FocusDirection::Down => {
+            (center.1 > current_center.1 && rect.overlaps_horizontal(current_rect)).then(|| {
                 let edge_dist = (rect.top() - current_rect.bottom()).max(0) as u64;
                 let horiz_center_dist = current_center.0.abs_diff(center.0);
                 edge_dist * 10000 + horiz_center_dist
-            }),
-        Direction::Up => (center.1 < current_center.1 && rect.overlaps_horizontal(current_rect))
-            .then(|| {
+            })
+        }
+        FocusDirection::Up => {
+            (center.1 < current_center.1 && rect.overlaps_horizontal(current_rect)).then(|| {
                 let edge_dist = (current_rect.top() - rect.bottom()).max(0) as u64;
                 let horiz_center_dist = current_center.0.abs_diff(center.0);
                 edge_dist * 10000 + horiz_center_dist
-            }),
+            })
+        }
+        FocusDirection::Next | FocusDirection::Prev => None,
     }
 }

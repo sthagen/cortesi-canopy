@@ -1,36 +1,32 @@
 use canopy::{
-    Loader, RoutePhase, Widget, error::Result, event::key::Key, geom::Size,
-    testing::harness::Harness,
+    Loader, RoutePhase, error::Result, event::key::Key, geom::Size, testing::harness::Harness,
 };
-use canopy_widgets::Root;
 
+use super::{Mount, root_harness};
 use crate::{demo_canopy, termgym, widget_editor};
 
-fn root_harness<W>(app: W, setup: fn(&mut canopy::Canopy) -> Result<()>) -> Result<Harness>
-where
-    W: Widget + Loader + 'static,
-{
-    let mut canopy = demo_canopy()?;
-    W::load(&mut canopy)?;
-    canopy.finalize_api()?;
-    setup(&mut canopy)?;
-    Root::install_app(&mut canopy, app)?;
-    canopy.run_startup_scripts()?;
-    let mut harness = Harness::from_canopy(canopy, Size::new(80, 24))?;
-    harness.render()?;
-    Ok(harness)
+#[test]
+fn demo_api_build_does_not_assemble_or_publish() -> Result<()> {
+    let canopy = termgym::binding_setup(demo_canopy().configure(termgym::TermGym::load)).build()?;
+    assert!(canopy.snapshot().is_none());
+    assert!(
+        canopy
+            .with_root_view(|context| context.find_nodes("root/termgym"))?
+            .is_empty()
+    );
+    Ok(())
 }
 
 fn add_scroll_rows(canopy: &mut canopy::Canopy) -> Result<()> {
     let mut source = ('a'..='t')
         .map(|key| {
             format!(
-                "canopy.bind(\"alt-{key}\", {{ description = \"Extra help row {key}\" }}, function() end)\n"
+                "canopy.bind(\"alt-{key}\", {{ phase = \"after_widget\", description = \"Extra help row {key}\" }}, function() end)\n"
             )
         })
         .collect::<String>();
     source.push_str(
-        r#"canopy.bind("ctrl-x", {
+        r#"canopy.bind("ctrl-x", { phase = "before_widget",
             description = "Acceptance sentinel",
             path = "/root/**/",
             tier = "global",
@@ -39,7 +35,7 @@ fn add_scroll_rows(canopy: &mut canopy::Canopy) -> Result<()> {
         end)
         "#,
     );
-    canopy.eval_script(&source)
+    canopy.eval_script(&source).map(|_| ())
 }
 
 fn prove_help_flow(mut harness: Harness) -> Result<()> {
@@ -65,7 +61,7 @@ fn prove_help_flow(mut harness: Harness) -> Result<()> {
     harness.render()?;
 
     let list = harness
-        .find_nodes("root/help/**/binding_list")
+        .find_nodes("root/help/**/binding_list")?
         .into_iter()
         .next()
         .expect("help binding list");
@@ -83,10 +79,29 @@ fn prove_help_flow(mut harness: Harness) -> Result<()> {
             .map(|group| group.as_str()),
         Some("root.help")
     );
-    assert!(harness.tbuf().contains_text("Key bindings"));
+    assert!(harness.tbuf().contains_text("Keyboard shortcuts"));
     assert!(!harness.tbuf().contains_text("Context:"));
-    assert!(harness.tbuf().contains_text("Up/k Down/j scroll"));
-    assert!(harness.tbuf().contains_text("?/Esc close"));
+    assert!(harness.tbuf().contains_text("↑/↓ Scroll"));
+    assert!(harness.tbuf().contains_text("Esc Close"));
+    let frame = harness.canopy.snapshot().expect("published help");
+    let panel = frame
+        .nodes
+        .iter()
+        .find(|node| node.name == "help_panel")
+        .and_then(|node| node.view)
+        .map(|view| view.outer)
+        .expect("visible help panel");
+    let cell = |x, y| &frame.cells[(y * frame.viewport.w + x) as usize];
+    let background = cell(panel.tl.x as u32, panel.tl.y as u32).style.bg;
+    for y in panel.tl.y as u32..panel.tl.y as u32 + panel.h {
+        for x in panel.tl.x as u32..panel.tl.x as u32 + panel.w {
+            assert_eq!(
+                cell(x, y).style.bg,
+                background,
+                "help background gap at {x},{y}"
+            );
+        }
+    }
 
     harness.key(Key::parse_spec("Down").expect("valid key"))?;
     assert!(harness.canopy.route_trace().iter().any(|entry| {
@@ -122,7 +137,12 @@ fn prove_help_flow(mut harness: Harness) -> Result<()> {
 
 #[test]
 fn termgym_help_opens_over_a_consuming_terminal_and_restores_input() -> Result<()> {
-    let harness = root_harness(termgym::TermGym::new(), termgym::setup_bindings)?;
+    let harness = root_harness(
+        termgym::TermGym::new(),
+        termgym::binding_setup,
+        Size::new(80, 24),
+        Mount::Wrap,
+    )?;
     prove_help_flow(harness)
 }
 
@@ -130,7 +150,9 @@ fn termgym_help_opens_over_a_consuming_terminal_and_restores_input() -> Result<(
 fn widget_editor_help_opens_over_a_consuming_editor_and_restores_input() -> Result<()> {
     let harness = root_harness(
         widget_editor::WidgetEditor::new("fn main() {}\n", "rs", "test.rs"),
-        widget_editor::setup_bindings,
+        widget_editor::binding_setup,
+        Size::new(80, 24),
+        Mount::Wrap,
     )?;
     prove_help_flow(harness)
 }

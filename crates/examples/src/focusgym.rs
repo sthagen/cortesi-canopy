@@ -1,4 +1,10 @@
-use canopy::{command, derive_commands, prelude::*};
+use canopy::{
+    Canopy, CanopyBuilder, Context, ContextExt, FocusDirection, FocusScope, Loader, NodeId, Render,
+    ViewContext, ViewContextExt, Widget, derive_commands,
+    error::Result,
+    geom::Size,
+    layout::{Direction, Layout, Sizing},
+};
 use canopy_widgets::Root;
 
 /// Default bindings for the focus gym demo.
@@ -8,67 +14,69 @@ root.default_bindings()
 canopy.bind("p", { description = "Log demo message" }, function()
     canopy.log("focus gym")
 end)
-canopy.bind("Tab", { path = "focus_gym", description = "Next focus" }, function()
-    root.focus("Next")
-end)
-canopy.bind_mouse("ScrollDown", { path = "focus_gym", description = "Next focus" }, function()
-    root.focus("Next")
-end)
-canopy.bind_mouse("ScrollUp", { path = "focus_gym", description = "Previous focus" }, function()
-    root.focus("Prev")
-end)
-canopy.bind("Right", { path = "focus_gym", description = "Focus right" }, function()
-    root.focus("Right")
-end)
-canopy.bind("l", { path = "focus_gym", description = "Focus right" }, function()
-    root.focus("Right")
-end)
-canopy.bind("Left", { path = "focus_gym", description = "Focus left" }, function()
-    root.focus("Left")
-end)
-canopy.bind("h", { path = "focus_gym", description = "Focus left" }, function()
-    root.focus("Left")
-end)
-canopy.bind("Up", { path = "focus_gym", description = "Focus up" }, function()
-    root.focus("Up")
-end)
-canopy.bind("k", { path = "focus_gym", description = "Focus up" }, function()
-    root.focus("Up")
-end)
-canopy.bind("Down", { path = "focus_gym", description = "Focus down" }, function()
-    root.focus("Down")
-end)
-canopy.bind("j", { path = "focus_gym", description = "Focus down" }, function()
-    root.focus("Down")
-end)
-canopy.bind("x", { path = "focus_gym", description = "Delete focused block" }, function()
-    focus_gym.delete_focused()
-end)
-canopy.bind("s", { path = "block", description = "Split block" }, function()
-    block.split()
-end)
-canopy.bind("a", { path = "block", description = "Add child block" }, function()
-    block.add()
-end)
-canopy.bind("[", { path = "block", description = "Decrease grow" }, function()
-    block.flex_grow_dec()
-end)
-canopy.bind("]", { path = "block", description = "Increase grow" }, function()
-    block.flex_grow_inc()
-end)
-canopy.bind_mouse("LeftDown", { path = "block", description = "Focus block" }, function()
-    block.focus()
-end)
-canopy.bind_mouse("MiddleDown", { path = "block", description = "Split block" }, function()
-    block.split()
-end)
-canopy.bind_mouse("RightDown", { path = "block", description = "Add child block" }, function()
-    block.add()
-end)
+canopy.keymap({
+    path = "focus_gym",
+    { key = "Tab", description = "Next focus", action = command.root.focus("Next") },
+    {
+        mouse = "ScrollDown",
+        description = "Next focus",
+        action = function()
+            root.focus("Next")
+        end,
+    },
+    {
+        mouse = "ScrollUp",
+        description = "Previous focus",
+        action = function()
+            root.focus("Prev")
+        end,
+    },
+    { key = { "Right", "l" }, description = "Focus right", action = command.root.focus("Right") },
+    { key = { "Left", "h" }, description = "Focus left", action = command.root.focus("Left") },
+    { key = { "Up", "k" }, description = "Focus up", action = command.root.focus("Up") },
+    { key = { "Down", "j" }, description = "Focus down", action = command.root.focus("Down") },
+    {
+        key = "x",
+        description = "Delete focused block",
+        action = command.focus_gym.delete_focused(),
+    },
+})
+canopy.keymap({
+    path = "block",
+    phase = "before_widget",
+    { key = "s", description = "Split block", action = command.block.split() },
+    { key = "a", description = "Add child block", action = command.block.add() },
+    { key = "[", description = "Decrease grow", action = command.block.flex_grow_dec() },
+    { key = "]", description = "Increase grow", action = command.block.flex_grow_inc() },
+})
+canopy.keymap({
+    path = "block",
+    {
+        mouse = "LeftDown",
+        description = "Focus block",
+        action = function()
+            block.focus()
+        end,
+    },
+    {
+        mouse = "MiddleDown",
+        description = "Split block",
+        action = function()
+            block.split()
+        end,
+    },
+    {
+        mouse = "RightDown",
+        description = "Add child block",
+        action = function()
+            block.add()
+        end,
+    },
+})
 "#;
 
 /// A focusable block that can split into children.
-pub struct Block {
+pub(crate) struct Block {
     /// True for horizontal layout.
     horizontal: bool,
 }
@@ -88,22 +96,17 @@ impl Block {
     /// Adjust flex factors by the requested deltas and apply the updated
     /// layout.
     fn adjust_flex(&self, c: &mut dyn Context, delta: i32) -> Result<()> {
-        if let Some(view) = c.node_view(c.node_id())
+        if let Some(view) = c.view_of(c.node_id())
             && (view.outer.w <= 1 || view.outer.h <= 1)
             && delta < 0
         {
             return Ok(());
         }
 
-        let parent_dir = if let Some(parent) = c.parent_of(c.node_id()) {
-            let mut dir = None;
-            c.with_layout_of(parent, &mut |layout| {
-                dir = Some(layout.direction);
-            })?;
-            dir
-        } else {
-            None
-        };
+        let parent_dir = c
+            .parent_of(c.node_id())
+            .and_then(|parent| (c as &dyn ViewContext).layout_of(parent))
+            .map(|layout| layout.direction);
 
         let adjust_horizontal = match parent_dir {
             Some(Direction::Row) => true,
@@ -137,9 +140,9 @@ impl Block {
     /// Add a nested block if space permits.
     fn add(&self, c: &mut dyn Context) -> Result<()> {
         if let Some(first_child) = c.children().first().copied()
-            && let Some(view) = c.node_view(first_child)
+            && let Some(view) = c.view_of(first_child)
         {
-            let size = Size::new(view.outer.w, view.outer.h);
+            let size = view.outer.size();
             if self.size_limited(size) {
                 return Ok(());
             }
@@ -152,11 +155,11 @@ impl Block {
     /// Split into two child blocks.
     fn split(&self, c: &mut dyn Context) -> Result<()> {
         let view = c.view();
-        let size = Size::new(view.outer.w, view.outer.h);
+        let size = view.outer.size();
         if !self.size_limited(size) && c.children().is_empty() {
             c.add_child(Self::new(!self.horizontal))?;
             c.add_child(Self::new(!self.horizontal))?;
-            c.focus_next(FocusScope::Current)?;
+            c.focus_move(FocusScope::Current, FocusDirection::Next)?;
         }
         Ok(())
     }
@@ -191,7 +194,7 @@ impl Widget for Block {
         if ctx.children().is_empty() {
             let bc = if ctx.is_focused() { "violet" } else { "blue" };
             let rect = ctx.view().outer_rect_local();
-            if rect.is_zero() {
+            if rect.is_empty() {
                 return Ok(());
             }
             r.fill(bc, rect, '\u{2588}')?;
@@ -234,6 +237,9 @@ impl FocusGym {
         let Some(focused) = c.focused_leaf(root_block) else {
             return Ok(());
         };
+        if focused == root_block {
+            return Ok(());
+        }
         c.remove_subtree(focused)?;
         c.focus_first(FocusScope::Node(root_block))?;
         Ok(())
@@ -259,7 +265,8 @@ impl Loader for FocusGym {
     }
 }
 
-/// Install key bindings for the focus gym demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.eval_script(DEFAULT_BINDINGS)
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.bindings("focusgym", DEFAULT_BINDINGS)
 }

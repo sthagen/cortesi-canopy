@@ -1,15 +1,15 @@
 use canopy::{
-    Context, EventOutcome, ViewContext, Widget, command, cursor, derive_commands,
+    Context, EventOutcome, NodeName, Render, ViewContext, Widget, WidgetSemantics, cursor,
+    derive_commands,
     error::Result,
     event::{Event, key},
-    geom::{Line, Point},
-    layout::{MeasureConstraints, Measurement, Size},
-    render::Render,
-    state::NodeName,
+    geom::{Line, Point, Size},
+    layout::{Layout, MeasureConstraints, Measurement},
+    style::{WidgetState, roles},
     text,
 };
 
-use crate::editor::{TextBuffer, TextPosition};
+use crate::text_buffer::{TextBuffer, TextPosition, single_line};
 
 /// Default tab stop width for single-line inputs.
 const DEFAULT_TAB_STOP: usize = 4;
@@ -33,7 +33,7 @@ impl InputBuffer {
     /// Construct a new input buffer with initial content.
     fn new(start: impl Into<String>) -> Self {
         let raw = start.into();
-        let value = sanitize_single_line(&raw);
+        let value = single_line(&raw);
         let buffer = TextBuffer::new(value.clone());
         let mut out = Self {
             buffer,
@@ -75,11 +75,8 @@ impl InputBuffer {
 
     /// Insert a character at the cursor position.
     fn insert(&mut self, c: char) {
-        let insert = match c {
-            '\n' | '\r' => ' ',
-            _ => c,
-        };
-        self.buffer.insert_text(&insert.to_string());
+        let insert = single_line(c.encode_utf8(&mut [0; 4]));
+        self.buffer.insert_text(&insert);
         self.sync_value();
         self.ensure_cursor_visible();
     }
@@ -147,18 +144,36 @@ impl InputBuffer {
         }
 
         let text_width = self.line_width();
-        if text_width <= self.view_width {
-            self.scroll = 0;
-        } else if self.scroll > text_width.saturating_sub(1) {
-            self.scroll = text_width.saturating_sub(1);
-        }
+        let max_scroll = text_width.saturating_add(1).saturating_sub(self.view_width);
+        self.scroll = self.scroll.min(max_scroll);
     }
 }
 
 /// Single-line text input widget.
+///
+/// The whole row changes style with keyboard focus, even when empty. A
+/// visible prompt can name the field independently of its editable value.
 pub struct Input {
     /// Text buffer for the input.
     buffer: InputBuffer,
+    /// Visible, noneditable prefix, separate from the value and semantic label.
+    prompt: String,
+    /// Optional semantic label independent of the text value.
+    label: Option<String>,
+    /// Policy for exposing the value in semantic snapshots.
+    value_exposure: ValueExposure,
+}
+
+/// Policy for publishing an input value in semantic snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ValueExposure {
+    /// Omit the value from semantics.
+    #[default]
+    Omit,
+    /// Publish the raw single-line value.
+    Public,
+    /// Mark the value as sensitive and always omit it from semantics.
+    Sensitive,
 }
 
 #[derive_commands]
@@ -167,7 +182,35 @@ impl Input {
     pub fn new(txt: impl Into<String>) -> Self {
         Self {
             buffer: InputBuffer::new(txt),
+            prompt: String::new(),
+            label: None,
+            value_exposure: ValueExposure::Omit,
         }
+    }
+
+    /// Set the semantic label without changing the displayed value.
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Add a visible prompt before the editable value, for example `" Glob: "`.
+    /// Its width participates in measurement, scrolling, and cursor placement.
+    /// The input automatically emphasizes the whole row while it holds focus.
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = single_line(&prompt.into());
+        self
+    }
+
+    /// Display columns reserved before the editable value.
+    fn prompt_width(&self) -> u32 {
+        u32::try_from(text::display_width(&self.prompt)).unwrap_or(u32::MAX)
+    }
+
+    /// Configure whether semantic snapshots expose this input's value.
+    pub fn with_value_exposure(mut self, exposure: ValueExposure) -> Self {
+        self.value_exposure = exposure;
+        self
     }
 
     /// Return the raw input value without padding.
@@ -182,24 +225,33 @@ impl Input {
 
     /// Move the cursor left.
     #[command]
-    fn left(&mut self, _c: &mut dyn Context) {
+    pub fn left(&mut self, _c: &mut dyn Context) {
         self.buffer.left();
     }
 
     /// Move the cursor right.
     #[command]
-    fn right(&mut self, _c: &mut dyn Context) {
+    pub fn right(&mut self, _c: &mut dyn Context) {
         self.buffer.right();
     }
 
     /// Delete a character at the input location.
     #[command]
-    fn backspace(&mut self, _c: &mut dyn Context) {
+    pub fn backspace(&mut self, _c: &mut dyn Context) {
         self.buffer.backspace();
     }
 }
 
 impl Widget for Input {
+    fn semantics(&self, _ctx: &dyn ViewContext) -> Result<WidgetSemantics> {
+        Ok(WidgetSemantics {
+            role: Some("input".into()),
+            label: self.label.clone(),
+            value: (self.value_exposure == ValueExposure::Public).then(|| self.value().to_owned()),
+            ..WidgetSemantics::default()
+        })
+    }
+
     fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
         true
     }
@@ -207,7 +259,9 @@ impl Widget for Input {
     fn cursor(&self) -> Option<cursor::Cursor> {
         Some(cursor::Cursor {
             location: Point {
-                x: self.buffer.cursor_display(),
+                x: self
+                    .prompt_width()
+                    .saturating_add(self.buffer.cursor_display()),
                 y: 0,
             },
             shape: cursor::CursorShape::Block,
@@ -215,13 +269,44 @@ impl Widget for Input {
     }
 
     fn render(&mut self, r: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
+        r.push_layer(roles::INPUT);
+        if ctx.is_focused() {
+            r.push_layer(WidgetState::Focused.layer());
+        }
         let view = ctx.view();
         let view_rect = view.view_rect();
         let content_origin = view.content_origin();
-        self.buffer.set_display_width(view_rect.w as usize);
-        let line = Line::new(content_origin.x, content_origin.y, view_rect.w);
+        r.fill(roles::INPUT_BACKGROUND, view.view_rect_local(), ' ')?;
+        if view_rect.h == 0 {
+            return Ok(());
+        }
+        let prompt_width = self.prompt_width().min(view_rect.w);
+        if prompt_width > 0 {
+            r.text(
+                roles::INPUT_PROMPT,
+                Line::new(content_origin.x, content_origin.y, prompt_width),
+                &self.prompt,
+            )?;
+        }
+        let width = view_rect.w.saturating_sub(prompt_width);
+        self.buffer.set_display_width(width as usize);
+        if width == 0 {
+            return Ok(());
+        }
+        let text_x = content_origin.x.saturating_add(prompt_width);
+        let line = Line::new(text_x, content_origin.y, width);
         let content = self.buffer.render_text();
-        r.text("text", line, &content)
+        r.text(roles::INPUT_TEXT, line, &content)?;
+        if ctx.is_focused() && self.buffer.cursor_display() < width {
+            r.restyle(
+                roles::INPUT_CURSOR,
+                Point {
+                    x: text_x + self.buffer.cursor_display(),
+                    y: content_origin.y,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn on_event(&mut self, event: &Event, _ctx: &mut dyn Context) -> Result<EventOutcome> {
@@ -238,19 +323,24 @@ impl Widget for Input {
         Ok(outcome)
     }
 
+    fn layout(&self) -> Layout {
+        // A text field keeps a stable width while its value changes, so it
+        // fills the width it is given. Its height is the one measured row.
+        Layout::column().flex_horizontal(1)
+    }
+
     fn measure(&self, c: MeasureConstraints) -> Measurement {
-        let text_len = self.buffer.display_width().max(1);
-        c.clamp(Size::new(text_len, 1))
+        // The cell after the text holds the caret at the end of the value.
+        let width = self
+            .prompt_width()
+            .saturating_add(self.buffer.display_width())
+            .saturating_add(1);
+        c.clamp(Size::new(width, 1))
     }
 
     fn name(&self) -> NodeName {
         NodeName::convert("input")
     }
-}
-
-/// Replace newlines in single-line input values.
-fn sanitize_single_line(value: &str) -> String {
-    value.replace(['\n', '\r'], " ")
 }
 
 #[cfg(test)]
@@ -262,7 +352,65 @@ mod tests {
     };
     use unicode_width::UnicodeWidthStr;
 
-    use super::{Input, InputBuffer};
+    use super::{Input, InputBuffer, ValueExposure};
+
+    #[test]
+    fn semantic_values_require_explicit_public_exposure() {
+        for exposure in [
+            ValueExposure::Omit,
+            ValueExposure::Public,
+            ValueExposure::Sensitive,
+        ] {
+            let mut input = Input::new("secret")
+                .with_label("Account")
+                .with_value_exposure(exposure);
+            input.set_value("updated");
+            let semantics = input
+                .semantics(&DummyContext::default())
+                .expect("input semantics");
+            assert_eq!(semantics.role.as_deref(), Some("input"));
+            assert_eq!(semantics.label.as_deref(), Some("Account"));
+            assert_eq!(
+                semantics.value.as_deref(),
+                (exposure == ValueExposure::Public).then_some("updated")
+            );
+        }
+        assert_eq!(
+            Input::new("private")
+                .semantics(&DummyContext::default())
+                .expect("default semantics")
+                .value,
+            None
+        );
+    }
+
+    #[test]
+    fn input_caret_stays_inside_nonempty_viewports() {
+        for width in [1, 3] {
+            for text in ["", "a", "abc", "abcdef", "界a", "e\u{301}ab"] {
+                let mut buf = InputBuffer::new(text);
+                buf.set_display_width(width);
+                assert!(
+                    buf.cursor_display() < width as u32,
+                    "{text:?}, width {width}"
+                );
+                for _ in 0..text.chars().count() {
+                    buf.left();
+                    assert!(buf.cursor_display() < width as u32);
+                }
+                assert_eq!(buf.scroll, 0);
+                for _ in 0..text.chars().count() {
+                    buf.right();
+                    assert!(buf.cursor_display() < width as u32);
+                }
+                for _ in 0..text.chars().count() {
+                    buf.backspace();
+                    assert!(buf.cursor_display() < width as u32);
+                }
+                assert_eq!(buf.value(), "");
+            }
+        }
+    }
 
     #[test]
     fn input_buffer_handles_multibyte_chars() {

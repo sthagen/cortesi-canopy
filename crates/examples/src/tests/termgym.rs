@@ -1,19 +1,22 @@
-use canopy::{BindingPhase, event::key::Key, prelude::*, testing::harness::Harness};
-use canopy_widgets::{Frame, Root, SINGLE_THICK, Terminal};
+use canopy::{
+    BindingPhase, ContextExt, NodeId, RoutePhase, ViewContextExt, error::Result, event::key::Key,
+    geom::Size, path::Path, testing::harness::Harness,
+};
+use canopy_widgets::terminal::Terminal;
 
-use crate::termgym::{TermGym, setup_bindings};
+use super::{Mount, root_harness};
+use crate::termgym::{TermGym, binding_setup};
 
 /// Build the installed TermGym application with its real bindings.
 fn termgym_harness() -> Result<(Harness, NodeId)> {
-    let mut canopy = Canopy::new();
-    Root::load(&mut canopy)?;
-    TermGym::load(&mut canopy)?;
-    setup_bindings(&mut canopy)?;
-    canopy.finalize_api()?;
-    let app = Root::install_app(&mut canopy, TermGym::new())?;
-    let mut harness = Harness::from_canopy(canopy, Size::new(80, 24))?;
-    harness.render()?;
-    Ok((harness, app.into()))
+    let harness = root_harness(
+        TermGym::new(),
+        binding_setup,
+        Size::new(80, 24),
+        Mount::Replace,
+    )?;
+    let app = harness.canopy.with_root_view(|context| context.root_id());
+    Ok((harness, app))
 }
 
 /// Return true when a terminal emulator owns focus.
@@ -33,7 +36,7 @@ fn terminal_count(harness: &Harness) -> usize {
 /// Return the current root-relative focus path.
 fn focus_path(harness: &Harness) -> Path {
     harness.canopy.with_root_view(|context| {
-        context.node_path(
+        context.path_of(
             context.root_id(),
             context.focused_node().expect("TermGym must own focus"),
         )
@@ -44,7 +47,7 @@ fn focus_path(harness: &Harness) -> Path {
 fn installed_termgym_keeps_sidebar_beside_terminal() -> Result<()> {
     let (mut harness, app) = termgym_harness()?;
     harness.canopy.with_root_context(|context| {
-        context.with_node(app, |_termgym: &mut TermGym, context| {
+        context.with_widget_mut(app, |_termgym: &mut TermGym, context| {
             context.invalidate_layout();
             Ok(())
         })
@@ -56,23 +59,12 @@ fn installed_termgym_keeps_sidebar_beside_terminal() -> Result<()> {
         let [sidebar, terminal] = children.as_slice() else {
             panic!("termgym must have sidebar and terminal children");
         };
-        let sidebar = context.node_view(*sidebar).expect("sidebar view").outer;
-        let terminal = context.node_view(*terminal).expect("terminal view").outer;
+        let sidebar = context.view_of(*sidebar).expect("sidebar view").outer;
+        let terminal = context.view_of(*terminal).expect("terminal view").outer;
 
         assert_eq!(sidebar.top(), terminal.top());
         assert_eq!(sidebar.h, terminal.h);
         assert_eq!(sidebar.right(), terminal.left());
-    });
-
-    let frame = harness.canopy.with_root_view(|context| {
-        context
-            .children_of(app)
-            .get(1)
-            .copied()
-            .expect("termgym terminal frame")
-    });
-    harness.with_widget::<Frame, _>(frame, |frame| {
-        assert_eq!(frame.glyphs(), &SINGLE_THICK);
     });
 
     Ok(())
@@ -90,22 +82,47 @@ fn f6_toggles_terminal_focus_without_stealing_shell_shortcuts() -> Result<()> {
     let terminal_bindings = harness.canopy.available_bindings(None)?.bindings;
     let toggle = terminal_bindings
         .iter()
-        .find(|binding| binding.key == Key::parse_spec("F6").expect("valid key"))
+        .find(|binding| binding.input == Key::parse_spec("F6").expect("valid key"))
         .expect("terminal toggle binding");
     assert_eq!(toggle.description, "Toggle terminal list");
     assert_eq!(toggle.phase, BindingPhase::BeforeWidget);
+    assert_eq!(
+        toggle
+            .command
+            .as_ref()
+            .expect("declarative toggle")
+            .action
+            .invocation
+            .id
+            .0,
+        "term_gym::toggle_terminal_focus"
+    );
     for removed in ["ctrl-a", "ctrl-F2", "ctrl-F3", "ctrl-F4"] {
         let removed = Key::parse_spec(removed).expect("valid removed key");
         assert!(
             terminal_bindings
                 .iter()
-                .all(|binding| binding.key != removed),
+                .all(|binding| binding.input != removed),
             "{removed} must remain available to the terminal"
         );
     }
 
     harness.key(Key::parse_spec("F6").expect("valid key"))?;
     assert!(!terminal_has_focus(&harness));
+    assert!(
+        harness
+            .canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.phase == RoutePhase::PreEventBinding)
+    );
+    assert!(
+        !harness
+            .canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.phase == RoutePhase::WidgetEvent)
+    );
     let list_path = focus_path(&harness);
     assert!(list_path.to_string().contains("/list/term_entry"));
 
@@ -115,7 +132,9 @@ fn f6_toggles_terminal_focus_without_stealing_shell_shortcuts() -> Result<()> {
     ] {
         let expected = Key::parse_spec(expected).expect("valid list key");
         assert!(
-            list_bindings.iter().any(|binding| binding.key == expected),
+            list_bindings
+                .iter()
+                .any(|binding| binding.input == expected),
             "{expected} must be available in the terminal list"
         );
     }

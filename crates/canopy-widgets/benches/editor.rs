@@ -3,13 +3,16 @@
 use std::hint::black_box;
 
 use canopy::{
-    Canopy, Context, Loader, Widget, derive_commands, error::Result, layout::Layout,
+    Canopy, Context, ContextExt, Loader, Widget, derive_commands, error::Result, layout::Layout,
     testing::harness::Harness,
 };
-use canopy_widgets::editor::{EditMode, Editor, EditorConfig, LineNumbers, WrapMode};
+use canopy_widgets::editor::{
+    EditMode, Editor, EditorConfig, LineNumbers, WrapMode,
+    highlight::{Highlighter, SyntectHighlighter},
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 
-canopy::key!(EditorSlot: Editor);
+canopy::slot!(EditorSlot: Editor);
 
 /// Wrapper node used for editor render benchmarks.
 struct BenchmarkEditorWrapper {
@@ -35,7 +38,7 @@ impl Widget for BenchmarkEditorWrapper {
             .with_line_numbers(LineNumbers::Absolute);
         let editor = Editor::with_config(self.text.clone(), config);
         let editor_id = c
-            .add_keyed::<EditorSlot>(editor)
+            .add_slot::<EditorSlot>(editor)
             .expect("Failed to attach editor");
 
         c.set_layout(Layout::fill()).expect("Failed to style root");
@@ -82,9 +85,20 @@ fn benchmark_editor_rendering(c: &mut Criterion) {
     });
 }
 
+/// Measure preparation independently of lazy syntax parsing and grammar
+/// loading.
+fn benchmark_highlight_preparation(c: &mut Criterion) {
+    let source = "let value = 42; // a source line\n".repeat(100_000);
+    let highlighter = SyntectHighlighter::new("rs");
+    highlighter.prepare(&source);
+    c.bench_function("highlight_prepare_large_source", |b| {
+        b.iter(|| highlighter.prepare(black_box(&source)));
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = benchmark_editor_rendering
+    targets = benchmark_editor_rendering, benchmark_highlight_preparation
 }
 criterion_main!(benches);

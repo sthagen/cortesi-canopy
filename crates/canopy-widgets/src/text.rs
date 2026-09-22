@@ -1,15 +1,12 @@
 use std::cell::RefCell;
 
 use canopy::{
-    Context, ViewContext, Widget, command, derive_commands,
+    Context, FocusDirection, NodeName, Render, ViewContext, Widget, derive_commands,
     error::Result,
-    geom::{Direction, Line},
-    layout::{Constraint, MeasureConstraints, Measurement, Size},
-    render::Render,
-    state::NodeName,
+    geom::{Line, Size},
+    layout::{Constraint, MeasureConstraints, Measurement},
     text,
 };
-use unicode_width::UnicodeWidthStr;
 
 use crate::Selectable;
 
@@ -99,7 +96,7 @@ impl Text {
     }
 
     /// Replace the raw text content.
-    pub fn set_raw(&mut self, raw: impl Into<String>) {
+    pub fn set_text(&mut self, raw: impl Into<String>) {
         self.raw = raw.into();
         self.wrap_cache.borrow_mut().take();
     }
@@ -113,12 +110,12 @@ impl Text {
     /// Scroll by one line in the specified direction.
     /// @param dir The direction to scroll.
     #[command]
-    pub fn scroll(&mut self, c: &mut dyn Context, dir: Direction) {
+    pub fn scroll(&mut self, c: &mut dyn Context, dir: FocusDirection) {
         match dir {
-            Direction::Up => c.scroll_up(),
-            Direction::Down => c.scroll_down(),
-            Direction::Left => c.scroll_left(),
-            Direction::Right => c.scroll_right(),
+            FocusDirection::Up | FocusDirection::Prev => c.scroll_up(),
+            FocusDirection::Down | FocusDirection::Next => c.scroll_down(),
+            FocusDirection::Left => c.scroll_left(),
+            FocusDirection::Right => c.scroll_right(),
         };
     }
 
@@ -139,7 +136,7 @@ impl Text {
     fn raw_width(&self) -> u32 {
         text::expand_tabs(&self.raw, self.tab_stop)
             .lines()
-            .map(UnicodeWidthStr::width)
+            .map(text::display_width)
             .max()
             .unwrap_or(0) as u32
     }
@@ -162,7 +159,7 @@ impl Text {
                 .collect::<Vec<_>>();
             let max_width = lines
                 .iter()
-                .map(|line| UnicodeWidthStr::width(line.as_str()))
+                .map(|line| text::display_width(line))
                 .max()
                 .unwrap_or(0) as u32;
             *cache = Some(WrapCache {

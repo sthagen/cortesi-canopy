@@ -5,15 +5,14 @@ mod tests {
     use std::{fs, path::Path};
 
     use canopy::{
-        Canopy, CommandArg, Context, EventOutcome, FrameworkBindingGroup, InputSpec, Loader,
-        NodeId, ViewContext, Widget, command,
-        commands::{ArgValue, CommandArgs, CommandId, CommandInvocation},
+        BindingOptions, BindingPhase, BindingScope, Canopy, CommandArg, Context, ContextExt,
+        EventOutcome, FrameworkBindingGroup, Loader, NodeId, Render, ViewContext, Widget,
+        commands::ArgValue,
         derive_commands,
         error::{Error, Result, ScriptErrorKind},
         event::{Event, key::Key, mouse},
         geom::{Line, Size},
         layout::Layout,
-        render::Render,
         testing::{backend::TestRender, harness::Harness},
     };
     use serde::{Deserialize, Serialize};
@@ -63,6 +62,20 @@ mod tests {
                     self.value = 22;
                     Ok(EventOutcome::Handle)
                 }
+                Event::Mouse(mouse::MouseEvent {
+                    action: mouse::Action::Drag,
+                    ..
+                }) => {
+                    self.value = 23;
+                    Ok(EventOutcome::Handle)
+                }
+                Event::Mouse(mouse::MouseEvent {
+                    action: mouse::Action::ScrollRight,
+                    ..
+                }) => {
+                    self.value = 24;
+                    Ok(EventOutcome::Handle)
+                }
                 _ => Ok(EventOutcome::Ignore),
             }
         }
@@ -102,7 +115,9 @@ mod tests {
     }
 
     fn leaf_ids(harness: &Harness) -> Vec<NodeId> {
-        harness.find_nodes("api_root/api_leaf")
+        harness
+            .find_nodes("api_root/api_leaf")
+            .expect("valid path filter")
     }
 
     fn leaf_values(harness: &mut Harness) -> Vec<i32> {
@@ -190,10 +205,20 @@ mod tests {
                 canopy.cmd_on(first, "api_leaf::get") == 22,
                 "send_scroll should dispatch a scroll event to the target node"
             )
+            canopy.send_scroll("Right", 1, 1)
+            canopy.assert(
+                canopy.cmd_on(first, "api_leaf::get") == 24,
+                "send_scroll should dispatch horizontal wheel steps"
+            )
+            canopy.send_drag(1, 1, 2, 1)
+            canopy.assert(
+                canopy.cmd_on(first, "api_leaf::get") == 23,
+                "send_drag should press, drag, and release"
+            )
         "#,
         )?;
 
-        assert_eq!(leaf_values(&mut harness), vec![22, 9]);
+        assert_eq!(leaf_values(&mut harness), vec![23, 9]);
         Ok(())
     }
 
@@ -243,6 +268,268 @@ mod tests {
     }
 
     #[test]
+    fn command_values_bind_keys_and_mouse_and_report_their_arguments() -> Result<()> {
+        let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
+        harness.render()?;
+        harness.canopy.eval_script(
+            r#"
+            local leaves = canopy.find_nodes("api_root/api_leaf")
+            canopy.set_focus(leaves[1])
+            local id = canopy.bind("x", { description = "Set three" }, command.api_leaf.set(3))
+            canopy.bind_mouse("ScrollUp", { description = "Set five" }, command.api_leaf.set(5))
+            local found = false
+            for _, binding in canopy.bindings() do
+                if binding.id == id then
+                    found = binding.target == "command"
+                        and binding.command == "api_leaf::set"
+                        and binding.arguments[1] == 3
+                        and binding.phase == "after_widget"
+                end
+            end
+            canopy.assert(found, "a command binding reports its command and arguments")
+            canopy.assert(
+                tostring(command.api_leaf.set(3)) == "api_leaf::set(3)",
+                "a CommandCall prints its command and arguments"
+            )
+            canopy.assert(command.api_leaf.set(3) == command.api_leaf.set(3), "equal calls compare equal")
+            "#,
+        )?;
+        harness.script(r#"canopy.send_key("x")"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![3, 0]);
+        harness.script(r#"canopy.send_scroll("Up", 1, 1)"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![5, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn command_constructors_reject_bad_arguments_before_any_binding_installs() -> Result<()> {
+        let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
+        harness.render()?;
+        let runtime_type = harness
+            .canopy
+            .eval_script(
+                r#"
+                local bad: any = "oops"
+                canopy.bind("x", { description = "Bad" }, command.api_leaf.set(bad))
+                "#,
+            )
+            .expect_err("a string argument for a number parameter must fail");
+        assert!(
+            runtime_type.to_string().contains("type mismatch"),
+            "{runtime_type}"
+        );
+        let runtime_arity = harness
+            .canopy
+            .eval_script(
+                r#"
+                local set: any = command.api_leaf.set
+                canopy.bind("x", { description = "Bad" }, set())
+                "#,
+            )
+            .expect_err("a missing argument must fail");
+        assert!(
+            runtime_arity.to_string().contains("arity mismatch"),
+            "{runtime_arity}"
+        );
+        for source in [
+            // The typechecker rejects a wrong literal argument.
+            r#"canopy.bind("x", { description = "Bad" }, command.api_leaf.set("1"))"#,
+            // An owner function call runs at once and returns no action.
+            r#"canopy.bind("x", { description = "Bad" }, api_leaf.get())"#,
+            // bind_command no longer exists.
+            r#"canopy.bind_command("x", { description = "Old" }, "api_leaf::set", 1)"#,
+            // An action must be a CommandCall or a function.
+            r#"local bad: any = "api_leaf::set"
+               canopy.bind("x", { description = "Bad" }, bad)"#,
+        ] {
+            harness
+                .canopy
+                .eval_script(source)
+                .expect_err("invalid binding action should fail");
+        }
+        harness.script(r#"canopy.send_key("x")"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_named_command_fails_api_finalization() -> Result<()> {
+        struct Command;
+
+        #[derive_commands]
+        impl Command {
+            #[command]
+            fn run(&self) {}
+        }
+
+        impl Widget for Command {}
+
+        let mut canopy = Canopy::new();
+        canopy.add_commands::<Command>()?;
+        let error = canopy
+            .finalize_api()
+            .expect_err("an owner named command collides with the command global");
+        assert!(error.to_string().contains("reserved"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn keymap_installs_every_entry_in_order() -> Result<()> {
+        let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
+        harness.render()?;
+        harness.canopy.eval_script(
+            r#"
+            local leaves = canopy.find_nodes("api_root/api_leaf")
+            canopy.set_focus(leaves[1])
+            local ids = canopy.keymap({
+                {
+                    key = { "a", "b" },
+                    mouse = "ScrollUp",
+                    description = "Set one",
+                    action = command.api_leaf.set(1),
+                },
+                { key = "c", description = "Set two", action = function() api_leaf.set(2) end },
+            })
+            canopy.assert(#ids == 4, "one binding per key and mouse spec")
+            for index = 2, #ids do
+                canopy.assert(ids[index] > ids[index - 1], "ids follow entry order")
+            end
+            local sources = {}
+            local inputs = {}
+            for _, binding in canopy.bindings() do
+                for _, id in ids do
+                    if binding.id == id then
+                        table.insert(sources, binding.source)
+                        table.insert(inputs, binding.input)
+                    end
+                end
+            end
+            canopy.assert(#sources == 4, "every binding is reported")
+            for _, source in sources do
+                canopy.assert(source == sources[1], "every binding records the keymap call site")
+            end
+            canopy.assert(inputs[3] == "ScrollUp", "key bindings come before mouse bindings")
+            canopy.assert(#canopy.keymap({}) == 0, "an empty keymap installs nothing")
+            "#,
+        )?;
+        harness.script(r#"canopy.send_key("c")"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![2, 0]);
+        harness.script(r#"canopy.send_key("b")"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![1, 0]);
+        harness.script(r#"canopy.send_key("c")"#)?;
+        harness.script(r#"canopy.send_scroll("Up", 1, 1)"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![1, 0]);
+
+        // A later keymap replaces an earlier binding with the same selector.
+        harness.canopy.eval_script(
+            r#"
+            canopy.keymap({
+                { key = "a", description = "Set nine", action = command.api_leaf.set(9) },
+            })
+            "#,
+        )?;
+        harness.script(r#"canopy.send_key("a")"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![9, 0]);
+
+        // A keymap puts key and mouse entries in the same phase.
+        harness.canopy.eval_script(
+            r#"
+            canopy.keymap({
+                phase = "before_widget",
+                { key = "e", description = "Set three", action = command.api_leaf.set(3) },
+                { mouse = "ScrollDown", description = "Set four", action = command.api_leaf.set(4) },
+            })
+            for _, binding in canopy.bindings() do
+                if binding.input == "e" or binding.input == "ScrollDown" then
+                    canopy.assert(
+                        binding.phase == "before_widget",
+                        "every entry takes the keymap's phase"
+                    )
+                end
+            end
+            "#,
+        )?;
+        harness.script(r#"canopy.send_scroll("Down", 1, 1)"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![4, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn keymap_rejects_invalid_input_and_installs_nothing() -> Result<()> {
+        let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
+        harness.render()?;
+        harness.canopy.eval_script(
+            r#"
+            local leaves = canopy.find_nodes("api_root/api_leaf")
+            canopy.set_focus(leaves[1])
+            "#,
+        )?;
+        for (source, expected) in [
+            (
+                r#"canopy.keymap({ mdoe = "preview", { key = "x", description = "Set", action = command.api_leaf.set(1) } })"#,
+                "",
+            ),
+            (
+                r#"canopy.keymap({ { key = "x", mosue = "ScrollUp", description = "Set", action = command.api_leaf.set(1) } })"#,
+                "keymap entry 1 has an unknown field `mosue`",
+            ),
+            (
+                r#"canopy.keymap({ { description = "Set", action = command.api_leaf.set(1) } })"#,
+                "keymap entry 1 has neither `key` nor `mouse`",
+            ),
+            (
+                r#"canopy.keymap({ { key = {}, description = "Set", action = command.api_leaf.set(1) } })"#,
+                "is an empty array",
+            ),
+            (
+                r#"canopy.keymap({ { key = "Ctrl+", description = "Set", action = command.api_leaf.set(1) } })"#,
+                "invalid key spec",
+            ),
+            (
+                r#"canopy.keymap({
+                    { key = "x", description = "A", action = command.api_leaf.set(1) },
+                    { key = "x", description = "B", action = command.api_leaf.set(2) },
+                })"#,
+                "keymap entry 2 binds `x` more than once",
+            ),
+            (
+                r#"canopy.keymap({ { key = "x", action = command.api_leaf.set(1) } })"#,
+                "",
+            ),
+            (
+                r#"canopy.keymap({ tier = "global", { key = "x", description = "Set", action = command.api_leaf.set(1) } })"#,
+                "anchored",
+            ),
+            (
+                r#"local bad: any = "api_leaf::set"
+                   canopy.keymap({ { key = "x", description = "Set", action = bad } })"#,
+                "must be a CommandCall or a function",
+            ),
+            (
+                r#"local bad: any = "oops"
+                   canopy.keymap({ { key = "x", description = "Set", action = command.api_leaf.set(bad) } })"#,
+                "type mismatch",
+            ),
+            (
+                r#"local entries: any = { { key = "x", description = "Set", action = command.api_leaf.set(1) } }
+                   entries[3] = entries[1]
+                   canopy.keymap(entries)"#,
+                "dense array",
+            ),
+        ] {
+            let error = harness
+                .canopy
+                .eval_script(source)
+                .expect_err("invalid keymap should fail");
+            assert!(error.to_string().contains(expected), "{source}: {error}");
+        }
+        harness.script(r#"canopy.send_key("x")"#)?;
+        harness.script(r#"canopy.send_scroll("Up", 1, 1)"#)?;
+        assert_eq!(leaf_values(&mut harness), vec![0, 0]);
+        Ok(())
+    }
+
+    #[test]
     fn binding_contract_rejects_missing_or_obsolete_options() -> Result<()> {
         let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
         harness.render()?;
@@ -269,13 +556,15 @@ mod tests {
         let group = FrameworkBindingGroup::new("test.framework");
         let id = harness.canopy.bind_framework(
             group,
-            InputSpec::Key(Key::parse_spec("F1").map_err(Error::Invalid)?),
-            "/api_root/**/",
-            "Framework action",
-            CommandInvocation {
-                id: CommandId("api_leaf::get"),
-                args: CommandArgs::default(),
+            Key::parse_spec("F1")?,
+            BindingOptions {
+                path: Some("/api_root/**/".parse()?),
+                scope: BindingScope::Exclusive(group),
+                description: "Framework action".to_string(),
+                source: None,
+                phase: BindingPhase::AfterWidget,
             },
+            ApiLeaf::call_get(),
         )?;
         harness.render()?;
 
@@ -468,10 +757,10 @@ mod tests {
         let journal = canopy.script_journal();
         assert_eq!(journal.len(), 2);
         let nested = &journal[0];
-        assert_eq!(nested.origin, "default-bindings:api_leaf");
+        assert_eq!(nested.origin.to_string(), "default-bindings:api_leaf");
         assert_eq!(nested.logs, vec!["from bindings".to_string()]);
         let outer = &journal[1];
-        assert_eq!(outer.origin, "eval");
+        assert_eq!(outer.origin.to_string(), "eval");
         assert_eq!(
             outer.logs,
             vec![
@@ -560,7 +849,7 @@ mod tests {
 
         assert_eq!(canopy.run_startup_scripts()?, 3);
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(33)
         );
         assert_eq!(canopy.run_startup_scripts()?, 0);
@@ -604,7 +893,7 @@ mod tests {
 
         assert_eq!(canopy.run_startup_scripts()?, 1);
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(1)
         );
         Ok(())
@@ -628,7 +917,7 @@ mod tests {
             .expect_err("startup execution should fail");
         canopy.eval_script(r#"canopy.send_key("x")"#)?;
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(0)
         );
         Ok(())
@@ -662,20 +951,20 @@ mod tests {
             .run_startup_scripts()
             .expect_err("second startup should fail");
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(11)
         );
         canopy
             .run_startup_scripts()
             .expect_err("second startup retry should fail");
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(21)
         );
 
         canopy.eval_script(r#"canopy.send_key("x")"#)?;
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(7)
         );
 
@@ -683,19 +972,19 @@ mod tests {
         canopy.set_root_size(Size::new(10, 1))?;
         canopy.render(&mut render)?;
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(7)
         );
 
         let first_runs = canopy
             .script_journal()
             .iter()
-            .filter(|entry| entry.origin == "startup:first")
+            .filter(|entry| entry.origin.to_string() == "startup:first")
             .count();
         let second_runs = canopy
             .script_journal()
             .iter()
-            .filter(|entry| entry.origin == "startup:second")
+            .filter(|entry| entry.origin.to_string() == "startup:second")
             .count();
         assert_eq!(first_runs, 1);
         assert_eq!(second_runs, 2);
@@ -770,20 +1059,24 @@ mod tests {
         canopy.run_config(&config)?;
 
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(44)
         );
 
         write_script(&project_root.join("lib.luau"), "return { value = 45 }");
-        assert!(canopy.invalidate_script_modules(Some("@project")).is_some());
+        assert!(
+            canopy
+                .invalidate_script_modules(Some("@project"))?
+                .is_some()
+        );
         canopy.eval_script(r#"canopy.send_key("x")"#)?;
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(44)
         );
         canopy.run_config(&config)?;
         assert_eq!(
-            canopy.eval_script_value("return api_leaf.get()")?,
+            canopy.eval_script("return api_leaf.get()")?,
             ArgValue::Int(45)
         );
 
@@ -922,7 +1215,7 @@ mod tests {
     fn command_discovery_reports_contract_and_availability() -> Result<()> {
         let mut harness = Harness::builder(ScriptTarget::new()).size(10, 1).build()?;
 
-        let command = harness.canopy.eval_script_value(
+        let command = harness.canopy.eval_script(
             r#"
             local found: any = nil
             for _, command in ipairs(canopy.commands()) do
@@ -952,10 +1245,10 @@ mod tests {
 
         let resolved = harness
             .canopy
-            .eval_script_value(r#"return canopy.resolve("script_target") ~= nil"#)?;
+            .eval_script(r#"return canopy.resolve("script_target") ~= nil"#)?;
         assert_eq!(resolved, ArgValue::Bool(true));
 
-        let forged_node = harness.canopy.eval_script_value(
+        let forged_node = harness.canopy.eval_script(
             r#"
             local forged: any = 1
             local ok, err = pcall(function()
@@ -978,7 +1271,7 @@ mod tests {
             Some(&ArgValue::String("NodeId".to_string()))
         );
 
-        let error = harness.canopy.eval_script_value(
+        let error = harness.canopy.eval_script(
             r#"
             local ok, err = pcall(function()
                 canopy.cmd("missing::command")
@@ -1000,7 +1293,7 @@ mod tests {
             Some(&ArgValue::String("missing::command".to_string()))
         );
 
-        let payload_param = harness.canopy.eval_script_value(
+        let payload_param = harness.canopy.eval_script(
             r#"
             for _, command in ipairs(canopy.commands()) do
                 if command.name == "set_payload" then
@@ -1027,7 +1320,7 @@ mod tests {
 
         let value = harness
             .canopy
-            .eval_script_value(r#"canopy.log("hello"); canopy.assert(true, "ok"); return 7"#)?;
+            .eval_script(r#"canopy.log("hello"); canopy.assert(true, "ok"); return 7"#)?;
         assert_eq!(value, ArgValue::Int(7));
         assert_eq!(harness.canopy.take_script_logs(), vec!["hello"]);
 
@@ -1040,16 +1333,13 @@ mod tests {
     }
 
     #[test]
-    fn on_start_hooks_run_after_first_render() -> Result<()> {
+    fn on_start_hooks_run_during_preparation_after_geometry() -> Result<()> {
         let mut harness = Harness::builder(ScriptTarget::new()).size(10, 1).build()?;
 
         harness
             .canopy
             .eval_script("canopy.on_start(function() script_target.set(21) end)")?;
-        harness.with_root_widget::<ScriptTarget, _>(|target| {
-            assert_eq!(target.value, 0);
-        });
-
+        // Synchronous eval drives its final preparation before returning.
         harness.render()?;
         harness.with_root_widget::<ScriptTarget, _>(|target| {
             assert_eq!(target.value, 21);
@@ -1068,20 +1358,17 @@ mod tests {
         let mut harness = Harness::builder(ScriptTarget::new()).size(10, 1).build()?;
         harness
             .canopy
-            .eval_script("canopy.on_start(function() script_target.set(1) end)")?;
-        harness.canopy.eval_script(
-            r#"
+            .eval_script(
+                r#"
+            canopy.on_start(function() script_target.set(1) end)
             canopy.on_start(function()
                 canopy.on_start(function() script_target.set(4) end)
                 error("hook failed")
             end)
+            canopy.on_start(function() script_target.set(3) end)
         "#,
-        )?;
-        harness
-            .canopy
-            .eval_script("canopy.on_start(function() script_target.set(3) end)")?;
-
-        harness.render().expect_err("second hook should fail");
+            )
+            .expect_err("second hook should fail during evaluation preparation");
         harness.with_root_widget::<ScriptTarget, _>(|target| {
             assert_eq!(target.value, 1);
         });
@@ -1102,6 +1389,50 @@ mod tests {
         let api = canopy.script_api()?;
         assert_eq!(api.matches("export type TreePayload").count(), 1);
         assert!(api.contains("children: {TreePayload}"));
+        Ok(())
+    }
+    #[test]
+    fn screen_regions_clamp_signed_dimensions() -> Result<()> {
+        let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
+        harness.render()?;
+        harness.script(
+            r#"
+            for _, size in {{-1, 1}, {1, -1}, {0, 1}, {1, 0}} do
+                canopy.assert(canopy.screen_region(0, 0, size[1], size[2]) == "")
+            end
+            local screen = canopy.screen_text()
+            canopy.assert(canopy.screen_region(0, 0, 20, 5) == screen)
+            canopy.assert(canopy.screen_region(0, 0, 5000000000, 5000000000) == screen)
+            canopy.assert(canopy.screen_region(-1, -1, 21, 6) == screen)
+            canopy.assert(canopy.screen_region(30, 30, 10, 10) == "")
+            canopy.assert(canopy.screen_region(0, 0, 1, 1) == "0")
+        "#,
+        )
+    }
+
+    #[test]
+    fn recursive_tree_declarations_match_runtime_records() -> Result<()> {
+        let mut harness = Harness::builder(ApiRoot).size(20, 5).build()?;
+        let source = r#"
+            local function visit(node: TreeNode)
+                local name: string = node.name
+                canopy.node_info(node.id)
+                for _, child in node.children do
+                    visit(child)
+                end
+            end
+            visit(canopy.tree())
+            for _, child in canopy.node_info(canopy.root()).children do
+                canopy.node_info(child)
+            end
+        "#;
+        let checked = harness.canopy.check_script("recursive-tree.luau", source)?;
+        assert!(checked.is_ok(), "{:?}", checked.diagnostics());
+        harness.script(source)?;
+        let invalid = harness
+            .canopy
+            .check_script("tree-is-not-handle.luau", "canopy.node_info(canopy.tree())")?;
+        assert!(!invalid.is_ok());
         Ok(())
     }
 }

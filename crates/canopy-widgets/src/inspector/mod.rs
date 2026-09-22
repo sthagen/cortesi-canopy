@@ -1,11 +1,8 @@
-/// Log panel widget.
-pub mod logs;
-/// Inspector view layout.
-mod view;
+mod logs;
 
 use canopy::{
-    Canopy, Context, Loader, NodeId, ViewContext, Widget, derive_commands, error::Result,
-    layout::Layout, render::Render, state::NodeName,
+    Canopy, Context, ContextExt, Loader, NodeId, NodeName, Render, ViewContext, Widget,
+    derive_commands, error::Result, layout::Layout,
 };
 use logs::Logs;
 
@@ -13,42 +10,30 @@ use crate::frame;
 
 /// Default inspector bindings exposed through `inspector.default_bindings()`.
 const DEFAULT_BINDINGS: &str = r#"
-canopy.bind("C", { path = "logs", description = "Clear log entry" }, function()
-    logs.clear()
-end)
-canopy.bind("d", { path = "logs", description = "Delete selected log entry" }, function()
-    logs.delete_selected()
-end)
-canopy.bind("j", { path = "logs", description = "Next log entry" }, function()
-    logs.select_by(1)
-end)
-canopy.bind("k", { path = "logs", description = "Previous log entry" }, function()
-    logs.select_by(-1)
-end)
-canopy.bind("g", { path = "logs", description = "First log entry" }, function()
-    logs.select_first()
-end)
-canopy.bind("G", { path = "logs", description = "Last log entry" }, function()
-    logs.select_last()
-end)
-canopy.bind("Space", { path = "logs", description = "Page down" }, function()
-    logs.page(1)
-end)
-canopy.bind("PageDown", { path = "logs", description = "Page down" }, function()
-    logs.page(1)
-end)
-canopy.bind("PageUp", { path = "logs", description = "Page up" }, function()
-    logs.page(-1)
-end)
-canopy.bind("Down", { path = "logs", description = "Next log entry" }, function()
-    logs.select_by(1)
-end)
-canopy.bind("Up", { path = "logs", description = "Previous log entry" }, function()
-    logs.select_by(-1)
-end)
+canopy.keymap({
+    path = "logs",
+    { key = "C", description = "Clear log entry", action = command.logs.clear() },
+    {
+        key = "d",
+        description = "Delete selected log entry",
+        action = command.logs.delete_selected(),
+    },
+    { key = { "j", "Down" }, description = "Next log entry", action = command.logs.select_by(1) },
+    {
+        key = { "k", "Up" },
+        description = "Previous log entry",
+        action = command.logs.select_by(-1),
+    },
+    { key = "g", description = "First log entry", action = command.logs.select_first() },
+    { key = "G", description = "Last log entry", action = command.logs.select_last() },
+    { key = { "Space", "PageDown" }, description = "Page down", action = command.logs.page(1) },
+    { key = "PageUp", description = "Page up", action = command.logs.page(-1) },
+})
 "#;
 
 /// Inspector overlay widget.
+///
+/// Keeps the latest 1,000 log entries, truncating each to 4,096 UTF-8 bytes.
 pub struct Inspector;
 
 #[derive_commands]
@@ -60,20 +45,14 @@ impl Inspector {
 
     /// Build the inspector subtree and return its node id.
     pub(crate) fn install(context: &mut dyn Context) -> Result<NodeId> {
-        let view_id = view::View::install(context)?;
+        let logs_id = context.create_detached(Logs::new())?;
         let frame_id = context.create_detached(frame::Frame::new())?;
-        context.set_children_of(frame_id.into(), vec![view_id])?;
+        context.set_children_of(frame_id.into(), vec![logs_id.into()])?;
 
         let inspector_id = context.create_detached(Self::new())?;
         context.set_children_of(inspector_id.into(), vec![frame_id.into()])?;
 
         Ok(inspector_id.into())
-    }
-}
-
-impl Default for Inspector {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

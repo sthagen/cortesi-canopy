@@ -1,8 +1,9 @@
 use canopy::{
-    command, derive_commands,
-    geom::{Direction, Line},
-    layout::CanvasContext,
-    prelude::*,
+    Canopy, CanopyBuilder, ChildSlot, Context, ContextExt, FocusDirection, Loader, Render,
+    ViewContext, Widget, derive_commands,
+    error::Result,
+    geom::{Line, Size},
+    layout::{CanvasContext, Layout, MeasureConstraints, Measurement},
 };
 use canopy_widgets::Frame;
 
@@ -13,17 +14,15 @@ const PATTERN: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const FRAMEGYM_PREFIX: &str = r#"
 root.default_bindings()
 
-canopy.bind("Tab", { path = "frame_gym", description = "Next focus" }, function()
-    root.focus("Next")
-end)
+canopy.bind("Tab", { path = "frame_gym", description = "Next focus" }, command.root.focus("Next"))
 "#;
 
 // Typed keys for keyed children
-canopy::key!(FrameSlot: Frame);
-canopy::key!(PatternSlot: TestPattern);
+canopy::slot!(pub(crate) FrameSlot: Frame);
+canopy::slot!(pub(crate) PatternSlot: TestPattern);
 
 /// A widget that renders a test pattern.
-pub struct TestPattern {
+pub(crate) struct TestPattern {
     /// Virtual canvas size.
     size: Size,
 }
@@ -45,31 +44,22 @@ impl TestPattern {
 
     #[command]
     /// Scroll to an absolute content position.
-    pub fn scroll_to(&mut self, c: &mut dyn Context, x: u32, y: u32) {
+    pub(crate) fn scroll_to(&self, c: &mut dyn Context, x: u32, y: u32) {
         c.scroll_to(x, y);
     }
 
     #[command]
     /// Scroll by one line in the specified direction.
     /// @param dir The direction to scroll.
-    pub fn scroll(&mut self, c: &mut dyn Context, dir: Direction) {
-        match dir {
-            Direction::Up => c.scroll_up(),
-            Direction::Down => c.scroll_down(),
-            Direction::Left => c.scroll_left(),
-            Direction::Right => c.scroll_right(),
-        };
+    pub(crate) fn scroll(&self, c: &mut dyn Context, dir: FocusDirection) {
+        crate::scroll_in(c, dir);
     }
 
     #[command]
     /// Page the view. Negative values move up; positive values move down.
     /// @param delta Signed page delta.
-    pub fn page(&mut self, c: &mut dyn Context, delta: i32) {
-        if delta < 0 {
-            c.page_up();
-        } else if delta > 0 {
-            c.page_down();
-        }
+    pub(crate) fn page(&self, c: &mut dyn Context, delta: i32) {
+        crate::page_by(c, delta);
     }
 
     /// Return the character for the test pattern at a position.
@@ -105,14 +95,14 @@ impl Widget for TestPattern {
         // The view automatically handles the visible window for us
         // We just need to render the content that's visible
         for y in 0..view_height {
-            let absolute_y = view.tl.y + y;
+            let absolute_y = view.scroll.y + y;
             if absolute_y >= self.size.h {
                 break;
             }
 
             let mut line = String::with_capacity(view_width as usize);
             for x in 0..view_width {
-                let absolute_x = view.tl.x + x;
+                let absolute_x = view.scroll.x + x;
                 if absolute_x >= self.size.w {
                     break;
                 }
@@ -152,8 +142,8 @@ impl FrameGym {
 
 impl Widget for FrameGym {
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
-        let frame_id = c.add_keyed::<FrameSlot>(Frame::new().with_title("Frame Gym"))?;
-        let pattern_id = c.add_keyed_to(frame_id, PatternSlot::KEY, TestPattern::new())?;
+        let frame_id = c.add_slot::<FrameSlot>(Frame::new().with_title("Frame Gym"))?;
+        let pattern_id = c.add_slot_to(frame_id, PatternSlot::KEY, TestPattern::new())?;
 
         c.set_layout(Layout::fill())?;
         c.set_layout_of(pattern_id, Layout::fill())?;
@@ -168,9 +158,13 @@ impl Loader for FrameGym {
     }
 }
 
-/// Install key bindings for the frame gym demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.eval_script(FRAMEGYM_PREFIX)?;
-    cnpy.eval_script(&crate::text_scroll_bindings("test_pattern", "frame_gym"))?;
-    Ok(())
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder
+        .bindings("framegym-prefix", FRAMEGYM_PREFIX)
+        .bindings(
+            "framegym-scroll",
+            crate::text_scroll_bindings("test_pattern", "frame_gym"),
+        )
 }

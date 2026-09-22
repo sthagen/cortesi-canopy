@@ -1,4 +1,7 @@
-use canopy::prelude::*;
+use canopy::{
+    Canopy, CanopyBuilder, Context, ContextExt, Loader, ViewContext, Widget, error::Result,
+    layout::Layout,
+};
 use canopy_widgets::{Frame, Text};
 
 /// Simple pager widget for file contents.
@@ -37,8 +40,8 @@ impl Loader for Pager {
     }
 }
 
-/// Install key bindings for the pager demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.eval_script(&crate::text_scroll_bindings("text", "pager"))?;
-    Ok(())
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.bindings("pager", crate::text_scroll_bindings("text", "pager"))
 }

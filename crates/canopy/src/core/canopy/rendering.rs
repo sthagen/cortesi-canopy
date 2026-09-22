@@ -1,15 +1,20 @@
 //! Rendering pipeline for the canopy facade.
 
-use super::Canopy;
+use std::sync::Arc;
+
+use super::{Canopy, FrameId};
 use crate::{
     NodeId,
-    core::{context::CoreViewContext, termbuf::TermBuf, view::View, world::WidgetOperation},
+    core::{
+        context::CoreViewContext, snapshot, termbuf::TermBuf, view::View, wake::WorkStamp,
+        world::WidgetOperation,
+    },
     cursor,
-    error::Result,
+    error::{Error, Result},
     geom::{Point, Rect, Size},
     layout::Display,
-    render::{NopBackend, Render, RenderBackend},
-    style::{Effect, StyleManager},
+    render::{Render, RenderBackend},
+    style::{StyleManager, effects::Effect},
 };
 
 /// Rendering traversal scratch state shared across recursion.
@@ -24,29 +29,49 @@ struct RenderTraversal<'a> {
 
 impl Canopy {
     /// Render the tree only if a render is pending.
+    #[cfg(test)]
     pub(crate) fn render_if_pending<R: RenderBackend>(&mut self, be: &mut R) -> Result<bool> {
-        if !self.render_pending {
+        if !self.render_pending && !self.core.changes.is_pending() {
             return Ok(false);
         }
         self.render(be)?;
         Ok(true)
     }
 
-    /// Refresh the cached terminal buffer without producing user-visible
-    /// output.
-    pub(crate) fn refresh_snapshot(&mut self) -> Result<()> {
-        let mut backend = NopBackend;
-        let _ignored = self.render_if_pending(&mut backend)?;
-        Ok(())
-    }
-
     /// Poll one node and schedule its next callback.
     pub(crate) fn poll_node(&mut self, node_id: NodeId) -> Result<()> {
-        if let Some(next) = self
+        let entry = self
             .core
-            .with_widget_ctx(node_id, |widget, ctx| widget.poll(ctx))?
+            .nodes
+            .get(node_id)
+            .ok_or(Error::NodeNotFound(node_id))?;
+        let attachment = match entry.poll_lifetime {
+            crate::WorkLifetime::Node => None,
+            crate::WorkLifetime::Attachment => {
+                let Some(generation) = entry.attachment_generation else {
+                    return Ok(());
+                };
+                Some(generation)
+            }
+        };
+        let stamp = WorkStamp {
+            node: node_id,
+            incarnation: entry.incarnation,
+            attachment,
+        };
+        // An explicit wake can arrive before the existing timer. Consume that
+        // timer too, so the callback's return value decides all future polling.
+        self.poller.cancel_owner(stamp.node, stamp.incarnation);
+        let result = self.with_dispatch_boundary(|canopy| {
+            canopy
+                .core
+                .with_widget_ctx(node_id, |widget, ctx| widget.poll(ctx))
+        });
+        let next = result?;
+        if self.core.work_stamp_valid(stamp)
+            && let Some(next) = next
         {
-            self.poller.schedule(node_id, next)?;
+            self.poller.schedule(stamp, next)?;
         }
         Ok(())
     }
@@ -87,7 +112,10 @@ impl Canopy {
                 }
             }
 
-            let children = self.core.nodes[id].children.clone();
+            let Some(node) = self.core.nodes.get(id) else {
+                continue;
+            };
+            let children = node.children.clone();
             for child in children.into_iter().rev() {
                 stack.push(child);
             }
@@ -150,6 +178,9 @@ impl Canopy {
         let saved_len = traversal.effect_stack.len();
 
         traversal.effect_stack.extend(node.effects.iter().cloned());
+        traversal
+            .effect_stack
+            .extend(self.core.modal_effects_for(node_id));
 
         let current_len = active_len + traversal.effect_stack.len() - saved_len;
 
@@ -207,9 +238,9 @@ impl Canopy {
         let mut current = self.core.focus;
         let mut cursor_spec: Option<(View, cursor::Cursor)> = None;
         while let Some(id) = current {
-            let cursor =
-                self.core
-                    .with_widget_read(id, WidgetOperation::render("cursor"), |w, _| w.cursor())?;
+            let cursor = self
+                .core
+                .with_widget(id, WidgetOperation::render("cursor"), |w, _| w.cursor())?;
             if let Some(node_cursor) = cursor
                 && let Some(node) = self.core.nodes.get(id)
             {
@@ -234,45 +265,80 @@ impl Canopy {
         Ok(())
     }
 
-    /// Render the widget tree. All visible nodes are rendered.
-    pub fn render<R: RenderBackend>(&mut self, be: &mut R) -> Result<()> {
-        let first_render = self.termbuf.is_none();
+    /// Bring geometry up to date without painting, so the input routed next
+    /// hit-tests the current tree.
+    pub(super) fn settle_layout(&mut self) -> Result<()> {
+        let Some(root_size) = self.root_size else {
+            return Ok(());
+        };
+        if !self.core.changes.layout {
+            return Ok(());
+        }
+        self.pre_render()?;
+        self.core.update_layout(root_size)
+    }
 
-        // Apply pending style change from Context::set_style
+    /// Prepare and publish pending state without writing to a backend.
+    pub(super) fn prepare_frame(&mut self, force: bool) -> Result<bool> {
+        if !self.driver.startup_attempted {
+            self.run_startup_scripts_inner()?;
+        }
+        if !force
+            && !self.render_pending
+            && !self.core.changes.is_pending()
+            && !self.script_host.has_on_start_hooks()
+            && !self.mode_hooks_pending()
+        {
+            return Ok(false);
+        }
+        let Some(root_size) = self.root_size else {
+            return Ok(false);
+        };
         if let Some(new_style) = self.core.pending_style.take() {
             self.style = new_style;
         }
-
-        if let Some(root_size) = self.root_size {
+        self.run_mode_hooks()?;
+        self.pre_render()?;
+        self.core.update_layout(root_size)?;
+        if self.run_on_start_hooks()? {
+            self.pre_render()?;
             self.core.update_layout(root_size)?;
-
-            let layout_dirty = self.pre_render()?;
-            if layout_dirty {
-                self.core.update_layout(root_size)?;
-            }
-
-            let next = self.render_pass(root_size)?;
-
-            be.reset()?;
-
-            if let Some(prev) = &self.termbuf {
-                next.diff(prev, be)?;
-            } else {
-                next.render(be)?;
-            }
-            self.termbuf = Some(next);
-
-            if let Some(target) = self.core.take_diagnostic_dump_request() {
-                eprintln!("{}", self.diagnostic_dump(target));
-            }
-
-            if first_render && self.run_on_start_hooks()? {
-                return self.render(be);
-            }
-
-            self.render_pending = false;
         }
+        let next = self.render_pass(root_size)?;
+        let frame_id = FrameId(self.driver.publication.generation() + 1);
+        let observation = snapshot::capture(&self.core, frame_id, &next)?;
+        self.termbuf = Some(next);
+        self.snapshot = Some(Arc::new(observation));
+        self.render_pending = false;
+        self.core.changes = crate::ChangeSet::default();
+        self.driver.publication.publish();
+        if let Some(target) = self.core.pending_diagnostic_dump.take() {
+            eprintln!("{}", self.diagnostic_dump(target));
+        }
+        Ok(true)
+    }
 
+    /// Emit published cells. After a backend failure, repaint the next frame
+    /// in full because some output may already have reached the terminal.
+    pub(crate) fn emit_frame<R: RenderBackend>(&mut self, be: &mut R) -> Result<()> {
+        let Some(next) = &self.termbuf else {
+            return Ok(());
+        };
+        let previous = self.emitted_buf.take();
+        be.reset()?;
+        if let Some(previous) = previous {
+            next.diff(&previous, be)?;
+        } else {
+            next.render(be)?;
+        }
+        be.flush()?;
+        self.emitted_buf = Some(next.clone());
         Ok(())
+    }
+
+    /// Prepare and render the widget tree explicitly.
+    pub fn render<R: RenderBackend>(&mut self, be: &mut R) -> Result<()> {
+        self.prepare_frame(true)?;
+        self.emit_frame(be)
     }
 }

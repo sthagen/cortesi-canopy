@@ -3,15 +3,23 @@
 use std::path::Path;
 
 use canopy::{
-    Canopy, Context, Loader, ViewContext, Widget, command,
-    commands::ZoomDirection,
-    derive_commands, error as canopy_error,
-    geom::{Direction, Point, Rect, Size},
+    Canopy, CommandEnum, Context, FocusDirection, Loader, Render, ViewContext, Widget,
+    derive_commands,
+    error::{Error, Result},
+    geom::{Point, Rect, Size},
     layout::{CanvasContext, Layout},
-    render::Render,
-    style::{AttrSet, Color, ResolvedStyle},
+    style::{AttrSet, Color, Style},
 };
-use image::RgbaImage;
+use image::{DynamicImage, ImageDecoder, RgbaImage};
+
+/// Direction for zoom commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CommandEnum)]
+pub enum ZoomDirection {
+    /// Zoom in.
+    In,
+    /// Zoom out.
+    Out,
+}
 
 /// Character used to render two vertical pixels per terminal cell.
 const HALF_BLOCK: char = '\u{2580}';
@@ -25,6 +33,12 @@ const ZOOM_STEP: f32 = 1.25;
 const PAN_STEP_COLUMNS: i32 = 1;
 /// Pan step in terminal rows.
 const PAN_STEP_ROWS: i32 = 1;
+/// Maximum source pixel count for thumbnail previews.
+const PREVIEW_MAX_PIXELS: u64 = 32 * 1024 * 1024;
+/// Decoder allocation budget for thumbnail previews, excluding conversion.
+const PREVIEW_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+/// Largest retained thumbnail edge, regardless of caller-provided bounds.
+const PREVIEW_MAX_EDGE: u32 = 1024;
 
 /// Summed-area table for fast image region sampling.
 struct IntegralImage {
@@ -98,6 +112,68 @@ impl IntegralImage {
             self.sum_channel(&self.blue, left, top, right, bottom),
         )
     }
+}
+
+/// Decode an image file into RGBA pixels.
+fn read_rgba(path: &Path) -> Result<RgbaImage> {
+    let image = image::open(path).map_err(|err| Error::Invalid(format!("image error: {err}")))?;
+    Ok(image.into_rgba8())
+}
+
+/// Decode within a source budget, then shrink before building sampling tables.
+fn read_preview(path: &Path, bounds: Size) -> Result<RgbaImage> {
+    if bounds.w == 0 || bounds.h == 0 {
+        return Err(Error::Invalid(
+            "image preview bounds must be nonzero".into(),
+        ));
+    }
+    let bounds = Size::new(
+        bounds.w.min(PREVIEW_MAX_EDGE),
+        bounds.h.min(PREVIEW_MAX_EDGE),
+    );
+    let image_error = |err| Error::Invalid(format!("image error: {err}"));
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|err| Error::Invalid(format!("image error: {err}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(PREVIEW_DECODE_BYTES);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().map_err(image_error)?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > PREVIEW_MAX_PIXELS {
+        return Err(Error::Invalid(format!(
+            "image preview limited to {PREVIEW_MAX_PIXELS} pixels"
+        )));
+    }
+    // ImageReader::decode reserves the output buffer before passing the
+    // remaining budget to the decoder. Keep that accounting after inspecting
+    // dimensions, so conversion and sampling cannot expand an unchecked image.
+    limits.reserve(decoder.total_bytes()).map_err(image_error)?;
+    decoder.set_limits(limits).map_err(image_error)?;
+    let image = DynamicImage::from_decoder(decoder).map_err(image_error)?;
+    Ok(thumbnail(image, bounds))
+}
+
+/// Downsample colors already composited onto the viewer's black background.
+fn thumbnail(image: DynamicImage, bounds: Size) -> RgbaImage {
+    if image.width() <= bounds.w && image.height() <= bounds.h {
+        return image.into_rgba8();
+    }
+    let image = if image.has_alpha() {
+        let mut rgba = image.into_rgba8();
+        for pixel in rgba.pixels_mut() {
+            let alpha = u16::from(pixel[3]);
+            if alpha != 255 {
+                for channel in &mut pixel.0[..3] {
+                    *channel = (u16::from(*channel) * alpha / 255) as u8;
+                }
+                pixel[3] = 255;
+            }
+        }
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        image
+    };
+    image.thumbnail(bounds.w, bounds.h).into_rgba8()
 }
 
 /// Widget that renders an image into terminal cells.
@@ -293,8 +369,9 @@ impl ImageView {
         origin: Point,
         offset: (f32, f32),
         zoom: f32,
-    ) -> canopy_error::Result<()> {
+    ) -> Result<()> {
         let (offset_x, offset_y) = offset;
+        let bounds = Rect::new(origin.x, origin.y, view.w, view.h);
 
         for row_index in 0..view.h {
             let top_subpixel_row = view.tl.y.saturating_add(row_index).saturating_mul(2);
@@ -306,12 +383,16 @@ impl ImageView {
                 let column = (view.tl.x + column_index) as f32 - offset_x;
                 let top_color = self.sample_color(zoom, column, top_row);
                 let bottom_color = self.sample_color(zoom, column, bottom_row);
-                let style = ResolvedStyle::new(top_color, bottom_color, AttrSet::default());
+                let style = render.apply_effects(Style {
+                    fg: top_color.into(),
+                    bg: bottom_color.into(),
+                    attrs: AttrSet::default(),
+                });
                 let point = Point {
                     x: origin.x + column_index,
                     y: origin.y + row_index,
                 };
-                render.put_cell(style, point, HALF_BLOCK)?;
+                render.put_cell(style.resolve_at(bounds, point), point, HALF_BLOCK)?;
             }
         }
 
@@ -333,17 +414,55 @@ impl ImageView {
     }
 
     /// Create a new image view widget from a file path.
-    pub fn from_path(path: impl AsRef<Path>) -> canopy_error::Result<Self> {
-        let image = image::open(path.as_ref())
-            .map_err(|err| canopy_error::Error::Invalid(format!("image error: {err}")))?;
-        let rgba = image.to_rgba8();
-        Ok(Self::new(&rgba))
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::new(&read_rgba(path.as_ref())?))
+    }
+
+    /// Create an image view with nothing to show yet.
+    ///
+    /// The view holds a single transparent pixel until [`Self::set_image`] or
+    /// [`Self::set_path`] gives it real content. Callers that mount a viewer
+    /// before they have an image should keep it hidden until then.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(&RgbaImage::new(1, 1))
+    }
+
+    /// Show a different image, returning the view to its auto-fitted state.
+    pub fn set_image(&mut self, image: &RgbaImage) {
+        *self = Self::new(image);
+    }
+
+    /// Show the image at `path`, returning the view to its auto-fitted state.
+    ///
+    /// The view keeps its current image when the file cannot be read.
+    pub fn set_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        self.set_image(&read_rgba(path.as_ref())?);
+        Ok(())
+    }
+
+    /// Load a thumbnail within `bounds`, preserving its aspect ratio.
+    ///
+    /// Small images keep their original pixels. Larger images are averaged
+    /// after compositing transparency onto black. Zooming uses the thumbnail;
+    /// use [`Self::set_path`] to retain full-resolution zooming instead.
+    ///
+    /// The source is limited to 32 * 1024 * 1024 pixels and the decoder has a
+    /// 128 MiB allocation budget. Conversion can allocate one additional RGBA
+    /// source buffer. Each thumbnail edge is capped at 1024 pixels, even when
+    /// `bounds` is larger. Sampling tables use at most 24 * (width + 1) *
+    /// (height + 1) bytes for the thumbnail dimensions. Zero bounds are
+    /// invalid. On failure, the current image is preserved. Callers should
+    /// also bound the encoded file size.
+    pub fn set_preview_path(&mut self, path: impl AsRef<Path>, bounds: Size) -> Result<()> {
+        self.set_image(&read_preview(path.as_ref(), bounds)?);
+        Ok(())
     }
 
     /// Zoom around the view center.
     /// @param dir The zoom direction.
     #[command]
-    pub fn zoom(&mut self, ctx: &mut dyn Context, dir: ZoomDirection) -> canopy_error::Result<()> {
+    pub fn zoom(&mut self, ctx: &mut dyn Context, dir: ZoomDirection) -> Result<()> {
         let view = ctx.view();
         let view_size = view.content_size();
         self.zoom = self.effective_zoom(view_size);
@@ -352,7 +471,7 @@ impl ImageView {
             ZoomDirection::In => ZOOM_STEP,
             ZoomDirection::Out => 1.0 / ZOOM_STEP,
         };
-        let scroll = self.zoom_by(view_size, view.tl, factor);
+        let scroll = self.zoom_by(view_size, view.scroll, factor);
         ctx.scroll_to(scroll.x, scroll.y);
         Ok(())
     }
@@ -360,19 +479,19 @@ impl ImageView {
     /// Pan by one step in the specified direction.
     /// @param dir The pan direction.
     #[command]
-    pub fn pan(&mut self, ctx: &mut dyn Context, dir: Direction) -> canopy_error::Result<()> {
+    pub fn pan(&mut self, ctx: &mut dyn Context, dir: FocusDirection) -> Result<()> {
         self.auto_fit = false;
         match dir {
-            Direction::Left => {
+            FocusDirection::Left | FocusDirection::Prev => {
                 ctx.scroll_by(-PAN_STEP_COLUMNS, 0);
             }
-            Direction::Right => {
+            FocusDirection::Right | FocusDirection::Next => {
                 ctx.scroll_by(PAN_STEP_COLUMNS, 0);
             }
-            Direction::Up => {
+            FocusDirection::Up => {
                 ctx.scroll_by(0, -PAN_STEP_ROWS);
             }
-            Direction::Down => {
+            FocusDirection::Down => {
                 ctx.scroll_by(0, PAN_STEP_ROWS);
             }
         }
@@ -387,7 +506,7 @@ impl Widget for ImageView {
     }
 
     fn canvas(&self, view: Size, _ctx: &CanvasContext) -> Size {
-        let view_size = Size::new(view.w, view.h);
+        let view_size = view;
         let zoom = self.effective_zoom(view_size);
         let width = (self.image_width_f32() * zoom).ceil() as u32;
         let height = ((self.image_height_f32() * zoom) / 2.0).ceil() as u32;
@@ -395,7 +514,7 @@ impl Widget for ImageView {
     }
 
     /// Render the current image view into the terminal buffer.
-    fn render(&mut self, render: &mut Render, ctx: &dyn ViewContext) -> canopy_error::Result<()> {
+    fn render(&mut self, render: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
         let view = ctx.view();
         let view_rect = view.view_rect();
         if view_rect.w == 0 || view_rect.h == 0 {
@@ -417,7 +536,7 @@ impl Widget for ImageView {
 
 impl Loader for ImageView {
     /// Register commands for the image viewer widget.
-    fn load(cnpy: &mut Canopy) -> canopy_error::Result<()> {
+    fn load(cnpy: &mut Canopy) -> Result<()> {
         cnpy.add_commands::<Self>()?;
         Ok(())
     }
@@ -425,12 +544,279 @@ impl Loader for ImageView {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, sync::Arc};
+
+    use canopy::{
+        ContextExt,
+        style::{
+            GradientSpec, GradientStop, Paint,
+            effects::{self, Effect, StyleEffect},
+        },
+        testing::harness::Harness,
+    };
     use image::Rgba;
 
     use super::*;
 
     fn make_view(width: u32, height: u32) -> Size {
         Size::new(width, height)
+    }
+
+    #[test]
+    fn preview_paths_bound_tables_without_changing_full_resolution_loading() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let source = RgbaImage::from_pixel(512, 256, image::Rgba([80, 160, 40, 255]));
+        for extension in ["png", "jpg", "gif", "webp"] {
+            let path = directory.path().join(format!("image.{extension}"));
+            if extension == "jpg" {
+                DynamicImage::ImageRgba8(source.clone())
+                    .into_rgb8()
+                    .save(&path)
+                    .unwrap();
+            } else {
+                source.save(&path).unwrap();
+            }
+            let mut view = ImageView::empty();
+            view.set_preview_path(&path, Size::new(64, 64))?;
+            assert_eq!(
+                (view.image_width, view.image_height),
+                (64, 32),
+                "{extension}"
+            );
+            assert_eq!(view.integral.red.len(), 65 * 33);
+            let (r, g, b) = view.sample_region(0.0, 0.0, 64.0, 32.0).unwrap();
+            assert!(
+                r.abs_diff(80) <= 2 && g.abs_diff(160) <= 2 && b.abs_diff(40) <= 2,
+                "{extension}: {r}, {g}, {b}"
+            );
+            view.set_path(&path)?;
+            assert_eq!((view.image_width, view.image_height), (512, 256));
+            let full = ImageView::from_path(&path)?;
+            assert_eq!((full.image_width, full.image_height), (512, 256));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn thumbnails_preserve_small_images_and_composite_before_averaging() {
+        let source = RgbaImage::from_fn(4, 2, |x, _| match x {
+            0 => image::Rgba([255, 0, 0, 255]),
+            1 => image::Rgba([0, 0, 255, 0]),
+            _ => image::Rgba([200, 100, 40, 128]),
+        });
+        let unchanged = thumbnail(DynamicImage::ImageRgba8(source.clone()), Size::new(8, 8));
+        assert_eq!(
+            unchanged, source,
+            "small images must not be resized or recomposited"
+        );
+        let reduced = thumbnail(DynamicImage::ImageRgba8(source.clone()), Size::new(2, 1));
+        assert_eq!(reduced.dimensions(), (2, 1));
+        assert_eq!(
+            reduced.get_pixel(0, 0)[2],
+            0,
+            "transparent blue must not bleed into red"
+        );
+        let full = ImageView::new(&source);
+        let preview = ImageView::new(&reduced);
+        for x in 0..2 {
+            let left = (x * 2) as f32;
+            let expected = full.sample_region(left, 0.0, left + 2.0, 2.0).unwrap();
+            let actual = preview
+                .sample_region(x as f32, 0.0, (x + 1) as f32, 1.0)
+                .unwrap();
+            assert!(actual.0.abs_diff(expected.0) <= 1);
+            assert!(actual.1.abs_diff(expected.1) <= 1);
+            assert!(actual.2.abs_diff(expected.2) <= 1);
+        }
+    }
+
+    #[test]
+    fn preview_bounds_preserve_portrait_and_thin_image_aspect_ratios() {
+        for (width, height, expected) in [(32, 96, (8, 24)), (4096, 1, (24, 1)), (1, 4096, (1, 24))]
+        {
+            let source = DynamicImage::ImageRgba8(RgbaImage::new(width, height));
+            assert_eq!(thumbnail(source, Size::new(24, 24)).dimensions(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_preview_load_keeps_the_previous_image_and_zoom() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.png");
+        RgbaImage::new(4, 2).save(&valid).unwrap();
+        let invalid = directory.path().join("invalid.png");
+        fs::write(&invalid, b"not an image").unwrap();
+        let mut view = ImageView::new(&RgbaImage::from_pixel(3, 2, image::Rgba([255, 0, 0, 255])));
+        view.auto_fit = false;
+        view.zoom = 3.0;
+        for (path, bounds) in [
+            (invalid, Size::new(16, 16)),
+            (directory.path().join("missing.png"), Size::new(16, 16)),
+            (valid.clone(), Size::new(0, 16)),
+            (valid.clone(), Size::new(16, 0)),
+        ] {
+            assert!(view.set_preview_path(path, bounds).is_err());
+            assert_eq!((view.image_width, view.image_height), (3, 2));
+            assert_eq!(
+                view.sample_color(1.0, 0.0, 0.0),
+                Color::Rgb { r: 255, g: 0, b: 0 }
+            );
+            assert!(!view.auto_fit);
+            assert_eq!(view.zoom, 3.0);
+        }
+        view.set_preview_path(valid, Size::new(16, 16))?;
+        assert!(view.auto_fit);
+        assert_eq!(view.zoom, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_rejects_source_pixels_above_budget_before_building_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.png");
+        // A valid, compressed grayscale image exceeds the decoded pixel
+        // budget while remaining well within the file-size budget in fh.
+        image::GrayImage::new(8192, 4097).save(&path).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() < 16 * 1024 * 1024);
+        let mut view = ImageView::empty();
+        let error = view
+            .set_preview_path(&path, Size::new(256, 256))
+            .unwrap_err();
+        assert!(error.to_string().contains("image preview limited to"));
+        assert_eq!((view.image_width, view.image_height), (1, 1));
+        assert_eq!(view.integral.red.len(), 4);
+    }
+
+    #[test]
+    fn oversized_preview_bounds_still_cap_retained_tables() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        image::GrayImage::new(2048, 1024).save(&path).unwrap();
+        let mut view = ImageView::empty();
+        view.set_preview_path(path, Size::new(u32::MAX, u32::MAX))?;
+        assert_eq!((view.image_width, view.image_height), (1024, 512));
+        assert_eq!(view.integral.red.len(), 1025 * 513);
+        Ok(())
+    }
+
+    fn render_effect_image(effects: Vec<Effect>) -> Result<canopy::TermBuf> {
+        let image = RgbaImage::from_fn(2, 2, |x, y| {
+            if y == 0 {
+                Rgba([200, 100, 40, if x == 0 { 255 } else { 128 }])
+            } else {
+                Rgba([40, 80, 120, 255])
+            }
+        });
+        let mut canopy = Canopy::new();
+        canopy.with_root_context(|ctx| {
+            ctx.set_layout(Layout::fill())?;
+            let _ = ctx.add_child(ImageView::new(&image))?;
+            for effect in effects {
+                ctx.push_effect(ctx.node_id(), effect)?;
+            }
+            Ok(())
+        })?;
+        let mut harness = Harness::from_canopy(canopy, Size::new(2, 1))?;
+        harness.render()?;
+        Ok(harness.buf().clone())
+    }
+
+    #[test]
+    fn image_cells_inherit_effects_once_on_both_pixel_channels() -> Result<()> {
+        let plain = render_effect_image(vec![])?;
+        let dimmed = render_effect_image(vec![effects::brightness(0.5), effects::bold()])?;
+        for x in 0..2 {
+            let point = Point { x, y: 0 };
+            let plain_cell = plain.get(point).expect("plain pixel cell");
+            let dimmed_cell = dimmed.get(point).expect("dimmed pixel cell");
+            assert_eq!(plain_cell.ch, HALF_BLOCK);
+            assert_eq!(dimmed_cell.ch, HALF_BLOCK);
+            let plain_fg = if x == 0 {
+                Color::Rgb {
+                    r: 200,
+                    g: 100,
+                    b: 40,
+                }
+            } else {
+                Color::Rgb {
+                    r: 100,
+                    g: 50,
+                    b: 20,
+                }
+            };
+            let dimmed_fg = if x == 0 {
+                Color::Rgb {
+                    r: 100,
+                    g: 50,
+                    b: 20,
+                }
+            } else {
+                Color::Rgb {
+                    r: 50,
+                    g: 25,
+                    b: 10,
+                }
+            };
+            assert_eq!(plain_cell.style.fg, plain_fg);
+            assert_eq!(
+                plain_cell.style.bg,
+                Color::Rgb {
+                    r: 40,
+                    g: 80,
+                    b: 120
+                }
+            );
+            assert_eq!(plain_cell.style.attrs, AttrSet::default());
+            assert_eq!(dimmed_cell.style.fg, dimmed_fg);
+            assert_eq!(
+                dimmed_cell.style.bg,
+                Color::Rgb {
+                    r: 20,
+                    g: 40,
+                    b: 60
+                }
+            );
+            assert_eq!(
+                dimmed_cell.style.attrs,
+                AttrSet {
+                    bold: true,
+                    ..AttrSet::default()
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct PixelGradient;
+
+    impl StyleEffect for PixelGradient {
+        fn apply(&self, mut style: Style) -> Style {
+            style.fg = Paint::gradient(GradientSpec::with_stops(
+                0.0,
+                vec![GradientStop::new(0.0, Color::Blue)],
+            ));
+            style
+        }
+    }
+
+    #[test]
+    fn image_effects_can_replace_solid_paint_with_a_gradient() -> Result<()> {
+        let buf = render_effect_image(vec![Arc::new(PixelGradient)])?;
+        for x in 0..2 {
+            let cell = buf.get(Point { x, y: 0 }).expect("pixel cell");
+            assert_eq!(cell.ch, HALF_BLOCK);
+            assert_eq!(cell.style.fg, Color::Blue);
+            assert_eq!(
+                cell.style.bg,
+                Color::Rgb {
+                    r: 40,
+                    g: 80,
+                    b: 120
+                }
+            );
+        }
+        Ok(())
     }
 
     #[test]

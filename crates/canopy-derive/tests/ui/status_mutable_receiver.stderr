@@ -1,0 +1,13 @@
+error: enabled hook receiver must be &self
+ --> tests/ui/status_mutable_receiver.rs:8:19
+  |
+8 |     fn can_update(&mut self, _ctx: &dyn ViewContext) -> Result<CommandStatus> {
+  |                   ^^^^^^^^^
+
+warning: unused imports: `ViewContext`, `commands::CommandStatus`, and `error::Result`
+ --> tests/ui/status_mutable_receiver.rs:1:14
+  |
+1 | use canopy::{ViewContext, commands::CommandStatus, error::Result};
+  |              ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

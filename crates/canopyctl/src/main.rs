@@ -11,26 +11,28 @@ mod session;
 use std::{
     fmt::Display,
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Stdio, exit, id},
+    result,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use canopy_mcp::{
-    ApplyFixtureRequest, ScriptEvalRequest, SuiteConfig, discover_scripts, fixture_for_script,
-    json_tool_result,
+    ApplyFixtureRequest, ApplyFixtureResponse, BootstrapRequest, ScriptEvalOutcome,
+    ScriptEvalRequest, SuiteConfig, Viewport, plan_suite,
 };
 use clap::{Args, Parser, Subcommand};
 use ruau_script_api::{ScriptApiQuery, ScriptApiResponse};
 use tmcp::{ToolError, ToolResult, mcp_server, schema::CallToolResult, tool_params};
-use tokio::{net::UnixStream, sync::Mutex, time::sleep};
+use tokio::{net::UnixStream, time::sleep};
 
 use crate::{
     config::LoadedConfig,
-    replay::{load_replay_journal, replay_entry_from_eval, write_replay_journal},
-    session::{Session, SessionManager},
+    replay::{ReplayEnvelope, ReplayStep, load_replay, write_replay},
+    session::{Session, SessionKind, SessionManager},
 };
 
 /// Top-level CLI arguments.
@@ -51,7 +53,7 @@ enum Commands {
     Mcp,
     /// Execute a Luau smoke suite through the headless MCP server.
     Smoke(SmokeArgs),
-    /// Replay a recorded script journal through a headless app instance.
+    /// Replay a versioned envelope against an explicit live or headless target.
     Replay(ReplayArgs),
     /// Print MCP bootstrap information from a headless app instance.
     Bootstrap(SpawnArgs),
@@ -117,13 +119,16 @@ struct SmokeArgs {
 }
 
 /// Arguments for `canopyctl replay`.
-#[derive(Args)]
+#[derive(Args, Default)]
 struct ReplayArgs {
+    /// Connect to this live socket instead of spawning a headless command.
+    #[arg(long, conflicts_with = "command")]
+    socket: Option<PathBuf>,
+    /// Report and permit each compatibility mismatch before executing sources.
+    #[arg(long)]
+    allow_mismatch: bool,
     /// Path to a JSON replay journal.
     journal: PathBuf,
-    /// Optional fixture to apply before each replayed entry.
-    #[arg(long)]
-    fixture: Option<String>,
     /// Stop after the first failing replay entry.
     #[arg(long)]
     fail_fast: bool,
@@ -152,7 +157,10 @@ struct EvalArgs {
     /// Optional evaluation timeout override in milliseconds.
     #[arg(long)]
     timeout_ms: Option<u64>,
-    /// Write a replay journal containing this evaluation.
+    /// Optional headless viewport as WIDTHxHEIGHT.
+    #[arg(long, value_parser = parse_viewport)]
+    viewport: Option<Viewport>,
+    /// Write a versioned replay envelope containing this evaluation.
     #[arg(long)]
     journal_out: Option<PathBuf>,
     /// Command override passed after `--`.
@@ -165,8 +173,6 @@ struct EvalArgs {
 struct CanopyctlMcpServer {
     /// Shared session manager for tool calls.
     sessions: Arc<SessionManager>,
-    /// Last observed tool activity time.
-    last_activity: Arc<Mutex<Instant>>,
 }
 
 /// Tool params for the `connect` tool.
@@ -179,15 +185,9 @@ struct ConnectRequest {
 
 #[mcp_server]
 impl CanopyctlMcpServer {
-    /// Record activity so the idle watchdog does not terminate the server.
-    async fn touch(&self) {
-        *self.last_activity.lock().await = Instant::now();
-    }
-
     #[tool]
     /// Connect to a live canopy UDS socket.
     async fn connect(&self, params: ConnectRequest) -> ToolResult<CallToolResult> {
-        self.touch().await;
         self.sessions
             .connect_live(Path::new(&params.socket))
             .await
@@ -198,7 +198,6 @@ impl CanopyctlMcpServer {
     #[tool]
     /// Disconnect the current session and shut down any managed child process.
     async fn disconnect(&self) -> ToolResult<CallToolResult> {
-        self.touch().await;
         self.sessions.disconnect().await.map_err(tool_error)?;
         Ok(CallToolResult::new().with_text_content("disconnected"))
     }
@@ -206,46 +205,45 @@ impl CanopyctlMcpServer {
     #[tool]
     /// Evaluate a script on the active session.
     async fn script_eval(&self, params: ScriptEvalRequest) -> ToolResult<CallToolResult> {
-        self.touch().await;
-        let outcome = self.sessions.eval(params).await.map_err(tool_error)?;
+        let session = self.sessions.session().await.map_err(tool_error)?;
+        let outcome = session.eval(params).await.map_err(tool_error)?;
         Ok(outcome.to_tool_result())
     }
 
     #[tool]
     /// Return bootstrap information for the active session.
-    async fn bootstrap(&self) -> ToolResult<CallToolResult> {
-        self.touch().await;
-        let bootstrap = self.sessions.bootstrap().await.map_err(tool_error)?;
-        let value = serde_json::to_value(bootstrap).map_err(tool_error)?;
-        Ok(json_tool_result(value))
+    async fn bootstrap(&self, request: BootstrapRequest) -> ToolResult<CallToolResult> {
+        let session = self.sessions.session().await.map_err(tool_error)?;
+        let bootstrap = session.bootstrap(request).await.map_err(tool_error)?;
+        to_tool_result(bootstrap)
     }
 
     #[tool]
     /// Apply a fixture to the active session.
     async fn apply_fixture(&self, params: ApplyFixtureRequest) -> ToolResult<CallToolResult> {
-        self.touch().await;
-        self.sessions
+        let mut session = self.sessions.session().await.map_err(tool_error)?;
+        session
             .apply_fixture(params.name.clone())
             .await
             .map_err(tool_error)?;
-        let value = serde_json::json!({ "applied": params.name });
-        Ok(json_tool_result(value))
+        to_tool_result(ApplyFixtureResponse {
+            applied: params.name,
+        })
     }
 
     #[tool(read_only, output_schema = ScriptApiResponse)]
     /// Return shared API discovery for the active session.
     async fn script_api(&self, params: ScriptApiQuery) -> ToolResult<CallToolResult> {
-        self.touch().await;
-        self.sessions.api(&params).await.map_err(tool_error)
+        let session = self.sessions.session().await.map_err(tool_error)?;
+        session.api(&params).await.map_err(tool_error)
     }
 
     #[tool]
     /// Return the fixture catalog for the active session.
     async fn fixtures(&self) -> ToolResult<CallToolResult> {
-        self.touch().await;
-        let fixtures = self.sessions.fixtures().await.map_err(tool_error)?;
-        let value = serde_json::to_value(fixtures).map_err(tool_error)?;
-        Ok(json_tool_result(value))
+        let session = self.sessions.session().await.map_err(tool_error)?;
+        let fixtures = session.fixtures().await.map_err(tool_error)?;
+        to_tool_result(fixtures)
     }
 }
 
@@ -299,26 +297,21 @@ async fn smoke_command(config: LoadedConfig, args: SmokeArgs) -> Result<()> {
     let suite_dir = config.smoke_suite_dir(args.suite.as_deref());
     let mut suite = SuiteConfig::new(&suite_dir);
     suite.scripts = args.scripts;
-    let scripts = discover_scripts(&suite)?;
-    let timeout_ms = config.smoke_timeout_ms(args.timeout_ms);
-    let fail_fast = config.smoke_fail_fast(args.fail_fast);
+    suite.timeout_ms = config.smoke_timeout_ms(args.timeout_ms);
+    suite.fail_fast = config.smoke_fail_fast(args.fail_fast);
 
+    smoke_scripts(&session, &suite).await
+}
+
+/// Run resolved smoke scripts through one connected session.
+async fn smoke_scripts(session: &Session, suite: &SuiteConfig) -> Result<()> {
     let mut failed = 0usize;
-    for path in scripts {
-        let source =
-            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let script_fixture = fixture_for_script(&suite_dir, &path);
+    for script in plan_suite(suite)? {
         let started = Instant::now();
-        let outcome = session
-            .eval(ScriptEvalRequest {
-                script: source,
-                fixture: script_fixture.clone(),
-                timeout_ms,
-            })
-            .await?;
+        let outcome = session.eval(script.request).await?;
         let elapsed = started.elapsed().as_millis();
-        let fixture = script_fixture.as_deref().unwrap_or("-");
-        let test_name = smoke_test_name(&suite_dir, &path, script_fixture.as_deref());
+        let fixture = script.fixture.as_deref().unwrap_or("-");
+        let test_name = smoke_test_name(&suite.suite_dir, &script.path, script.fixture.as_deref());
         if outcome.success {
             println!("PASS fixture={fixture} test={test_name} ({elapsed}ms)");
         } else {
@@ -327,7 +320,7 @@ async fn smoke_command(config: LoadedConfig, args: SmokeArgs) -> Result<()> {
             if let Some(error) = outcome.error {
                 println!("  {}", error.message);
             }
-            if fail_fast {
+            if suite.fail_fast {
                 break;
             }
         }
@@ -339,37 +332,120 @@ async fn smoke_command(config: LoadedConfig, args: SmokeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Execute `canopyctl replay`.
+/// Parse and validate one CLI viewport before an app is spawned.
+fn parse_viewport(text: &str) -> result::Result<Viewport, String> {
+    let (width, height) = text
+        .split_once('x')
+        .ok_or_else(|| "viewport must be WIDTHxHEIGHT".to_owned())?;
+    let viewport = Viewport {
+        width: width.parse().map_err(|_| "invalid viewport width")?,
+        height: height.parse().map_err(|_| "invalid viewport height")?,
+    };
+    viewport.validate().map_err(|error| error.to_string())?;
+    Ok(viewport)
+}
+
+/// Execute `canopyctl replay` after parsing all sources and assumptions.
 async fn replay_command(config: LoadedConfig, args: ReplayArgs) -> Result<()> {
-    let command = config.headless_command(&args.command)?;
-    let session = Session::spawn_headless(&command).await?;
-    let journal = load_replay_journal(&args.journal)?;
+    let envelope = load_replay(&args.journal)?;
+    let mut session = match &args.socket {
+        Some(socket) => Session::connect_live(socket).await?,
+        None => Session::spawn_headless(&config.headless_command(&args.command)?).await?,
+    };
+    let result = replay_file(&mut session, envelope, &args).await;
+    session.shutdown().await;
+    result
+}
+
+/// Validate compatibility before applying fixtures or running any replay step.
+async fn replay_file(
+    session: &mut Session,
+    envelope: ReplayEnvelope,
+    args: &ReplayArgs,
+) -> Result<()> {
+    envelope.validate()?;
+    let requested = (session.kind() == SessionKind::Headless).then_some(envelope.viewport);
+    let target = session
+        .bootstrap(BootstrapRequest {
+            viewport: requested,
+        })
+        .await?;
+    target
+        .metadata
+        .viewport
+        .context("target bootstrap has no viewport")?
+        .validate()?;
+    if let Some(name) = &envelope.fixture
+        && !target.fixtures.iter().any(|fixture| fixture.name == *name)
+    {
+        bail!("replay fixture {name:?} is not implemented by the target");
+    }
+    let differences = envelope.mismatches(&target.metadata)?;
+    if !differences.is_empty() && !args.allow_mismatch {
+        bail!("replay compatibility mismatch:\n{}", differences.join("\n"));
+    }
+    for difference in differences {
+        eprintln!("OVERRIDE {difference}");
+    }
+    let steps = envelope.steps;
+    let fixture = envelope.fixture;
+    if !steps
+        .iter()
+        .any(|step| step.expect.success || args.include_failed)
+    {
+        return Ok(());
+    }
+    if session.kind() == SessionKind::Live
+        && let Some(name) = &fixture
+    {
+        session.apply_fixture(name.clone()).await?;
+    }
+    let inline_fixture = if session.kind() == SessionKind::Headless {
+        fixture
+    } else {
+        None
+    };
+    replay_entries(session, steps, inline_fixture, requested, args).await
+}
+
+/// Execute selected steps and compare both successful and failed expectations.
+async fn replay_entries(
+    session: &Session,
+    steps: Vec<ReplayStep>,
+    fixture: Option<String>,
+    viewport: Option<Viewport>,
+    args: &ReplayArgs,
+) -> Result<()> {
     let mut failed = 0usize;
     let mut skipped = 0usize;
-
-    for (index, entry) in journal.into_iter().enumerate() {
+    for (index, step) in steps.into_iter().enumerate() {
         let replay_id = index + 1;
-        if entry.originally_failed() && !args.include_failed {
+        if !step.expect.success && !args.include_failed {
             skipped += 1;
             println!(
-                "SKIP replay#{replay_id} origin={} (originally failed)",
-                entry.origin()
+                "SKIP replay#{replay_id} (recorded failure; select --include-failed to execute)"
             );
             continue;
         }
-        let script = entry.source()?;
         let outcome = session
             .eval(ScriptEvalRequest {
-                script: script.to_string(),
-                fixture: args.fixture.clone(),
+                fixture: fixture.clone(),
                 timeout_ms: args.timeout_ms,
+                viewport,
+                ..ScriptEvalRequest::new(step.source)
             })
             .await?;
-        if outcome.success {
-            println!("PASS replay#{replay_id} origin={}", entry.origin());
+        if outcome.success == step.expect.success {
+            println!(
+                "PASS replay#{replay_id} expected_success={}",
+                step.expect.success
+            );
         } else {
             failed += 1;
-            println!("FAIL replay#{replay_id} origin={}", entry.origin());
+            println!(
+                "FAIL replay#{replay_id} expected_success={} actual_success={}",
+                step.expect.success, outcome.success
+            );
             if let Some(error) = outcome.error {
                 println!("  {}", error.message);
             }
@@ -378,7 +454,6 @@ async fn replay_command(config: LoadedConfig, args: ReplayArgs) -> Result<()> {
             }
         }
     }
-
     if failed > 0 {
         bail!("{failed} replay entries failed; {skipped} skipped");
     }
@@ -389,7 +464,7 @@ async fn replay_command(config: LoadedConfig, args: ReplayArgs) -> Result<()> {
 async fn bootstrap_command(config: LoadedConfig, args: SpawnArgs) -> Result<()> {
     let command = config.headless_command(&args.command)?;
     let session = Session::spawn_headless(&command).await?;
-    let bootstrap = session.bootstrap().await?;
+    let bootstrap = session.bootstrap(BootstrapRequest::default()).await?;
     println!("{}", serde_json::to_string_pretty(&bootstrap)?);
     Ok(())
 }
@@ -429,17 +504,38 @@ async fn eval_command(config: LoadedConfig, args: EvalArgs) -> Result<()> {
     let session = Session::spawn_headless(&command).await?;
     let outcome = session
         .eval(ScriptEvalRequest {
-            script: script.clone(),
-            fixture: args.fixture,
+            fixture: args.fixture.clone(),
             timeout_ms: args.timeout_ms,
+            viewport: args.viewport,
+            ..ScriptEvalRequest::new(script.clone())
         })
         .await?;
-    println!("{}", serde_json::to_string_pretty(&outcome)?);
-    if let Some(path) = args.journal_out {
-        write_replay_journal(&path, replay_entry_from_eval(script, &outcome))?;
-    }
+    write_eval_output(
+        &outcome,
+        script,
+        args.journal_out.as_deref(),
+        args.fixture,
+        &mut io::stdout().lock(),
+    )?;
     if !outcome.success {
         exit(1);
+    }
+    Ok(())
+}
+
+/// Write evaluation output and its optional journal before exit status
+/// handling.
+fn write_eval_output(
+    outcome: &ScriptEvalOutcome,
+    script: String,
+    journal_out: Option<&Path>,
+    fixture: Option<String>,
+    output: &mut impl Write,
+) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *output, outcome)?;
+    writeln!(output)?;
+    if let Some(path) = journal_out {
+        write_replay(path, &ReplayEnvelope::record(script, fixture, outcome)?)?;
     }
     Ok(())
 }
@@ -474,13 +570,12 @@ async fn api_command(config: LoadedConfig, args: ApiArgs) -> Result<()> {
 /// Execute `canopyctl mcp`.
 async fn mcp_command(config: LoadedConfig) -> Result<()> {
     let sessions = Arc::new(SessionManager::new(config.clone()));
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
     let idle_timeout = config.idle_shutdown_after();
-    let watchdog_activity = last_activity.clone();
+    let watchdog_sessions = sessions.clone();
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(1)).await;
-            if watchdog_activity.lock().await.elapsed() >= idle_timeout {
+            if watchdog_sessions.last_activity.lock().await.elapsed() >= idle_timeout {
                 exit(0);
             }
         }
@@ -488,7 +583,6 @@ async fn mcp_command(config: LoadedConfig) -> Result<()> {
 
     tmcp::Server::new(move || CanopyctlMcpServer {
         sessions: sessions.clone(),
-        last_activity: last_activity.clone(),
     })
     .serve_stdio()
     .await?;
@@ -534,30 +628,357 @@ fn tool_error(error: impl Display) -> ToolError {
     ToolError::internal(error.to_string())
 }
 
+/// Encode a typed MCP response.
+fn to_tool_result(value: impl serde::Serialize) -> ToolResult<CallToolResult> {
+    CallToolResult::structured(value).map_err(tool_error)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+    };
+
+    use canopy::{Canopy, Fixture, Work, geom::Size, testing::contracts};
+    use canopy_mcp::{AppMetadata, ExecutionMode, ResetPolicy, serve_uds};
+    use futures::{StreamExt, executor};
+    use tmcp::schema::ToolResultMode;
+    use tokio::runtime::Builder;
+
     use super::*;
-    use crate::replay::ReplayInput;
+    use crate::{
+        replay::ReplayExpectation,
+        session::tests::{evaluator_session, manager_with_session, peer_session, request},
+    };
 
     #[test]
-    fn replay_input_accepts_object_journal() -> Result<()> {
-        let parsed = serde_json::from_str::<ReplayInput>(
-            r#"{"journal":[{"origin":"eval","source":"return true","ok":true}]}"#,
+    fn live_replay_applies_fixture_once_and_preserves_state_between_steps() -> Result<()> {
+        let mut canopy = Canopy::new();
+        let applications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&applications);
+        canopy.register_fixture(Fixture::new("seed", "Seed live state", move |canopy| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            canopy.set_input_mode("seed");
+            Ok(())
+        }))?;
+        canopy.finalize_api()?;
+        canopy.set_root_size(Size::new(20, 5))?;
+        canopy.turn(Work::Prepare)?;
+        let automation = canopy.automation_handle();
+        let mut events = canopy.take_event_receiver().expect("test owns events");
+        let directory = tempfile::tempdir()?;
+        let socket = directory.path().join("replay.sock");
+        let listener = serve_uds(
+            &socket,
+            automation.clone(),
+            AppMetadata {
+                app: "canopyctl-test".into(),
+                reset: ResetPolicy::External,
+            },
         )?;
-        let entries = parsed.into_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].source()?, "return true");
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                Builder::new_current_thread().enable_all().build()?.block_on(async {
+                    let mut session = Session::connect_live(&socket).await?;
+                    assert_eq!(session.kind(), SessionKind::Live);
+                    let bootstrap = session.bootstrap(BootstrapRequest::default()).await?;
+                    let envelope = ReplayEnvelope {
+                        schema: "canopy.replay/1".into(), app: bootstrap.metadata.app,
+                        api_digest: bootstrap.metadata.api_digest.expect("live digest"),
+                        execution: ExecutionMode::LiveSession,
+                        viewport: bootstrap.metadata.viewport.context("live viewport")?,
+                        fixture: Some("seed".into()), reset: ResetPolicy::Fixture,
+                        steps: [
+                            "canopy.assert(canopy.input_mode() == \"seed\"); canopy.set_mode(\"first\")",
+                            "canopy.assert(canopy.input_mode() == \"first\"); canopy.set_mode(\"second\")",
+                        ].into_iter().map(|source| ReplayStep { source: source.into(), expect: ReplayExpectation { success: true } }).collect(),
+                    };
+                    let args = ReplayArgs { socket: Some(socket), ..ReplayArgs::default() };
+                    replay_file(&mut session, envelope, &args).await
+                })
+            }));
+            done_tx.send(result).expect("test observer connected");
+            automation
+                .submit(Box::new(|_| {}))
+                .expect("wake test observer");
+        });
+        let result = loop {
+            if let Ok(result) = done_rx.try_recv() {
+                break result;
+            }
+            executor::block_on(events.next()).expect("live MCP wakes the UI");
+            canopy.turn(Work::Wake)?;
+        };
+        worker.join().expect("live replay worker exits");
+        listener.stop()?;
+        result.expect("live replay client did not panic")?;
+        assert_eq!(applications.load(Ordering::Relaxed), 1);
+        assert_eq!(canopy.input_mode(), "second");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_contract_crosses_real_evaluator_proxy_and_versioned_replay() -> Result<()> {
+        let (session, _, peer) = evaluator_session().await?;
+        let proxy = CanopyctlMcpServer {
+            sessions: manager_with_session(session).await?,
+        };
+        let mut request = request(contracts::SCRIPT);
+        request.viewport = Some(Viewport {
+            width: 12,
+            height: 3,
+        });
+        let response = proxy.script_eval(request).await?;
+        let outcome = response.extract_as::<ScriptEvalOutcome>(ToolResultMode::Structured)?;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            outcome.value,
+            Some(contracts::expected().to_external_json_value()?)
+        );
+        let envelope = ReplayEnvelope::record(contracts::SCRIPT.to_owned(), None, &outcome)?;
+        let encoded = serde_json::to_string(&envelope)?;
+        let replay = replay::parse_replay(&encoded)?;
+        let (mut session, calls, replay_peer) = evaluator_session().await?;
+        replay_file(&mut session, replay, &ReplayArgs::default()).await?;
+        assert_eq!(calls.lock().await.as_slice(), [contracts::SCRIPT]);
+        peer.abort();
+        replay_peer.abort();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_preflight_blocks_execution_and_overrides_never_hide_missing_fixtures()
+    -> Result<()> {
+        let (mut session, calls, peer) = evaluator_session().await?;
+        let target = session
+            .bootstrap(BootstrapRequest {
+                viewport: Some(Viewport {
+                    width: 12,
+                    height: 3,
+                }),
+            })
+            .await?;
+        let mut envelope = ReplayEnvelope {
+            schema: "canopy.replay/1".into(),
+            app: "wrong app".into(),
+            api_digest: "wrong digest".into(),
+            execution: ExecutionMode::LiveSession,
+            viewport: target.metadata.viewport.context("target viewport")?,
+            fixture: None,
+            reset: ResetPolicy::External,
+            steps: vec![ReplayStep {
+                source: contracts::SCRIPT.into(),
+                expect: ReplayExpectation { success: true },
+            }],
+        };
+        let error = replay_file(&mut session, envelope.clone(), &ReplayArgs::default())
+            .await
+            .unwrap_err();
+        for field in ["app:", "api_digest:", "execution:", "reset:"] {
+            assert!(error.to_string().contains(field), "{error:#}");
+        }
+        assert!(calls.lock().await.is_empty());
+        let args = ReplayArgs {
+            allow_mismatch: true,
+            ..ReplayArgs::default()
+        };
+        replay_file(&mut session, envelope.clone(), &args).await?;
+        assert_eq!(calls.lock().await.len(), 1);
+        calls.lock().await.clear();
+        envelope.fixture = Some("missing fixture".into());
+        envelope.reset = ResetPolicy::Fixture;
+        let error = replay_file(&mut session, envelope, &args)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not implemented"));
+        assert!(calls.lock().await.is_empty());
+        peer.abort();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn selected_recorded_failures_are_executed_and_compared() -> Result<()> {
+        let (session, calls, peer) = evaluator_session().await?;
+        let steps = vec![ReplayStep {
+            source: "error(\"expected failure\")".into(),
+            expect: ReplayExpectation { success: false },
+        }];
+        replay_entries(&session, steps.clone(), None, None, &ReplayArgs::default()).await?;
+        assert!(calls.lock().await.is_empty());
+        let args = ReplayArgs {
+            include_failed: true,
+            ..ReplayArgs::default()
+        };
+        replay_entries(&session, steps, None, None, &args).await?;
+        assert_eq!(calls.lock().await.len(), 1);
+        let error = replay_entries(
+            &session,
+            vec![ReplayStep {
+                source: "return true".into(),
+                expect: ReplayExpectation { success: false },
+            }],
+            None,
+            None,
+            &args,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("1 replay entries failed"));
+        peer.abort();
         Ok(())
     }
 
     #[test]
-    fn replay_input_accepts_bare_script_array() -> Result<()> {
-        let parsed = serde_json::from_str::<ReplayInput>(
-            r#"[{"origin":"manual","script":"canopy.assert(true, \"ok\")"}]"#,
+    fn replay_cli_selects_live_or_headless() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "canopyctl",
+            "replay",
+            "trace.json",
+            "--socket",
+            "/tmp/app.sock",
+        ])?;
+        let Commands::Replay(args) = cli.command else {
+            panic!("replay command");
+        };
+        assert_eq!(args.socket, Some(PathBuf::from("/tmp/app.sock")));
+        assert!(
+            Cli::try_parse_from([
+                "canopyctl",
+                "replay",
+                "trace.json",
+                "--socket",
+                "/tmp/app.sock",
+                "--",
+                "todo",
+                "mcp"
+            ])
+            .is_err()
+        );
+        assert!(parse_viewport("0x3").is_err());
+        assert!(parse_viewport("12x0").is_err());
+        assert!(parse_viewport("12x3").is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smoke_failure_accounting_preserves_fail_fast() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let scripts = vec![
+            directory.path().join("first.luau"),
+            directory.path().join("second.luau"),
+        ];
+        fs::write(&scripts[0], "failure")?;
+        fs::write(&scripts[1], "success")?;
+        for fail_fast in [false, true] {
+            let (session, calls, peer) = peer_session().await?;
+            let mut suite = SuiteConfig::new(directory.path());
+            suite.scripts = scripts.clone();
+            suite.fail_fast = fail_fast;
+            let error = smoke_scripts(&session, &suite).await.unwrap_err();
+            assert_eq!(error.to_string(), "1 smoke script(s) failed");
+            assert_eq!(
+                *calls.lock().await,
+                if fail_fast {
+                    vec!["failure"]
+                } else {
+                    vec!["failure", "success"]
+                }
+            );
+            peer.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_failure_accounting_preserves_fail_fast() -> Result<()> {
+        for fail_fast in [false, true] {
+            let (session, calls, peer) = peer_session().await?;
+            let journal = vec![
+                ReplayStep {
+                    source: "failure".into(),
+                    expect: ReplayExpectation { success: true },
+                },
+                ReplayStep {
+                    source: "success".into(),
+                    expect: ReplayExpectation { success: true },
+                },
+            ];
+            let args = ReplayArgs {
+                fail_fast,
+                ..ReplayArgs::default()
+            };
+            let error = replay_entries(&session, journal, None, None, &args)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "1 replay entries failed; 0 skipped");
+            assert_eq!(
+                *calls.lock().await,
+                if fail_fast {
+                    vec!["failure"]
+                } else {
+                    vec!["failure", "success"]
+                }
+            );
+            peer.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_eval_writes_json_and_replay_journal() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let journal = directory.path().join("journal.json");
+        let (session, _, peer) = peer_session().await?;
+        let outcome = session.eval(request("failure")).await?;
+        let mut output = Vec::new();
+        write_eval_output(
+            &outcome,
+            "failure".to_owned(),
+            Some(&journal),
+            None,
+            &mut output,
         )?;
-        let entries = parsed.into_entries();
-        assert_eq!(entries[0].origin(), "manual");
-        assert_eq!(entries[0].source()?, "canopy.assert(true, \"ok\")");
+        let decoded: ScriptEvalOutcome = serde_json::from_slice(&output)?;
+        assert!(!decoded.success);
+        assert_eq!(decoded, outcome);
+        let envelope = load_replay(&journal)?;
+        assert_eq!(envelope.steps.len(), 1);
+        assert!(!envelope.steps[0].expect.success);
+        assert_eq!(envelope.steps[0].source, "failure");
+        peer.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxy_does_not_acknowledge_failed_fixture() -> Result<()> {
+        let (session, _, peer) = peer_session().await?;
+        let server = CanopyctlMcpServer {
+            sessions: manager_with_session(session).await?,
+        };
+        assert!(
+            server
+                .apply_fixture(ApplyFixtureRequest {
+                    name: "bad".to_owned()
+                })
+                .await
+                .is_err()
+        );
+        let success = server
+            .apply_fixture(ApplyFixtureRequest {
+                name: "good".to_owned(),
+            })
+            .await?;
+        assert_eq!(
+            success.structured_content,
+            Some(serde_json::json!({"applied":"good"}))
+        );
+        peer.abort();
         Ok(())
     }
 

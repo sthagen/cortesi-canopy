@@ -67,7 +67,12 @@ pub(super) fn dispatch_command(
             id: spec.id,
             args: build_args_from_values(spec, values),
         };
-        commands::dispatch(&mut canopy.core, node_id, &invocation).map_err(error::Error::from)
+        commands::dispatch_target(
+            &mut canopy.core,
+            commands::CommandTarget::From(node_id),
+            &invocation,
+        )
+        .map_err(error::Error::from)
     })
 }
 
@@ -87,6 +92,24 @@ pub(super) fn dispatch_command_by_name(
         Ok((anchor, spec))
     })?;
     dispatch_command(scope, spec, node_id.unwrap_or(anchor), values)
+}
+
+/// Dispatch explicit arguments without the legacy single-map inference.
+pub(super) fn dispatch_explicit(
+    scope: &Scope<'_>,
+    name: &str,
+    target: commands::CommandTarget,
+    args: CommandArgs,
+) -> Result<ArgValue> {
+    with_current_canopy(scope, |canopy, _| {
+        let spec = canopy.core.commands.get(name).ok_or_else(|| {
+            error::Error::from(commands::CommandError::UnknownCommand {
+                id: name.to_string(),
+            })
+        })?;
+        let invocation = CommandInvocation { id: spec.id, args };
+        commands::dispatch_target(&mut canopy.core, target, &invocation).map_err(error::Error::from)
+    })
 }
 
 /// Convert the remaining host-call values into command arguments.
@@ -187,7 +210,7 @@ pub(super) fn call_in_scope<'s>(
                 .next()
                 .unwrap_or(ScopedValue::Nil);
             scoped_to_arg_value(scope, value)
-                .map_err(|message| error::Error::Script(format!("{label}: {message}")))
+                .map_err(|message| error::Error::script(format!("{label}: {message}")))
         }
         Ok(Err(script_error)) => Err(script_error_to_canopy(scope, &script_error, label, timeout)),
         Err(runtime_error) => Err(runtime_error_to_canopy(&runtime_error, label, timeout)),

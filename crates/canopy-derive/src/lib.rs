@@ -13,6 +13,18 @@ use syn::{Attribute, Fields, ItemImpl, Result, parse_macro_input, parse_quote};
 
 /// Generate command metadata and wrappers for `#[command]` methods in an impl
 /// block.
+///
+/// Each command gets a `cmd_*` metadata accessor and a `call_*` builder with
+/// typed user parameters. Builders omit context and injected parameters.
+/// `#[command(enabled = "method")]` adds a read-only eligibility hook. The
+/// method takes `&self` and `&dyn canopy::ViewContext` and returns
+/// `canopy::error::Result<canopy::commands::CommandStatus>`.
+/// `#[command(ignore_result)]` declares that a non-unit return value is
+/// intentionally discarded instead of published in command metadata.
+///
+/// Method documentation may use `@param name text` lines to document user
+/// parameters and `@return text` to document the returned value. These tagged
+/// lines are removed from the command's main documentation.
 #[proc_macro_attribute]
 pub fn derive_commands(
     _attr: proc_macro::TokenStream,
@@ -25,17 +37,29 @@ pub fn derive_commands(
     }
 }
 
-/// Mark a method as a command. This macro should be used to decorate methods in
-/// an `impl` block that uses the `derive_commands` macro.
+/// Mark a method as a command inside an impl using `#[derive_commands]`.
+///
+/// The outer macro consumes this attribute. Using `#[command]` on its own is
+/// an error because no command metadata or dispatch wrapper would be emitted.
 #[proc_macro_attribute]
 pub fn command(
     _attr: proc_macro::TokenStream,
     input: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    input
+    let input = proc_macro2::TokenStream::from(input);
+    syn::Error::new_spanned(
+        input,
+        "#[command] requires #[derive_commands] on the containing impl",
+    )
+    .to_compile_error()
+    .into()
 }
 
-/// Derive the CommandArg marker trait for serde-backed types.
+/// Derive command record support for a named-field struct.
+///
+/// This emits `CommandArg`, `CommandType`, and `ToArgValue` implementations.
+/// The struct must also derive or implement both `serde::Serialize` and
+/// `serde::Deserialize` so command arguments can cross the scripting bridge.
 #[proc_macro_derive(CommandArg)]
 pub fn derive_command_arg(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
@@ -67,26 +91,9 @@ fn expand_command_arg(input: &syn::DeriveInput) -> Result<proc_macro2::TokenStre
             ));
         }
     };
-    let mut generics = input.generics.clone();
-    // Field-type bounds are only needed to propagate generic parameters; for
-    // concrete structs they would turn self-referential fields into cyclic
-    // trait obligations, so they are omitted there.
-    if !generics.params.is_empty() {
-        let where_clause = generics.make_where_clause();
-        for field in fields {
-            let ty = &field.ty;
-            where_clause
-                .predicates
-                .push(parse_quote!(#ty: canopy::commands::CommandType));
-        }
-    }
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    let field_decl_regs = fields.iter().map(|field| {
-        let ty = &field.ty;
-        quote! { <#ty as canopy::commands::CommandType>::luau_decls(registry); }
-    });
     let mut field_tokens = Vec::new();
+    let mut command_bounds = Vec::new();
+    let mut value_bounds = Vec::new();
     for field in fields {
         let Some(ident) = &field.ident else {
             return Err(syn::Error::new_spanned(
@@ -105,9 +112,34 @@ fn expand_command_arg(input: &syn::DeriveInput) -> Result<proc_macro2::TokenStre
             )
             #doc
         });
+        command_bounds.push(parse_quote!(#ty: canopy::commands::CommandType));
+        value_bounds.push(parse_quote!(#ty: canopy::commands::ToArgValue));
     }
+    let generics = bounded_generics(&input.generics, command_bounds);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let value_generics = bounded_generics(&input.generics, value_bounds);
+    let (value_impl_generics, value_ty_generics, value_where_clause) =
+        value_generics.split_for_impl();
+    let value_fields = fields.iter().map(|field| {
+        let ident = field.ident.as_ref().expect("named struct field");
+        let name = ident.to_string();
+        quote! { (#name.to_string(), canopy::commands::ToArgValue::to_arg_value(self.#ident)) }
+    });
+
+    let field_decl_regs = fields.iter().map(|field| {
+        let ty = &field.ty;
+        quote! { <#ty as canopy::commands::CommandType>::luau_decls(registry); }
+    });
 
     Ok(quote! {
+        impl #value_impl_generics canopy::commands::ToArgValue for #ident #value_ty_generics #value_where_clause {
+            fn to_arg_value(self) -> canopy::commands::ArgValue {
+                canopy::commands::ArgValue::Map(::std::collections::BTreeMap::from([
+                    #(#value_fields),*
+                ]))
+            }
+        }
+
         impl #impl_generics canopy::commands::CommandArg for #ident #ty_generics #where_clause {}
 
         impl #impl_generics canopy::commands::CommandType for #ident #ty_generics #where_clause {
@@ -132,6 +164,23 @@ fn expand_command_arg(input: &syn::DeriveInput) -> Result<proc_macro2::TokenStre
     })
 }
 
+/// Clone generics, adding the provided predicates only when the input is
+/// generic.
+///
+/// Field-type bounds are only needed to propagate generic parameters; for
+/// concrete structs they would turn self-referential fields into cyclic trait
+/// obligations, so they are omitted there.
+fn bounded_generics(
+    generics: &syn::Generics,
+    predicates: impl IntoIterator<Item = syn::WherePredicate>,
+) -> syn::Generics {
+    let mut bounded = generics.clone();
+    if !bounded.params.is_empty() {
+        bounded.make_where_clause().predicates.extend(predicates);
+    }
+    bounded
+}
+
 /// Render a doc-attachment token stream for declaration model items.
 fn doc_tokens(attrs: &[Attribute]) -> proc_macro2::TokenStream {
     match parse::doc_string(attrs) {
@@ -143,7 +192,11 @@ fn doc_tokens(attrs: &[Attribute]) -> proc_macro2::TokenStream {
     }
 }
 
-/// Derive command enum conversions from/to ArgValue.
+/// Derive command conversions for a fieldless enum.
+///
+/// This emits `CommandType`, `ToArgValue`, and `FromArgValue`
+/// implementations. Variant names are matched case-insensitively and exposed
+/// as string literals in the generated Luau type.
 #[proc_macro_derive(CommandEnum)]
 pub fn derive_command_enum(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);

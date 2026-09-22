@@ -6,12 +6,13 @@ use std::{
 };
 
 use crate::{
-    Context,
+    Context, WidgetSemantics, WorkLifetime,
     core::context::ViewContext,
     cursor,
     error::Result,
     event::Event,
-    layout::{CanvasContext, Layout, MeasureConstraints, Measurement, Size},
+    geom::{Rect, Size},
+    layout::{CanvasContext, Layout, MeasureConstraints, Measurement},
     render::Render,
     state::NodeName,
 };
@@ -21,14 +22,56 @@ use crate::{
 pub enum EventOutcome {
     /// The event was processed and propagation stops.
     Handle,
-    /// The event was processed without a state change and propagation stops.
-    Consume,
     /// The event was not handled and will bubble up the tree.
     Ignore,
 }
 
+/// The axis a scrollbar measures.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ScrollAxis {
+    /// Rows, with a track that runs top to bottom.
+    Vertical,
+    /// Columns, with a track that runs left to right.
+    Horizontal,
+}
+
+/// A position indicator drawn on a scrollbar track.
+///
+/// `start` and `end` bound a half-open region of canvas cells, counted from
+/// the start of the target's canvas along the scrollbar's axis, so a mark
+/// can cover one row or a whole multi-line match. The scrollbar maps the
+/// region onto its track the same proportional way it places the thumb, so
+/// a mark sits beside the content it annotates; every nonempty region owns
+/// at least one track cell, and an empty region draws nothing. Each covered
+/// cell outside the thumb draws with `style` and `glyph`; each cell under
+/// the thumb keeps the thumb's glyph and the mark's style, so the position
+/// reads through in the mark's color.
+///
+/// The mark color must read from the style's foreground. Block thumb glyphs
+/// hide the background, so a text-highlight style with a dark foreground
+/// turns the mark dark just when the thumb slides over it; give marks a
+/// style whose foreground is the mark color instead.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct ScrollMark {
+    /// First canvas cell of the marked region.
+    pub start: u32,
+    /// One past the last canvas cell of the marked region.
+    pub end: u32,
+    /// Style path of the mark.
+    pub style: &'static str,
+    /// Glyph of the mark where it sits outside the thumb.
+    pub glyph: char,
+}
+
 /// Widgets are the behavior attached to nodes in the Core arena.
 pub trait Widget: Any {
+    /// Describe application semantics for one publication through read-only
+    /// access. Sensitive values must be omitted; this hook does not
+    /// serialize widget state.
+    fn semantics(&self, _view: &dyn ViewContext) -> Result<WidgetSemantics> {
+        Ok(WidgetSemantics::default())
+    }
+
     /// Layout configuration for this widget.
     fn layout(&self) -> Layout {
         Layout::column()
@@ -69,16 +112,65 @@ pub trait Widget: Any {
         None
     }
 
+    /// Return the rectangle of this widget's canvas that
+    /// [`Context::reveal_anchor`] shows, given the final content size.
+    ///
+    /// Layout calls this after it settles geometry, so the anchor reflects
+    /// changes made earlier in the turn. The hook reads widget state and cannot
+    /// change layout. The default returns `None`, which consumes the request
+    /// without scrolling.
+    fn reveal_anchor(&self, _view: Size) -> Option<Rect> {
+        None
+    }
+
+    /// Whether this widget displays scroll positions for the subtree beneath
+    /// it.
+    ///
+    /// Scrollbar owners, such as frames, search their subtree for the node
+    /// whose position they draw. The search stops at a widget that returns
+    /// true, so no node is drawn by two owners.
+    fn owns_scrollbars(&self) -> bool {
+        false
+    }
+
+    /// Position indicators for a scrollbar on `axis`.
+    ///
+    /// A scrollbar owner draws the returned marks on its track beside this
+    /// widget's canvas, so any scrolling widget can annotate positions such
+    /// as search matches without owning a scrollbar itself. `content` is
+    /// this node's content size, for widgets whose canvas offsets depend on
+    /// the view width, such as soft-wrapped text. The default reports no
+    /// marks.
+    fn scroll_marks(&self, _axis: ScrollAxis, _content: Size) -> Vec<ScrollMark> {
+        Vec::new()
+    }
+
+    /// Lifetime of scheduled polling. Hiding never stops polling.
+    ///
+    /// Node lifetime preserves background work while detached. Attachment
+    /// lifetime pauses polling on detach and initializes it again after
+    /// reattachment.
+    fn poll_lifetime(&self) -> WorkLifetime {
+        WorkLifetime::Node
+    }
+
     /// Scheduled poll endpoint.
+    ///
+    /// Return `Some(delay)` to replace the pending timer. Delays below one
+    /// millisecond round up to one millisecond so the runtime can sleep.
+    /// Return `None` to stop scheduled polling, including a timer pending when
+    /// an explicit wake triggered this callback. Node wakes can still request
+    /// an immediate poll without waiting for a timer.
     fn poll(&mut self, _ctx: &mut dyn Context) -> Option<Duration> {
         None
     }
 
     /// Called when the widget is mounted in the tree, before its first render.
     ///
-    /// A failed hook rolls back core-owned state. External effects and
-    /// widget-owned state must be repeatable or compensating because a
-    /// later mount attempt may call this hook again.
+    /// A failed hook restores the structural state listed by
+    /// [`Context::edit_structure`]. Widget state, binding registration, and
+    /// external effects survive. Compensate those effects or make them safe
+    /// to repeat, because a later mount attempt may call this hook again.
     fn on_mount(&mut self, _ctx: &mut dyn Context) -> Result<()> {
         Ok(())
     }

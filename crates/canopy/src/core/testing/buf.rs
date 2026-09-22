@@ -98,7 +98,6 @@ impl<'a> BufTest<'a> {
         for y in 0..self.buf.size().h {
             for x in 0..=self.buf.size().w.saturating_sub(tl) {
                 let mut m = true;
-                let mut c = false;
                 for (i, ch) in txt.chars().enumerate() {
                     if let Some(cell) = self.buf.get(Point { x: x + i as u32, y }) {
                         if cell.display_char() != ch {
@@ -119,45 +118,21 @@ impl<'a> BufTest<'a> {
                         let attr_matches =
                             style.attrs.is_none() || style.attrs == Some(cell.style.attrs);
                         let style_matches = fg_matches && bg_matches && attr_matches;
-                        if style_matches {
-                            c = true;
+                        if !style_matches {
+                            m = false;
+                            break;
                         }
                     } else {
                         m = false;
                         break;
                     }
                 }
-                if m && c {
+                if m {
                     return true;
                 }
             }
         }
         false
-    }
-
-    /// Dumps the contents of the buffer to the terminal for debugging purposes.
-    pub fn dump(&self) {
-        let width = self.buf.size().w as usize;
-
-        println!(
-            "\nTermBuf dump ({}x{}):",
-            self.buf.size().w,
-            self.buf.size().h
-        );
-        println!("┌{}┐", "─".repeat(width));
-
-        for y in 0..self.buf.size().h {
-            println!("│{}│{}", self.row_string(y), y % 10);
-        }
-
-        println!("└{}┘", "─".repeat(width));
-
-        // Bottom ruler
-        print!(" ");
-        for x in 0..width {
-            print!("{}", x % 10);
-        }
-        println!();
     }
 
     /// Return the contents of the buffer as lines of text.
@@ -195,20 +170,6 @@ mod tests {
         let matcher = BufTest::new(&buf);
         assert!(matcher.matches(&["hello", "XXXXX", "XXXXX"]));
         assert!(!matcher.matches(&["world", "XXXXX", "XXXXX"]));
-    }
-
-    #[test]
-    fn test_dump() {
-        let mut buf = TermBuf::new(Size::new(5, 3), '\0', test_style())
-            .expect("test render target should allocate");
-        buf.text(&test_style(), Line::new(0, 0, 5), "hello")
-            .expect("test buffer mutation should succeed");
-        buf.text(&test_style(), Line::new(1, 1, 3), "abc")
-            .expect("test buffer mutation should succeed");
-
-        // This test just verifies dump() runs without panicking
-        // The actual output goes to stdout
-        BufTest::new(&buf).dump();
     }
 
     #[test]
@@ -269,5 +230,40 @@ mod tests {
             "bold",
             &PartialStyle::from(StyleBuilder::new().fg(Color::Red).attr(Attr::Italic))
         ));
+    }
+    #[test]
+    fn contains_text_style_requires_every_character_and_component() {
+        let base = test_style();
+        let red = ResolvedStyle::new(Color::Red, Color::Blue, AttrSet::new(Attr::Bold));
+        let requested = PartialStyle::from(
+            StyleBuilder::new()
+                .fg(Color::Red)
+                .bg(Color::Blue)
+                .attr(Attr::Bold),
+        );
+        for red_column in 0..3 {
+            let mut buf = TermBuf::new((3, 1), 'x', base).unwrap();
+            buf.put(
+                Point {
+                    x: red_column,
+                    y: 0,
+                },
+                'x',
+                red,
+            )
+            .unwrap();
+            assert!(!BufTest::new(&buf).contains_text_style("xxx", &requested));
+        }
+        let mut buf = TermBuf::new((3, 1), 'x', red).unwrap();
+        assert!(BufTest::new(&buf).contains_text_style("xxx", &requested));
+        assert!(!BufTest::new(&buf).contains_text_style("", &requested));
+        for changed in [
+            ResolvedStyle::new(Color::White, red.bg, red.attrs),
+            ResolvedStyle::new(red.fg, Color::Black, red.attrs),
+            ResolvedStyle::new(red.fg, red.bg, AttrSet::default()),
+        ] {
+            buf.put(Point { x: 1, y: 0 }, 'x', changed).unwrap();
+            assert!(!BufTest::new(&buf).contains_text_style("xxx", &requested));
+        }
     }
 }

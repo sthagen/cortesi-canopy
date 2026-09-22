@@ -4,18 +4,22 @@
 //! Items participate in focus management and can be composed from other
 //! widgets.
 
+use std::{collections::HashSet, hash::Hash};
+
 use canopy::{
-    Context, EventOutcome, KeyedChildren, NodeId, TypedId, ViewContext, Widget, command,
+    Context, ContextExt, EventOutcome, FocusDirection, KeyedChildren, NodeId, NodeName, Render,
+    RevealAlign, TypedId, ViewContext, Widget, WidgetSemantics,
     commands::{
-        CommandArgs, CommandCall, CommandInvocation, CommandScopeFrame, ListRowContext, ToArgValue,
+        ArgValue, CommandAction, CommandArgs, CommandCall, CommandInvocation, CommandScopeFrame,
+        CommandStatus, CommandTarget, ListRowContext, ToArgValue,
     },
     derive_commands,
     error::{Error, Result},
     event::{Event, mouse},
-    geom::{Direction, Line, Point},
-    layout::{CanvasContext, Constraint, Edges, Layout, MeasureConstraints, Measurement, Size},
-    render::Render,
-    state::NodeName,
+    geom::{Line, Point, PointI32, Size},
+    layout::{
+        CanvasContext, Constraint, Edges, Layout, MeasureConstraints, MeasureOverflow, Measurement,
+    },
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -57,18 +61,24 @@ fn invocation_with_index(command: &CommandInvocation, index: usize) -> CommandIn
 
 /// Pending activation state for list row clicks.
 #[derive(Debug, Clone, Copy)]
-struct PendingActivate {
-    /// Selected row index.
-    index: usize,
+struct PendingActivate<K> {
+    /// Stable key of the pressed row.
+    key: K,
     /// Pointer origin when the press began.
-    origin: Point,
+    origin: PointI32,
     /// Whether the drag threshold was exceeded.
     dragged: bool,
 }
 
 /// Monotonic key for list items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ListKey(u64);
+pub struct AutoKey(u64);
+
+impl ToArgValue for AutoKey {
+    fn to_arg_value(self) -> ArgValue {
+        self.0.to_arg_value()
+    }
+}
 
 /// Trait for widgets that can be selected in a list.
 ///
@@ -87,29 +97,31 @@ pub trait Selectable: Widget {
 ///
 /// Items must implement the [`Selectable`] trait so the list can manage their
 /// selection state independently of focus.
-pub struct List<W: Selectable> {
+pub struct List<W: Selectable, K: Eq + Hash + Clone + ToArgValue + 'static = AutoKey> {
     /// Keyed list items in order.
-    items: KeyedChildren<ListKey, W>,
+    items: KeyedChildren<K, W>,
     /// Next monotonic key to assign.
     next_key: u64,
-    /// Currently selected item index.
-    selected: Option<usize>,
+    /// Stable key of the selected item.
+    selected: Option<K>,
     /// Optional list-level selection indicator.
     selection_indicator: Option<SelectionIndicator>,
     /// Optional activation command configuration.
-    on_activate: Option<CommandInvocation>,
+    on_activate: Option<CommandAction>,
     /// Pending activation state while handling clicks.
-    pending_activate: Option<PendingActivate>,
+    pending_activate: Option<PendingActivate<K>>,
+    /// Optional semantic label for the collection.
+    label: Option<String>,
 }
 
-impl<W: Selectable> Default for List<W> {
+impl<W: Selectable, K: Eq + Hash + Clone + ToArgValue + 'static> Default for List<W, K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[derive_commands]
-impl<W: Selectable> List<W> {
+impl<W: Selectable, K: Eq + Hash + Clone + ToArgValue + 'static> List<W, K> {
     /// Construct an empty list.
     pub fn new() -> Self {
         Self {
@@ -119,7 +131,32 @@ impl<W: Selectable> List<W> {
             selection_indicator: None,
             on_activate: None,
             pending_activate: None,
+            label: None,
         }
+    }
+
+    /// Set the semantic label of the collection.
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Inspect the selected row's configured activation command.
+    fn command_status(&self, ctx: &dyn ViewContext) -> Result<Option<CommandStatus>> {
+        let Some(action) = self.on_activate.as_ref() else {
+            return Ok(None);
+        };
+        if !ctx.is_attached_of(ctx.node_id()) {
+            return Ok(Some(CommandStatus::Disabled("List is detached".into())));
+        }
+        let Some(index) = self.selected_index() else {
+            return Ok(Some(CommandStatus::Disabled("No item selected".into())));
+        };
+        ctx.command_status(
+            action.target.unwrap_or(CommandTarget::From(ctx.node_id())),
+            &invocation_with_index(&action.invocation, index),
+        )
+        .map(Some)
     }
 
     /// Build a list with a list-level selection indicator.
@@ -143,7 +180,7 @@ impl<W: Selectable> List<W> {
 
     /// Build a list that dispatches a command when a row is activated.
     pub fn with_on_activate(mut self, command: CommandCall) -> Self {
-        self.on_activate = Some(command.invocation());
+        self.on_activate = Some(command.action());
         self
     }
 
@@ -157,6 +194,11 @@ impl<W: Selectable> List<W> {
         self.items.len()
     }
 
+    /// Borrow the stable keys in display order.
+    pub fn keys(&self) -> &[K] {
+        self.items.keys()
+    }
+
     /// Returns the typed ID of the item at the given index.
     pub fn item(&self, index: usize) -> Option<TypedId<W>> {
         self.items.id_at(index)
@@ -165,72 +207,117 @@ impl<W: Selectable> List<W> {
     /// Returns the currently selected index.
     pub fn selected_index(&self) -> Option<usize> {
         self.selected
+            .as_ref()
+            .and_then(|key| self.items.keys().iter().position(|item| item == key))
     }
 
     /// Returns the typed ID of the currently selected item.
     pub fn selected_item(&self) -> Option<TypedId<W>> {
-        self.selected.and_then(|idx| self.item(idx))
+        self.selected
+            .as_ref()
+            .and_then(|key| self.items.id_for(key))
     }
 
-    /// Append an item widget to the end of the list.
-    pub fn append(&mut self, ctx: &mut dyn Context, widget: W) -> Result<TypedId<W>>
-    where
-        W: 'static,
-    {
-        self.insert(ctx, self.items.len(), widget)
+    /// Return the stable key of the selected row.
+    pub fn selected_key(&self) -> Option<&K> {
+        self.selected.as_ref()
     }
 
-    /// Insert an item widget at the specified index.
-    pub fn insert(&mut self, ctx: &mut dyn Context, index: usize, widget: W) -> Result<TypedId<W>>
-    where
-        W: 'static,
-    {
-        let clamped = index.min(self.items.len());
-        let key = self.next_key();
-        let was_empty = self.selected.is_none();
-        let previous_focus = ctx.focused_leaf(ctx.root_id());
-        let mut desired = self.items.keys().to_vec();
-        desired.insert(clamped, key);
-        let ordered = self.reconcile_with_widget(ctx, desired, key, widget)?;
-        let id = ordered
-            .get(clamped)
-            .copied()
-            .ok_or_else(|| Error::Internal("list insert did not return the new item".into()))?;
+    /// Return the widget for a domain key.
+    #[cfg(test)]
+    pub(crate) fn item_for_key(&self, key: &K) -> Option<TypedId<W>> {
+        self.items.id_for(key)
+    }
 
-        // Adjust selection if inserting before current selection
-        if let Some(sel) = self.selected {
-            if clamped <= sel {
-                // Just update index, don't change which item is selected
-                self.selected = Some(sel + 1);
-            }
-        } else if !self.items.is_empty() {
-            self.update_selection(ctx, Some(0))?;
+    /// Select a domain key, returning an error when it is absent.
+    pub fn select_key(&mut self, ctx: &mut dyn Context, key: &K) -> Result<()> {
+        let index = self
+            .items
+            .keys()
+            .iter()
+            .position(|item| item == key)
+            .ok_or_else(|| Error::Invalid("list selection key is absent".into()))?;
+        self.select(ctx, index)
+    }
+
+    /// Reconcile domain keys while retaining widgets and selection for
+    /// surviving keys.
+    ///
+    /// Duplicate keys fail before callbacks run. Updates have the same
+    /// structural rollback boundary as [`KeyedChildren::reconcile`]. If
+    /// selection is removed, the next surviving old neighbor wins, then the
+    /// previous neighbor.
+    pub fn reconcile<I, C, U>(
+        &mut self,
+        ctx: &mut dyn Context,
+        desired: I,
+        create: C,
+        mut update: U,
+    ) -> Result<Vec<TypedId<W>>>
+    where
+        I: IntoIterator<Item = K>,
+        C: FnMut(&K) -> Result<W>,
+        U: FnMut(&K, TypedId<W>, &mut dyn Context) -> Result<()>,
+    {
+        let desired: Vec<K> = desired.into_iter().collect();
+        let keys: HashSet<&K> = desired.iter().collect();
+        if keys.len() != desired.len() {
+            return Err(Error::Invalid("duplicate list key".into()));
         }
-
-        // Focus first item if this was an empty list
-        if was_empty
-            && let Some(first_id) = self.item(0)
-            && ctx.node_is_attached(first_id.into())
+        let selected = self.selection_after_reconcile(&desired);
+        let selection_changed = selected != self.selected;
+        let had_focus = ctx.is_on_focus_path_of(ctx.node_id());
+        let previous_focus = ctx.focused_node();
+        let ordered = self.items.reconcile(ctx, desired, create, |key, id, ctx| {
+            update(key, id, ctx)?;
+            ctx.with_widget_mut(id, |widget: &mut W, _| {
+                widget.set_selected(selected.as_ref() == Some(key));
+                Ok(())
+            })
+        })?;
+        self.selected = selected;
+        if self
+            .pending_activate
+            .as_ref()
+            .is_some_and(|pending| self.items.id_for(&pending.key).is_none())
         {
-            ctx.set_focus(first_id.into())?;
-        } else if let Some(previous_focus) = previous_focus {
-            ctx.set_focus(previous_focus)?;
-        } else {
-            self.focus_selected(ctx)?;
+            self.pending_activate = None;
+            ctx.release_mouse()?;
         }
+        if selection_changed && had_focus {
+            self.focus_selected(ctx)?;
+        } else if let Some(focus) = previous_focus
+            && ctx.is_attached_of(focus)
+        {
+            ctx.set_focus(focus)?;
+        }
+        Ok(ordered)
+    }
 
-        Ok(id)
+    /// Choose a surviving selection using the previous row order.
+    fn selection_after_reconcile(&self, desired: &[K]) -> Option<K> {
+        let Some(selected) = self.selected.as_ref() else {
+            return desired.first().cloned();
+        };
+        if desired.contains(selected) {
+            return Some(selected.clone());
+        }
+        let old_index = self.selected_index()?;
+        self.items.keys()[old_index + 1..]
+            .iter()
+            .chain(self.items.keys()[..old_index].iter().rev())
+            .find(|key| desired.contains(key))
+            .cloned()
     }
 
     /// Remove the item at the specified index.
-    pub fn remove(&mut self, ctx: &mut dyn Context, index: usize) -> Result<bool> {
+    pub(crate) fn remove(&mut self, ctx: &mut dyn Context, index: usize) -> Result<bool> {
         let mut desired = self.items.keys().to_vec();
         if index >= desired.len() {
             return Ok(false);
         }
         desired.remove(index);
         self.reconcile_order(ctx, desired)?;
-        self.repair_selection_after_remove(ctx, index)?;
         Ok(true)
     }
 
@@ -238,14 +325,13 @@ impl<W: Selectable> List<W> {
     #[command(ignore_result)]
     pub fn clear(&mut self, ctx: &mut dyn Context) -> Result<()> {
         self.reconcile_order(ctx, Vec::new())?;
-        self.selected = None;
         Ok(())
     }
 
     /// Delete the currently selected item.
     #[command(ignore_result)]
     pub fn delete_selected(&mut self, ctx: &mut dyn Context) -> Result<bool> {
-        match self.selected {
+        match self.selected_index() {
             Some(sel) => self.remove(ctx, sel),
             None => Ok(false),
         }
@@ -273,31 +359,34 @@ impl<W: Selectable> List<W> {
             ));
         }
 
-        let old_id = self.selection_id(self.selected, "list selection points at a missing item")?;
+        let old_id = self.selection_id(
+            self.selected_index(),
+            "list selection points at a missing item",
+        )?;
         let new_id =
             self.selection_id(new_selected, "new list selection points at a missing item")?;
         let same_selection = old_id.as_ref().map(|id| NodeId::from(*id))
             == new_id.as_ref().map(|id| NodeId::from(*id));
         if same_selection {
-            self.selected = new_selected;
+            self.selected = new_selected.map(|index| self.items.keys()[index].clone());
             return Ok(());
         }
 
         if let Some(old_id) = old_id {
-            ctx.with_widget(old_id, |w: &mut W, _| {
+            ctx.with_widget_mut(old_id, |w: &mut W, _| {
                 w.set_selected(false);
                 Ok(())
             })?;
         }
 
         if let Some(new_id) = new_id {
-            ctx.with_widget(new_id, |w: &mut W, _| {
+            ctx.with_widget_mut(new_id, |w: &mut W, _| {
                 w.set_selected(true);
                 Ok(())
             })?;
         }
 
-        self.selected = new_selected;
+        self.selected = new_selected.map(|index| self.items.keys()[index].clone());
         debug_assert!(self.selection_invariant_holds());
         Ok(())
     }
@@ -315,32 +404,9 @@ impl<W: Selectable> List<W> {
 
     /// Return whether the stored selection points at a live list item.
     fn selection_invariant_holds(&self) -> bool {
-        self.selected.is_none_or(|index| index < self.items.len())
-    }
-
-    /// Repair selection and focus after removing an item.
-    fn repair_selection_after_remove(&mut self, ctx: &mut dyn Context, index: usize) -> Result<()> {
-        if let Some(sel) = self.selected {
-            if index < sel {
-                self.selected = Some(sel - 1);
-                debug_assert!(self.selection_invariant_holds());
-                return Ok(());
-            }
-            if index == sel {
-                let new_sel = if self.items.is_empty() {
-                    None
-                } else {
-                    Some(sel.min(self.items.len() - 1))
-                };
-                self.selected = None;
-                self.update_selection(ctx, new_sel)?;
-                if new_sel.is_some() {
-                    self.focus_selected(ctx)?;
-                }
-            }
-        }
-        debug_assert!(self.selection_invariant_holds());
-        Ok(())
+        self.selected
+            .as_ref()
+            .is_none_or(|key| self.items.id_for(key).is_some())
     }
 
     /// Select an item by index, focus it, and scroll it into view.
@@ -352,7 +418,9 @@ impl<W: Selectable> List<W> {
         }
         self.update_selection(c, Some(index.min(self.items.len() - 1)))?;
         self.focus_selected(c)?;
-        self.ensure_selected_visible(c);
+        if let Some(item) = self.selected_item() {
+            c.reveal_node(item.into(), RevealAlign::Nearest)?;
+        }
         Ok(())
     }
 
@@ -372,7 +440,7 @@ impl<W: Selectable> List<W> {
     #[command]
     pub fn select_by(&mut self, c: &mut dyn Context, delta: i32) -> Result<()> {
         let next = self
-            .selected
+            .selected_index()
             .unwrap_or(0)
             .saturating_add_signed(delta as isize);
         self.select_and_reveal(c, next)
@@ -388,7 +456,7 @@ impl<W: Selectable> List<W> {
                 self.select_and_reveal(c, index)?;
                 if self.on_activate.is_some() {
                     self.pending_activate = Some(PendingActivate {
-                        index,
+                        key: self.items.keys()[index].clone(),
                         origin: event.location,
                         dragged: false,
                     });
@@ -417,8 +485,10 @@ impl<W: Selectable> List<W> {
                     c.release_mouse()?;
                     if !pending.dragged {
                         let index = self.index_at_location(c, event.location);
-                        if index == Some(pending.index) {
-                            self.dispatch_activate(c, pending.index);
+                        if let Some(index) = index
+                            && self.items.keys().get(index) == Some(&pending.key)
+                        {
+                            self.dispatch_activate(c, index)?;
                         }
                     }
                     return Ok(true);
@@ -432,7 +502,7 @@ impl<W: Selectable> List<W> {
     /// Set focus on the currently selected item.
     fn focus_selected(&self, c: &mut dyn Context) -> Result<()> {
         if let Some(id) = self.selected_item()
-            && c.node_is_attached(id.into())
+            && c.is_attached_of(id.into())
         {
             c.set_focus(id.into())?;
         }
@@ -440,9 +510,9 @@ impl<W: Selectable> List<W> {
     }
 
     /// Dispatch the activation command for a selected row.
-    fn dispatch_activate(&self, c: &mut dyn Context, index: usize) -> bool {
+    fn dispatch_activate(&self, c: &mut dyn Context, index: usize) -> Result<()> {
         let Some(config) = self.on_activate.as_ref() else {
-            return false;
+            return Ok(());
         };
         let frame = CommandScopeFrame {
             event: c.current_event().cloned(),
@@ -450,63 +520,48 @@ impl<W: Selectable> List<W> {
             list_row: Some(ListRowContext {
                 list: c.node_id(),
                 index,
+                key: self.items.keys()[index].clone().to_arg_value(),
             }),
         };
-        let invocation = invocation_with_index(config, index);
-        c.dispatch_command_scoped(frame, &invocation).is_ok()
+        let invocation = invocation_with_index(&config.invocation, index);
+        c.dispatch_scoped(
+            config.target.unwrap_or(CommandTarget::From(c.node_id())),
+            frame,
+            &invocation,
+        )?;
+        Ok(())
     }
 
     /// Scroll the view by one line in the specified direction.
     /// @param dir The direction to scroll.
     #[command]
-    pub fn scroll(&mut self, c: &mut dyn Context, dir: Direction) {
+    pub fn scroll(&mut self, c: &mut dyn Context, dir: FocusDirection) {
         match dir {
-            Direction::Up => {
+            FocusDirection::Up | FocusDirection::Prev => {
                 c.scroll_up();
             }
-            Direction::Down => {
+            FocusDirection::Down | FocusDirection::Next => {
                 c.scroll_down();
             }
-            Direction::Left => {
+            FocusDirection::Left => {
                 c.scroll_left();
             }
-            Direction::Right => {
+            FocusDirection::Right => {
                 c.scroll_right();
             }
         }
     }
 
-    /// Move selection by pages.
-    /// Positive values move down; negative values move up.
+    /// Move selection by one page.
+    /// Positive values move down; negative values move up. Zero is a no-op.
     /// @param delta Signed page delta. Positive moves down and negative moves
     /// up.
     #[command]
     pub fn page(&mut self, c: &mut dyn Context, delta: i32) -> Result<()> {
-        self.page_shift(c, delta >= 0)
-    }
-
-    /// Ensure the selected item is visible in the view.
-    fn ensure_selected_visible(&self, c: &mut dyn Context) {
-        let Some(selected_idx) = self.selected else {
-            return;
-        };
-
-        let view = c.view();
-        let view_rect = view.view_rect();
-
-        // Compute item positions by measuring each child
-        let metrics = self.item_metrics(c);
-        let Some((start, height)) = metrics.get(selected_idx).copied() else {
-            return;
-        };
-
-        if start < view_rect.tl.y {
-            let delta = view_rect.tl.y - start;
-            let _ = c.scroll_by(0, -(delta as i32));
-        } else if start.saturating_add(height) > view_rect.tl.y.saturating_add(view_rect.h) {
-            let delta = start.saturating_add(height) - (view_rect.tl.y + view_rect.h);
-            let _ = c.scroll_by(0, delta as i32);
+        if delta == 0 {
+            return Ok(());
         }
+        self.page_shift(c, delta > 0)
     }
 
     /// Move selection by one page and keep it visible.
@@ -522,7 +577,7 @@ impl<W: Selectable> List<W> {
         }
 
         let metrics = self.item_metrics(c);
-        let selected_idx = self.selected.unwrap_or(0).min(self.items.len() - 1);
+        let selected_idx = self.selected_index().unwrap_or(0).min(self.items.len() - 1);
         let Some((start, _height)) = metrics.get(selected_idx).copied() else {
             return Ok(());
         };
@@ -534,19 +589,16 @@ impl<W: Selectable> List<W> {
             start.saturating_sub(page)
         };
 
-        if let Some(target_idx) = Self::index_at_y(&metrics, target_y) {
-            self.select_and_reveal(c, target_idx)?;
-        }
-        Ok(())
+        // Keyboard paging clamps at the last row; mouse hit testing does not.
+        let target_idx = Self::index_at_y(&metrics, target_y).unwrap_or(self.items.len() - 1);
+        self.select_and_reveal(c, target_idx)
     }
 
-    /// Find the item index at a local content-space location.
-    fn index_at_location(&self, c: &dyn Context, location: Point) -> Option<usize> {
-        let view = c.view();
-        let view_rect = view.view_rect();
-        let content_y = view_rect.tl.y.saturating_add(location.y);
+    /// Find the item index at a viewport-local location.
+    fn index_at_location(&self, c: &dyn Context, location: PointI32) -> Option<usize> {
+        let content = c.view().content_point(location)?;
         let metrics = self.item_metrics(c);
-        Self::index_at_y(&metrics, content_y)
+        Self::index_at_y(&metrics, content.y)
     }
 
     /// Build (start_y, height) tuples for each item, one per keyed child.
@@ -557,7 +609,7 @@ impl<W: Selectable> List<W> {
         let mut y_offset = 0u32;
 
         for id in self.items.iter_ids() {
-            let height = c.node_view(id.into()).map(|v| v.outer.h).unwrap_or(1);
+            let height = c.view_of(id.into()).map(|v| v.outer.h).unwrap_or(1);
             metrics.push((y_offset, height));
             y_offset = y_offset.saturating_add(height);
         }
@@ -567,78 +619,85 @@ impl<W: Selectable> List<W> {
 
     /// Find the item index covering a y coordinate.
     fn index_at_y(metrics: &[(u32, u32)], y: u32) -> Option<usize> {
-        for (idx, (start, height)) in metrics.iter().enumerate() {
-            if y < start.saturating_add(*height) {
-                return Some(idx);
-            }
-        }
-        if metrics.is_empty() {
-            None
-        } else {
-            Some(metrics.len() - 1)
-        }
+        metrics
+            .iter()
+            .position(|(start, height)| *start <= y && y < start.saturating_add(*height))
     }
-    /// Allocate the next list key.
-    fn next_key(&mut self) -> ListKey {
-        let key = ListKey(self.next_key);
-        self.next_key = self.next_key.saturating_add(1);
-        key
-    }
-
-    /// Reconcile the list order while creating a single new widget.
-    fn reconcile_with_widget(
-        &mut self,
-        ctx: &mut dyn Context,
-        desired: Vec<ListKey>,
-        key: ListKey,
-        widget: W,
-    ) -> Result<Vec<TypedId<W>>>
-    where
-        W: 'static,
-    {
-        if self.items.id_for(&key).is_some() {
-            return Err(Error::Internal("list key collision".into()));
-        }
-        let mut widget = Some(widget);
-        self.items.reconcile(
-            ctx,
-            desired,
-            |requested| {
-                if *requested != key {
-                    return Err(Error::Internal(
-                        "list reconcile requested an unexpected key".into(),
-                    ));
-                }
-                widget
-                    .take()
-                    .ok_or_else(|| Error::Internal("list widget already consumed".into()))
-            },
-            |_, _, _| Ok(()),
-        )
-    }
-
     /// Reconcile the list order without creating new widgets.
     fn reconcile_order(
         &mut self,
         ctx: &mut dyn Context,
-        desired: Vec<ListKey>,
+        desired: Vec<K>,
     ) -> Result<Vec<TypedId<W>>> {
-        self.items.reconcile(
+        self.reconcile(
             ctx,
             desired,
-            |requested| {
-                Err(Error::Internal(format!(
-                    "list reconcile requested missing widget for key {requested:?}",
-                )))
+            |_| {
+                Err(Error::Internal(
+                    "list reconcile requested a missing widget".into(),
+                ))
             },
             |_, _, _| Ok(()),
         )
     }
 }
 
-impl<W: Selectable + 'static> Widget for List<W> {
+impl<W: Selectable> List<W, AutoKey> {
+    /// Append a widget with a fresh automatic key.
+    pub fn append(&mut self, ctx: &mut dyn Context, widget: W) -> Result<TypedId<W>> {
+        self.insert(ctx, self.len(), widget)
+    }
+
+    /// Insert a widget with a fresh automatic key at the clamped index.
+    pub fn insert(&mut self, ctx: &mut dyn Context, index: usize, widget: W) -> Result<TypedId<W>> {
+        let index = index.min(self.len());
+        let key = AutoKey(self.next_key);
+        self.next_key = self
+            .next_key
+            .checked_add(1)
+            .ok_or_else(|| Error::Internal("list automatic keys exhausted".into()))?;
+        let previous_focus = ctx.focused_node();
+        let was_empty = self.is_empty();
+        let mut desired = self.items.keys().to_vec();
+        desired.insert(index, key);
+        let mut widget = Some(widget);
+        let ordered = self.reconcile(
+            ctx,
+            desired,
+            |_| {
+                widget
+                    .take()
+                    .ok_or_else(|| Error::Internal("list widget already consumed".into()))
+            },
+            |_, _, _| Ok(()),
+        )?;
+        if was_empty {
+            self.focus_selected(ctx)?;
+        } else if let Some(focus) = previous_focus {
+            ctx.set_focus(focus)?;
+        }
+        Ok(ordered[index])
+    }
+}
+
+impl<W: Selectable + 'static, K: Eq + Hash + Clone + ToArgValue + 'static> Widget for List<W, K> {
+    fn semantics(&self, ctx: &dyn ViewContext) -> Result<WidgetSemantics> {
+        Ok(WidgetSemantics {
+            role: Some("list".into()),
+            label: self.label.clone(),
+            selected_keys: self
+                .selected
+                .iter()
+                .cloned()
+                .map(ToArgValue::to_arg_value)
+                .collect(),
+            action_status: self.command_status(ctx)?,
+            ..WidgetSemantics::default()
+        })
+    }
+
     fn layout(&self) -> Layout {
-        let mut layout = Layout::fill().overflow_x();
+        let mut layout = Layout::fill().overflow_x(MeasureOverflow::Unbounded);
         if let Some(indicator) = &self.selection_indicator
             && indicator.width > 0
         {
@@ -664,7 +723,7 @@ impl<W: Selectable + 'static> Widget for List<W> {
         rndr.fill("list", area, ' ')?;
 
         if let Some(indicator) = &self.selection_indicator
-            && let Some(selected_idx) = self.selected
+            && let Some(selected_idx) = self.selected_index()
             && indicator.width > 0
         {
             let metrics = self.item_metrics(ctx);
@@ -676,10 +735,12 @@ impl<W: Selectable + 'static> Widget for List<W> {
                     .min(view_rect.tl.y.saturating_add(view_rect.h));
 
                 if visible_start < visible_end {
-                    let content_origin = view.content_origin();
-                    let local_y = content_origin
-                        .y
-                        .saturating_add(visible_start - view_rect.tl.y);
+                    let outer =
+                        Point::try_from(view.viewport_to_outer(PointI32::try_from(Point {
+                            x: 0,
+                            y: visible_start - view_rect.tl.y,
+                        })?)?)?;
+                    let local_y = outer.y;
                     let width = indicator.width.min(area.w);
 
                     if width > 0 {
@@ -748,7 +809,7 @@ fn indicator_width(text: &str) -> u32 {
 }
 
 /// Return true when drag distance exceeds the configured threshold.
-fn drag_exceeded(origin: Point, current: Point, threshold: u32) -> bool {
+fn drag_exceeded(origin: PointI32, current: PointI32, threshold: u32) -> bool {
     let dx = origin.x.abs_diff(current.x);
     let dy = origin.y.abs_diff(current.y);
     dx.max(dy) > threshold
@@ -757,12 +818,85 @@ fn drag_exceeded(origin: Point, current: Point, threshold: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Canopy, Loader, NodeId, ViewContext, derive_commands, state::NodeName,
+        Canopy, Loader, NodeId, NodeName, ViewContext, derive_commands,
+        event::key,
+        layout::{Edges, Layout},
         testing::harness::Harness,
     };
 
     use super::*;
     use crate::Text;
+
+    struct ActivationRoot {
+        fail: bool,
+        activations: usize,
+    }
+
+    #[derive_commands]
+    impl ActivationRoot {
+        #[command]
+        fn activate(&mut self, index: usize) -> Result<()> {
+            assert_eq!(index, 0);
+            self.activations += 1;
+            if self.fail {
+                Err(Error::Invalid("activation failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Widget for ActivationRoot {
+        fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
+            let list =
+                ctx.add_child(List::<Text>::new().with_on_activate(Self::cmd_activate().call()))?;
+            ctx.with_widget_mut::<List<Text>, _>(list, |list, ctx| {
+                list.append(ctx, Text::new("First row"))?;
+                Ok(())
+            })
+        }
+    }
+
+    impl Loader for ActivationRoot {
+        fn load(canopy: &mut Canopy) -> Result<()> {
+            canopy.add_commands::<Self>()
+        }
+    }
+
+    #[test]
+    fn list_activation_propagates_errors_after_releasing_capture() -> Result<()> {
+        for (fail, drag) in [(false, false), (true, false), (true, true)] {
+            let mut harness = Harness::builder(ActivationRoot {
+                fail,
+                activations: 0,
+            })
+            .size(20, 4)
+            .build()?;
+            harness.render()?;
+            let mut event = mouse::MouseEvent {
+                action: mouse::Action::Down,
+                button: mouse::Button::Left,
+                modifiers: key::Empty,
+                location: PointI32 { x: 0, y: 0 },
+            };
+            harness.mouse(event)?;
+            if drag {
+                event.action = mouse::Action::Drag;
+                event.location.x = 8;
+                harness.mouse(event)?;
+            }
+            event.action = mouse::Action::Up;
+            event.location.x = 0;
+            let result = harness.mouse(event);
+            assert_eq!(result.is_err(), fail && !drag);
+            harness.with_root_context(|root: &mut ActivationRoot, ctx| {
+                assert_eq!(root.activations, usize::from(!drag));
+                assert_eq!(ctx.take_mouse_capture()?, None);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 
     struct Row {
         selected: bool,
@@ -803,6 +937,336 @@ mod tests {
             c.add_commands::<Self>()?;
             Ok(())
         }
+    }
+
+    impl Loader for List<Row, i64> {
+        fn load(canopy: &mut Canopy) -> Result<()> {
+            canopy.add_commands::<Self>()
+        }
+    }
+
+    /// Reconcile a domain-keyed fixture with selectable rows.
+    fn reconcile_rows(
+        list: &mut List<Row, i64>,
+        ctx: &mut dyn Context,
+        keys: &[i64],
+    ) -> Result<()> {
+        list.reconcile(
+            ctx,
+            keys.iter().copied(),
+            |_| Ok(Row::new()),
+            |_, _, _| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_reorder_preserves_selection_widget_and_focus() -> Result<()> {
+        let mut harness = Harness::builder(List::<Row, i64>::new())
+            .size(20, 10)
+            .build()?;
+        let selected = harness.with_root_context(|list: &mut List<Row, i64>, ctx| {
+            reconcile_rows(list, ctx, &[10, 20, 30])?;
+            list.select_by(ctx, 1)?;
+            let selected = list.item_for_key(&20).expect("selected row");
+            reconcile_rows(list, ctx, &[30, 10, 20])?;
+            assert_eq!(list.selected_key(), Some(&20));
+            assert_eq!(list.selected_index(), Some(2));
+            assert_eq!(list.item_for_key(&20), Some(selected));
+            let semantics = list.semantics(ctx)?;
+            assert_eq!(semantics.role.as_deref(), Some("list"));
+            assert_eq!(semantics.selected_keys, vec![20_i64.to_arg_value()]);
+            assert_eq!(semantics.selected, None);
+            Ok(selected)
+        })?;
+        assert_eq!(focused_row(&harness), Some(selected.into()));
+        assert!(harness.with_widget(selected, |row: &mut Row| row.selected));
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_selection_removal_prefers_old_neighbors() -> Result<()> {
+        let mut harness = Harness::builder(List::<Row, i64>::new())
+            .size(20, 10)
+            .build()?;
+        harness.with_root_context(|list: &mut List<Row, i64>, ctx| {
+            reconcile_rows(list, ctx, &[10, 20, 30, 40])?;
+            list.select_key(ctx, &20)?;
+            reconcile_rows(list, ctx, &[40, 10, 30])?;
+            assert_eq!(list.selected_key(), Some(&30));
+            reconcile_rows(list, ctx, &[40, 10])?;
+            assert_eq!(list.selected_key(), Some(&10));
+            reconcile_rows(list, ctx, &[99])?;
+            assert_eq!(list.selected_key(), None);
+            assert!(list.select_key(ctx, &100).is_err());
+            list.select_key(ctx, &99)?;
+            assert_eq!(list.selected_index(), Some(0));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn keyed_duplicate_and_failed_updates_preserve_mapping() -> Result<()> {
+        let mut harness = Harness::builder(List::<Row, i64>::new())
+            .size(20, 10)
+            .build()?;
+        harness.with_root_context(|list: &mut List<Row, i64>, ctx| {
+            reconcile_rows(list, ctx, &[10, 20])?;
+            let first = list.item_for_key(&10);
+            let mut creates = 0;
+            let mut updates = 0;
+            assert!(
+                list.reconcile(
+                    ctx,
+                    [30, 30],
+                    |_| {
+                        creates += 1;
+                        Ok(Row::new())
+                    },
+                    |_, _, _| {
+                        updates += 1;
+                        Ok(())
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!((creates, updates), (0, 0));
+            assert!(
+                list.reconcile(
+                    ctx,
+                    [20, 30],
+                    |_| Ok(Row::new()),
+                    |_, _, _| { Err(Error::Invalid("update failed".into())) }
+                )
+                .is_err()
+            );
+            assert_eq!(list.item(0), first);
+            assert_eq!(list.selected_key(), Some(&10));
+            assert_eq!(list.item_for_key(&30), None);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn keyed_list_rejects_unmanaged_children_before_callbacks() -> Result<()> {
+        let mut harness = Harness::builder(List::<Row, i64>::new())
+            .size(20, 10)
+            .build()?;
+        harness.with_root_context(|list: &mut List<Row, i64>, ctx| {
+            let header = ctx.add_child(Text::new("unmanaged header"))?;
+            let result = list.reconcile(
+                ctx,
+                [1],
+                |_| panic!("create must not run with unmanaged children"),
+                |_, _, _| panic!("update must not run with unmanaged children"),
+            );
+            assert!(result.is_err());
+            assert_eq!(ctx.children(), vec![header.into()]);
+            assert!(list.is_empty());
+            Ok(())
+        })
+    }
+
+    /// Receives domain-keyed row activation together with its current index.
+    #[derive(Default)]
+    struct KeyedActivationRoot {
+        /// Last delivered activation index and stable key.
+        activation: Option<(usize, ArgValue)>,
+    }
+
+    #[derive_commands]
+    impl KeyedActivationRoot {
+        #[command]
+        fn activate(&mut self, index: usize, row: ListRowContext) {
+            assert_eq!(index, row.index);
+            self.activation = Some((index, row.key));
+        }
+    }
+
+    impl Widget for KeyedActivationRoot {
+        fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
+            let list = ctx.add_child(
+                List::<Text, i64>::new().with_on_activate(
+                    Self::cmd_activate()
+                        .call()
+                        .with_target(CommandTarget::Exact(ctx.node_id())),
+                ),
+            )?;
+            ctx.with_widget_mut(list, |list: &mut List<Text, i64>, ctx| {
+                list.reconcile(
+                    ctx,
+                    [10, 20],
+                    |key| Ok(Text::new(key.to_string())),
+                    |_, _, _| Ok(()),
+                )?;
+                Ok(())
+            })
+        }
+    }
+
+    impl Loader for KeyedActivationRoot {
+        fn load(canopy: &mut Canopy) -> Result<()> {
+            canopy.add_commands::<Self>()
+        }
+    }
+
+    #[test]
+    fn blank_space_below_rows_neither_selects_nor_activates() -> Result<()> {
+        for press_y in [1, 2, 4] {
+            let mut harness = Harness::builder(KeyedActivationRoot::default())
+                .size(20, 5)
+                .build()?;
+            harness.render()?;
+            let mut event = mouse::MouseEvent {
+                action: mouse::Action::Down,
+                button: mouse::Button::Left,
+                modifiers: key::Empty,
+                location: PointI32 { x: 0, y: press_y },
+            };
+            harness.mouse(event)?;
+            if press_y >= 2 {
+                harness.with_root_context(|_: &mut KeyedActivationRoot, ctx| {
+                    assert_eq!(
+                        ctx.take_mouse_capture()?,
+                        None,
+                        "blank space cannot capture"
+                    );
+                    Ok(())
+                })?;
+            }
+            event.action = mouse::Action::Up;
+            event.location.y = 4;
+            harness.mouse(event)?;
+            harness.with_root_context(|root: &mut KeyedActivationRoot, ctx| {
+                assert_eq!(
+                    root.activation, None,
+                    "release outside a row cannot activate"
+                );
+                assert_eq!(ctx.take_mouse_capture()?, None);
+                ctx.with_unique_descendant::<List<Text, i64>, _>(|list, _| {
+                    let expected = if press_y == 1 { 20 } else { 10 };
+                    assert_eq!(list.selected_key(), Some(&expected));
+                    Ok(())
+                })
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_in_padding_above_rows_does_not_activate() -> Result<()> {
+        let mut harness = Harness::builder(KeyedActivationRoot::default())
+            .size(20, 5)
+            .build()?;
+        harness.with_root_context(|_: &mut KeyedActivationRoot, ctx| {
+            ctx.with_unique_descendant::<List<Text, i64>, _>(|_, ctx| {
+                ctx.set_layout(Layout::fill().padding(Edges::new(1, 0, 0, 0)))
+            })
+        })?;
+        harness.render()?;
+        let mut event = mouse::MouseEvent {
+            action: mouse::Action::Down,
+            button: mouse::Button::Left,
+            modifiers: key::Empty,
+            location: PointI32 { x: 0, y: 1 },
+        };
+        harness.mouse(event)?;
+        event.action = mouse::Action::Up;
+        event.location.y = 0;
+        harness.mouse(event)?;
+        harness.with_root_widget::<KeyedActivationRoot, _>(|root| {
+            assert_eq!(
+                root.activation, None,
+                "a release in the padding above the rows is outside every row"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn paging_beyond_short_list_clamps_to_first_and_last_rows() -> Result<()> {
+        let mut harness = Harness::builder(KeyedActivationRoot::default())
+            .size(20, 5)
+            .build()?;
+        harness.render()?;
+        harness.with_root_context(|_: &mut KeyedActivationRoot, ctx| {
+            ctx.with_unique_descendant::<List<Text, i64>, _>(|list, ctx| {
+                list.page(ctx, 0)?;
+                assert_eq!(list.selected_key(), Some(&10));
+                list.page(ctx, 1)?;
+                assert_eq!(list.selected_key(), Some(&20));
+                list.page(ctx, 1)?;
+                assert_eq!(list.selected_key(), Some(&20));
+                list.page(ctx, -1)?;
+                assert_eq!(list.selected_key(), Some(&10));
+                list.page(ctx, -1)?;
+                assert_eq!(list.selected_key(), Some(&10));
+                Ok(())
+            })
+        })
+    }
+
+    #[test]
+    fn pending_activation_follows_key_through_reorder() -> Result<()> {
+        let mut harness = Harness::builder(KeyedActivationRoot::default())
+            .size(20, 4)
+            .build()?;
+        harness.render()?;
+        let mut event = mouse::MouseEvent {
+            action: mouse::Action::Down,
+            button: mouse::Button::Left,
+            modifiers: key::Empty,
+            location: PointI32 { x: 0, y: 0 },
+        };
+        harness.mouse(event)?;
+        harness.with_root_context(|_: &mut KeyedActivationRoot, ctx| {
+            ctx.with_unique_descendant::<List<Text, i64>, _>(|list, ctx| {
+                list.reconcile(
+                    ctx,
+                    [20, 10],
+                    |_| unreachable!("rows retained"),
+                    |_, _, _| Ok(()),
+                )?;
+                Ok(())
+            })
+        })?;
+        harness.render()?;
+        event.action = mouse::Action::Up;
+        event.location.y = 1;
+        harness.mouse(event)?;
+        harness.with_root_widget::<KeyedActivationRoot, _>(|root| {
+            assert_eq!(root.activation, Some((1, 10_i64.to_arg_value())));
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn removing_pressed_key_cancels_activation_and_capture() -> Result<()> {
+        let mut harness = Harness::builder(KeyedActivationRoot::default())
+            .size(20, 4)
+            .build()?;
+        harness.render()?;
+        harness.mouse(mouse::MouseEvent {
+            action: mouse::Action::Down,
+            button: mouse::Button::Left,
+            modifiers: key::Empty,
+            location: PointI32 { x: 0, y: 0 },
+        })?;
+        harness.with_root_context(|root: &mut KeyedActivationRoot, ctx| {
+            ctx.with_unique_descendant::<List<Text, i64>, _>(|list, ctx| {
+                list.reconcile(
+                    ctx,
+                    [20],
+                    |_| unreachable!("row retained"),
+                    |_, _, _| Ok(()),
+                )?;
+                assert!(list.pending_activate.is_none());
+                assert_eq!(ctx.take_mouse_capture()?, None);
+                Ok(())
+            })?;
+            assert_eq!(root.activation, None);
+            Ok(())
+        })
     }
 
     fn row_selection(harness: &mut Harness) -> Vec<bool> {

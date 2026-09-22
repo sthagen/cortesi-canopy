@@ -6,9 +6,10 @@ use crate::{
         context::CoreContext,
         node::Node,
         view::View,
+        wake::WorkStamp,
         widget_access::{WidgetSlotPolicy, validate_slot},
     },
-    layout::Layout,
+    layout::{Layout, LayoutOverride},
     path::Path,
     widget::Widget,
 };
@@ -20,30 +21,33 @@ impl TreeStateSnapshot {
     /// tree-edit rollback.
     fn capture(core: &Core) -> Self {
         Self {
+            removal_checkpoint: core.completion.requests.len(),
             nodes: core.nodes.clone(),
+            semantic_keys: core.semantic_keys.clone(),
+            interaction: core.interaction.clone(),
             root: core.root,
             focus: core.focus,
             exit_requested: core.exit_requested,
             pending_style: core.pending_style.clone(),
             mouse_capture: core.mouse_capture,
             focus_hint: core.focus_hint,
-            commands: core.commands.clone(),
-            command_scope: core.command_scope.clone(),
             pending_diagnostic_dump: core.pending_diagnostic_dump,
         }
     }
 
     /// Restore a previously captured core state.
     fn restore(self, core: &mut Core) {
+        core.completion.requests.truncate(self.removal_checkpoint);
         core.nodes = self.nodes;
+        core.semantic_keys = self.semantic_keys;
+        core.interaction = self.interaction;
+        core.sync_modal_bindings();
         core.root = self.root;
         core.focus = self.focus;
         core.exit_requested = self.exit_requested;
         core.pending_style = self.pending_style;
         core.mouse_capture = self.mouse_capture;
         core.focus_hint = self.focus_hint;
-        core.commands = self.commands;
-        core.command_scope = self.command_scope;
         core.pending_diagnostic_dump = self.pending_diagnostic_dump;
     }
 }
@@ -55,8 +59,6 @@ impl TreeEditJournal {
             before: TreeStateSnapshot::capture(core),
             mounted: Vec::new(),
             unmounted: HashSet::new(),
-            replaced_binding_owners: HashSet::new(),
-            exclusive_frames_before: core.input_map.exclusive_frame_tokens(),
         }
     }
 }
@@ -69,6 +71,46 @@ impl MountedWidget {
 }
 
 impl Core {
+    /// Allocate an identity that failed structural edits cannot reuse.
+    fn next_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = generation
+            .checked_add(1)
+            .expect("node generation exhausted");
+        generation
+    }
+
+    /// Update provisional attachment identities after topology changes.
+    fn refresh_attachment_generations(&mut self) {
+        let nodes: Vec<_> = self.nodes.keys().collect();
+        for id in nodes {
+            let attached = self.is_attached_to_root(id);
+            let generation = self.nodes[id].attachment_generation;
+            if attached && generation.is_none() {
+                let generation = self.next_generation();
+                self.nodes[id].attachment_generation = Some(generation);
+                if self.nodes[id].poll_lifetime == crate::WorkLifetime::Attachment {
+                    self.nodes[id].initialized = false;
+                }
+            } else if !attached && generation.is_some() {
+                self.nodes[id].attachment_generation = None;
+                if self.nodes[id].poll_lifetime == crate::WorkLifetime::Attachment {
+                    self.nodes[id].initialized = false;
+                }
+            }
+        }
+    }
+
+    /// Commit live work identities and expire provisional or retired handles.
+    fn sync_work_stamps(&self) -> Result<()> {
+        self.wake_registry
+            .sync(self.nodes.iter().map(|(node, entry)| WorkStamp {
+                node,
+                incarnation: entry.incarnation,
+                attachment: entry.attachment_generation,
+            }))
+    }
+
     /// Update the layout for a node.
     pub fn with_layout_of(
         &mut self,
@@ -76,21 +118,41 @@ impl Core {
         f: impl FnOnce(&mut Layout),
     ) -> Result<()> {
         let node = node.into();
-        let mut layout = self
-            .nodes
-            .get(node)
-            .ok_or(Error::NodeNotFound(node))?
-            .layout;
+        let current = self.nodes.get(node).ok_or(Error::NodeNotFound(node))?;
+        let before = current.layout;
+        let mut layout = before;
         f(&mut layout);
-        layout.validate()?;
-        self.nodes[node].layout = layout;
+        let mut overrides = current.layout_override;
+        overrides.record_changes(before, layout);
+        self.set_layout_override_of(node, overrides)
+    }
+
+    /// Replace all persistent parent constraints for a node.
+    pub fn set_layout_override_of(
+        &mut self,
+        node: NodeId,
+        overrides: LayoutOverride,
+    ) -> Result<()> {
+        let current = self.nodes.get_mut(node).ok_or(Error::NodeNotFound(node))?;
+        let layout = overrides.apply(current.base_layout)?;
+        if current.layout_override != overrides || current.layout != layout {
+            current.layout_override = overrides;
+            current.layout = layout;
+            self.invalidate(crate::Invalidation::Layout);
+        }
         Ok(())
     }
 
-    /// Set the layout for a node.
+    /// Restore the widget's base layout.
+    #[cfg(test)]
+    pub fn clear_layout_override_of(&mut self, node: NodeId) -> Result<()> {
+        self.set_layout_override_of(node, LayoutOverride::default())
+    }
+
+    /// Override every field of a node's layout.
     #[cfg(test)]
     pub fn set_layout_of(&mut self, node: impl Into<NodeId>, layout: Layout) -> Result<()> {
-        self.with_layout_of(node, |l| *l = layout)
+        self.set_layout_override_of(node.into(), LayoutOverride::full(layout))
     }
 
     /// Replace a widget and remove all descendant nodes.
@@ -113,17 +175,16 @@ impl Core {
         let layout = widget.layout();
         layout.validate()?;
         let widget_type = widget.as_ref().type_id();
+        let poll_lifetime = widget.poll_lifetime();
 
         let plan = self.plan_subtree_removal(node_id, "replace subtree")?;
         let removed_focus_root = self.removed_focus_root(&plan);
         let focus_hint = removed_focus_root.map(|root| self.focus_recovery_hint(root));
-        self.run_pre_remove_plan(&plan)?;
-        self.validate_removal_plan(&plan)?;
-        self.run_unmount_plan(&plan)?;
-        self.validate_removal_plan(&plan)?;
+        self.run_removal_hooks(&plan)?;
 
         for removed_node in plan.post_order.iter().copied() {
             if removed_node != plan.root {
+                self.clear_semantic_key(removed_node)?;
                 self.nodes.remove(removed_node);
             }
         }
@@ -135,27 +196,33 @@ impl Core {
         node.child_keys.clear();
         self.clear_removed_targets(&plan.pre_order[1..]);
 
+        self.clear_semantic_key(node_id)?;
+        let incarnation = self.next_generation();
         let node = self
             .nodes
             .get_mut(node_id)
             .ok_or(Error::NodeNotFound(node_id))?;
+        node.incarnation = incarnation;
+        node.reveal = None;
+        node.reveal_in_ancestors = None;
+        node.scroll_order = 0;
+        node.attachment_generation = None;
+        node.poll_lifetime = poll_lifetime;
         node.widget = Rc::new(RefCell::new(Some(widget)));
         node.name = name;
         node.layout = layout;
+        node.base_layout = layout;
+        node.layout_override = LayoutOverride::default();
         node.widget_type = widget_type;
         node.mounted = false;
         node.initialized = false;
 
+        self.refresh_attachment_generations();
         if self.is_attached_to_root(node_id) {
             self.mount_node(node_id)?;
         }
         self.focus_hint = focus_hint;
         self.ensure_invariants(removed_focus_root)?;
-        self.tree_edit
-            .as_mut()
-            .expect("widget replacement must run inside a tree edit")
-            .replaced_binding_owners
-            .insert(node_id);
         Ok(())
     }
 
@@ -197,15 +264,12 @@ impl Core {
         if self.rolling_back_tree_edit {
             return Err(Error::TreeEditDuringRollback { operation });
         }
+        self.invalidate(crate::Invalidation::Layout);
         if self.tree_edit.is_some() {
             let before = TreeStateSnapshot::capture(self);
-            let (mounted_len, unmounted_before, replaced_owners_before) = {
+            let (mounted_len, unmounted_before) = {
                 let journal = self.tree_edit.as_ref().expect("tree edit journal missing");
-                (
-                    journal.mounted.len(),
-                    journal.unmounted.clone(),
-                    journal.replaced_binding_owners.clone(),
-                )
+                (journal.mounted.len(), journal.unmounted.clone())
             };
             let result = f(self);
             return match result {
@@ -216,11 +280,12 @@ impl Core {
                         let mounted = journal.mounted.split_off(mounted_len);
                         let unmounted = journal.unmounted.clone();
                         journal.unmounted = unmounted_before;
-                        journal.replaced_binding_owners = replaced_owners_before;
                         (mounted, unmounted)
                     };
                     self.unwind_mounted_widgets(&mounted, &unmounted);
                     before.restore(self);
+                    // Keep committed registrations until the outer edit
+                    // settles.
                     Err(error)
                 }
             };
@@ -232,30 +297,26 @@ impl Core {
 
         match result {
             Ok(value) => {
-                let attached = self
-                    .nodes
-                    .keys()
-                    .filter(|node| self.is_attached_to_root(*node))
-                    .collect();
-                self.input_map.retain_exclusive_owners(&attached);
-                self.input_map.remove_replaced_exclusive_owners(
-                    &journal.replaced_binding_owners,
-                    &journal.exclusive_frames_before,
-                );
+                self.prune_semantic_keys();
+                self.refresh_attachment_generations();
+                self.sync_work_stamps()?;
+                self.retire_invalid_interactions()?;
                 Ok(value)
             }
             Err(err) => {
-                self.rollback_tree_edit(journal);
+                self.rollback_tree_edit(journal)?;
                 Err(err)
             }
         }
     }
 
     /// Unwind completed mounts in reverse order and restore the captured state.
-    fn rollback_tree_edit(&mut self, journal: TreeEditJournal) {
+    fn rollback_tree_edit(&mut self, journal: TreeEditJournal) -> Result<()> {
         self.unwind_mounted_widgets(&journal.mounted, &journal.unmounted);
         journal.before.restore(self);
+        self.sync_work_stamps()?;
         self.debug_assert_tree_invariants();
+        Ok(())
     }
 
     /// Run rollback cleanup for mounts completed after a journal checkpoint.
@@ -325,7 +386,7 @@ impl Core {
     /// Validate core invariants using a caller-specific widget slot policy.
     fn validate_invariants_with(&self, widget_slot_policy: WidgetSlotPolicy) -> Result<()> {
         self.validate_root()?;
-        for (node_id, node) in &self.nodes {
+        for (node_id, node) in self.nodes.iter() {
             validate_slot(node_id, node, widget_slot_policy)?;
             self.validate_node_links(node_id, node)?;
             self.validate_parent_chain(node_id)?;
@@ -334,6 +395,7 @@ impl Core {
         }
         self.validate_focus_and_capture()?;
         self.validate_pending_targets()?;
+        self.validate_semantic_keys()?;
         Ok(())
     }
 
@@ -488,6 +550,11 @@ impl Core {
 
     /// Validate cached layout and view state for a node.
     fn validate_cached_state(&self, node_id: NodeId, node: &Node) -> Result<()> {
+        if node.layout_override.apply(node.base_layout)? != node.layout {
+            return Err(invariant_violation(format!(
+                "node {node_id:?} effective layout differs from its base and overrides"
+            )));
+        }
         if node.content_size.w > node.rect.w || node.content_size.h > node.rect.h {
             return Err(invariant_violation(format!(
                 "node {node_id:?} content size {:?} exceeds rect {:?}",
@@ -525,10 +592,10 @@ impl Core {
                 node.view.canvas, node.canvas
             )));
         }
-        if node.view.tl != node.scroll {
+        if node.view.scroll != node.scroll {
             return Err(invariant_violation(format!(
                 "node {node_id:?} view scroll {:?} does not match node scroll {:?}",
-                node.view.tl, node.scroll
+                node.view.scroll, node.scroll
             )));
         }
         if node.view.outer.w != node.rect.w || node.view.outer.h != node.rect.h {
@@ -564,9 +631,15 @@ impl Core {
                 operation: "create detached",
             });
         }
-        let node = Node::new(widget);
+        let generation = self.next_generation();
+        let node = Node::new(widget, generation);
         node.layout.validate()?;
-        Ok(self.nodes.insert(node))
+        let id = self.nodes.insert(node);
+        self.invalidate(crate::Invalidation::Semantics);
+        if self.tree_edit.is_none() {
+            self.sync_work_stamps()?;
+        }
+        Ok(id)
     }
 
     /// Add a boxed widget as a child of a specific parent and return the new
@@ -586,7 +659,7 @@ impl Core {
 
     /// Add a boxed widget as a keyed child of a specific parent and return the
     /// new node ID.
-    pub fn add_child_to_keyed_boxed(
+    pub fn add_child_to_slot_boxed(
         &mut self,
         parent: impl Into<NodeId>,
         key: &str,
@@ -594,7 +667,7 @@ impl Core {
     ) -> Result<NodeId> {
         let parent = parent.into();
         self.with_tree_edit("add keyed child", |core| {
-            if core.child_keyed(parent, key).is_some() {
+            if core.child_slot(parent, key).is_some() {
                 return Err(Error::DuplicateChildKey(key.to_string()));
             }
             let child = core.create_detached_boxed(widget)?;
@@ -604,7 +677,7 @@ impl Core {
     }
 
     /// Return the keyed child under a parent.
-    pub fn child_keyed(&self, parent: impl Into<NodeId>, key: &str) -> Option<NodeId> {
+    pub fn child_slot(&self, parent: impl Into<NodeId>, key: &str) -> Option<NodeId> {
         self.nodes
             .get(parent.into())
             .and_then(|node| node.child_keys.get(key).copied())
@@ -618,7 +691,7 @@ impl Core {
     }
 
     /// Attach a detached child under a parent with a unique key.
-    pub fn attach_keyed(
+    pub fn attach_slot(
         &mut self,
         parent: impl Into<NodeId>,
         key: &str,
@@ -633,6 +706,40 @@ impl Core {
 
     /// Attach a child under a parent, optionally tracking a keyed association.
     fn attach_inner(&mut self, parent: NodeId, child: NodeId, key: Option<&str>) -> Result<()> {
+        self.attach_topology(parent, child, key)?;
+        if self.is_attached_to_root(parent) {
+            self.mount_subtree_pre_order(child)?;
+        }
+        self.ensure_invariants(None)?;
+        Ok(())
+    }
+
+    /// Attach all configured topology and identities before invoking mount
+    /// hooks.
+    pub(crate) fn attach_composed(
+        &mut self,
+        parent: NodeId,
+        roots: &[(NodeId, Option<&str>)],
+        keys: &[(NodeId, NodeId, String)],
+    ) -> Result<()> {
+        self.with_tree_edit("attach composition", |core| {
+            for (node, key) in roots {
+                core.attach_topology(parent, *node, *key)?;
+            }
+            for (node, scope, key) in keys {
+                core.set_semantic_key(*node, *scope, key)?;
+            }
+            if core.is_attached_to_root(parent) {
+                for (node, _) in roots {
+                    core.mount_subtree_pre_order(*node)?;
+                }
+            }
+            core.ensure_invariants(None)
+        })
+    }
+
+    /// Update validated topology without running mount callbacks yet.
+    fn attach_topology(&mut self, parent: NodeId, child: NodeId, key: Option<&str>) -> Result<()> {
         if !self.nodes.contains_key(parent) {
             return Err(Error::NodeNotFound(parent));
         }
@@ -678,11 +785,7 @@ impl Core {
             node.children.push(child);
         }
 
-        if parent_attached {
-            self.mount_subtree_pre_order(child)?;
-        }
-
-        self.ensure_invariants(None)?;
+        self.refresh_attachment_generations();
         Ok(())
     }
 
@@ -707,6 +810,7 @@ impl Core {
             if let Some(node) = core.nodes.get_mut(child) {
                 node.parent = None;
             }
+            core.refresh_attachment_generations();
             core.focus_hint = hint;
             core.ensure_invariants(Some(child))?;
             Ok(())
@@ -823,6 +927,7 @@ impl Core {
         self.retain_child_keys(parent);
 
         let new_children = self.nodes[parent].children.clone();
+        self.refresh_attachment_generations();
         if parent_attached {
             for child in new_children {
                 self.mount_subtree_pre_order(child)?;
@@ -853,10 +958,7 @@ impl Core {
             None
         };
         let plan = self.plan_subtree_removal(root_id, "remove subtree")?;
-        self.run_pre_remove_plan(&plan)?;
-        self.validate_removal_plan(&plan)?;
-        self.run_unmount_plan(&plan)?;
-        self.validate_removal_plan(&plan)?;
+        self.run_removal_hooks(&plan)?;
 
         let parent = self.nodes.get(root_id).and_then(|node| node.parent);
         if let Some(parent) = parent
@@ -867,6 +969,7 @@ impl Core {
         }
 
         for node_id in &plan.post_order {
+            self.clear_semantic_key(*node_id)?;
             self.nodes.remove(*node_id);
         }
 
@@ -898,6 +1001,15 @@ impl Core {
             pre_order,
             post_order: self.subtree_post_order(root),
         })
+    }
+
+    /// Run the full fallible removal hook sequence for a plan.
+    fn run_removal_hooks(&mut self, plan: &RemovalPlan) -> Result<()> {
+        self.run_pre_remove_plan(plan)?;
+        self.validate_removal_plan(plan)?;
+        self.run_unmount_plan(plan)?;
+        self.validate_removal_plan(plan)?;
+        Ok(())
     }
 
     /// Run fallible removal hooks in deterministic pre-order.
@@ -995,7 +1107,7 @@ impl Core {
 
     /// Ensure one widget slot is present and not held by a callback.
     fn ensure_widget_slot_available(&self, node_id: NodeId, operation: &'static str) -> Result<()> {
-        self.with_widget_read(
+        self.with_widget(
             node_id,
             WidgetOperation::access(operation),
             |_widget, _core| (),
@@ -1036,6 +1148,7 @@ impl Core {
         let changed = node.hidden != hidden;
         node.hidden = hidden;
         if changed {
+            self.invalidate(crate::Invalidation::Layout);
             self.ensure_invariants(None)?;
             Ok(ChangeOutcome::Changed)
         } else {
@@ -1044,7 +1157,7 @@ impl Core {
     }
 
     /// Return the path for a node relative to a root.
-    pub fn node_path(&self, root: impl Into<NodeId>, node_id: impl Into<NodeId>) -> Path {
+    pub fn path_of(&self, root: impl Into<NodeId>, node_id: impl Into<NodeId>) -> Path {
         let root = root.into();
         let node_id = node_id.into();
         let mut parts = Vec::new();

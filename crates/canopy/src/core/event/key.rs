@@ -1,6 +1,8 @@
 //! This module contains the core primitives to represent keyboard input.
 use std::{fmt, ops::Add};
 
+use crate::error::ParseError;
+
 /// Modifier key state.
 #[derive(Default, Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub struct Mods {
@@ -75,70 +77,6 @@ pub const Alt: Mods = Mods {
     alt: true,
 };
 
-/// Physical modifier key codes.
-#[derive(Debug, PartialOrd, PartialEq, Hash, Eq, Clone, Copy)]
-pub enum ModifierKeyCode {
-    /// Left Shift key.
-    LeftShift,
-    /// Left Control key.
-    LeftControl,
-    /// Left Alt key.
-    LeftAlt,
-    /// Left Super key.
-    LeftSuper,
-    /// Left Hyper key.
-    LeftHyper,
-    /// Left Meta key.
-    LeftMeta,
-    /// Right Shift key.
-    RightShift,
-    /// Right Control key.
-    RightControl,
-    /// Right Alt key.
-    RightAlt,
-    /// Right Super key.
-    RightSuper,
-    /// Right Hyper key.
-    RightHyper,
-    /// Right Meta key.
-    RightMeta,
-    /// Iso Level3 Shift key.
-    IsoLevel3Shift,
-    /// Iso Level5 Shift key.
-    IsoLevel5Shift,
-}
-
-/// Media key codes.
-#[derive(Debug, PartialOrd, PartialEq, Hash, Eq, Clone, Copy)]
-pub enum MediaKeyCode {
-    /// Play media key.
-    Play,
-    /// Pause media key.
-    Pause,
-    /// Play/Pause media key.
-    PlayPause,
-    /// Reverse media key.
-    Reverse,
-    /// Stop media key.
-    Stop,
-    /// Fast-forward media key.
-    FastForward,
-    /// Rewind media key.
-    Rewind,
-    /// Next-track media key.
-    TrackNext,
-    /// Previous-track media key.
-    TrackPrevious,
-    /// Record media key.
-    Record,
-    /// Lower-volume media key.
-    LowerVolume,
-    /// Raise-volume media key.
-    RaiseVolume,
-    /// Mute media key.
-    MuteVolume,
-}
-
 /// Logical key codes.
 #[derive(Debug, PartialOrd, PartialEq, Hash, Eq, Clone, Copy)]
 pub enum KeyCode {
@@ -196,10 +134,6 @@ pub enum KeyCode {
     ///
     /// `KeyCode::Char('c')` represents the `c` character, and so on.
     Char(char),
-    /// Media key code.
-    Media(MediaKeyCode),
-    /// Modifier key code.
-    Modifier(ModifierKeyCode),
 }
 
 impl From<char> for KeyCode {
@@ -278,8 +212,8 @@ impl Key {
             }
         }
 
-        // Shift is folded into the character it produced, except for space, which keeps
-        // it.
+        // Shift is folded into the character it produced, except for space,
+        // which keeps it.
         if normalized.mods.shift
             && let KeyCode::Char(c) = normalized.key
             && c != ' '
@@ -291,13 +225,13 @@ impl Key {
     }
 
     /// Parse a key specification such as `ctrl-s`, `PageDown`, or `A`.
-    pub fn parse_spec(spec: &str) -> Result<Self, String> {
+    pub fn parse_spec(spec: &str) -> Result<Self, ParseError> {
         let spec = spec.trim();
         if spec.chars().count() == 1 {
-            return Ok(Self::from(parse_key_code(spec)?).normalize());
+            return Ok(Self::from(parse_key_code(spec).map_err(ParseError::new)?).normalize());
         }
-        let (mods, key_part) = parse_spec_parts(spec, &['-', '+'])?;
-        Ok((mods + parse_key_code(key_part)?).normalize())
+        let (mods, key_part) = parse_spec_parts(spec, &['-', '+']).map_err(ParseError::new)?;
+        Ok((mods + parse_key_code(key_part).map_err(ParseError::new)?).normalize())
     }
 }
 
@@ -462,8 +396,6 @@ impl fmt::Display for KeyCode {
             Self::F(n) => write!(f, "F{n}"),
             Self::Char(' ') => write!(f, "Space"),
             Self::Char(c) => write!(f, "{c}"),
-            Self::Media(m) => write!(f, "Media({m:?})"),
-            Self::Modifier(m) => write!(f, "Mod({m:?})"),
         }
     }
 }

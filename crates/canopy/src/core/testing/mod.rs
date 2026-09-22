@@ -1,7 +1,16 @@
+mod clock;
+
+/// Explicit monotonic clock for deterministic runtime tests.
+pub use clock::ManualClock;
+
 /// Backend utilities for tests.
 pub mod backend;
 /// Buffer testing utilities.
 pub mod buf;
+/// Shared native and adapter publication contract fixture.
+pub mod contracts;
+/// Event notifications for stepping adapter integration tests.
+pub mod driver;
 /// Dummy context for tests.
 pub mod dummyctx;
 /// Grid test helpers.

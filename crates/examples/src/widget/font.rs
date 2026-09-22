@@ -3,14 +3,13 @@
 use std::time::Duration;
 
 use canopy::{
-    Context, TypedId, Widget,
+    Context, ContextExt, NodeName, TypedId, Widget,
     error::{Error, Result},
     layout::{Align, Layout},
     rgb,
-    state::NodeName,
     style::StyleMap,
 };
-use canopy_widgets::{Font, FontBanner, FontEffects, FontRenderer, LayoutOptions};
+use canopy_widgets::font::{Font, FontBanner, FontEffects, FontRenderer, LayoutOptions};
 
 /// Style path used for widget demo text.
 const FONT_STYLE_PATH: &str = "widget/font";
@@ -87,12 +86,7 @@ impl FontDemo {
         let font = Font::from_bytes(source.bytes.as_slice()).map_err(|err| {
             Error::Invalid(format!("font parse failed for {}: {err}", source.label))
         })?;
-        Ok(Self::renderer_from_font(font))
-    }
-
-    /// Build a renderer with demo glyph settings.
-    fn renderer_from_font(font: Font) -> FontRenderer {
-        FontRenderer::new(font)
+        Ok(FontRenderer::new(font))
     }
 
     /// Swap the font renderer used by the banner.
@@ -101,7 +95,7 @@ impl FontDemo {
             .banner_id
             .ok_or_else(|| Error::Internal("font banner missing".into()))?;
         let renderer = self.renderer_for(index)?;
-        ctx.with_widget(banner_id, |banner: &mut FontBanner, _ctx| {
+        ctx.with_widget_mut(banner_id, |banner: &mut FontBanner, _ctx| {
             banner.set_renderer(renderer);
             Ok(())
         })?;

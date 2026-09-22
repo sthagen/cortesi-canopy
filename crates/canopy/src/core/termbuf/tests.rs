@@ -22,6 +22,27 @@ fn def_style() -> ResolvedStyle {
     }
 }
 
+#[test]
+fn restyling_preserves_wide_and_combining_graphemes() -> Result<()> {
+    let mut buffer = TermBuf::new(Size::new(5, 1), ' ', def_style())?;
+    buffer.text(&def_style(), Line::new(0, 0, 5), "界e\u{301}")?;
+    let before = buffer.clone();
+    let mut style = def_style();
+    style.fg = Color::Red;
+    buffer.restyle_grapheme(Point { x: 1, y: 0 }, style);
+    buffer.restyle_grapheme(Point { x: 2, y: 0 }, style);
+    for x in 0..3 {
+        let old = before.get(Point { x, y: 0 }).expect("old cell");
+        let new = buffer.get(Point { x, y: 0 }).expect("new cell");
+        assert_eq!(
+            (new.ch, &new.suffix, new.continuation),
+            (old.ch, &old.suffix, old.continuation)
+        );
+        assert_eq!(new.style, style);
+    }
+    Ok(())
+}
+
 fn buf_from_rows(rows: &[&str]) -> TermBuf {
     let height = rows.len() as u32;
     let width = rows.first().map(|row| row.len()).unwrap_or(0) as u32;
@@ -134,10 +155,10 @@ fn zero_width_and_right_clipped_graphemes_are_no_ops() -> Result<()> {
 fn cursor_overlay_styles_complete_graphemes() -> Result<()> {
     let style = def_style();
     let mut buf = TermBuf::new(Size::new(2, 1), '\0', def_style())?;
-    buf.put_grapheme(Point::zero(), "界", style)?;
+    buf.put_grapheme(Point::ZERO, "界", style)?;
     buf.overlay_cursor(Point { x: 1, y: 0 }, cursor::CursorShape::Block);
 
-    let base = buf.get(Point::zero()).expect("missing wide base");
+    let base = buf.get(Point::ZERO).expect("missing wide base");
     let continuation = buf.get(Point { x: 1, y: 0 }).expect("missing continuation");
     assert_eq!(base.ch, '界');
     assert!(continuation.continuation);
@@ -247,10 +268,13 @@ impl RenderBackend for RecBackend {
 struct RegionShiftBackend {
     shift: Option<(u32, u32, i32)>,
     text_ops: usize,
+    style_ops: usize,
+    flush_ops: usize,
 }
 
 impl RenderBackend for RegionShiftBackend {
     fn style(&mut self, _style: &ResolvedStyle) -> Result<()> {
+        self.style_ops += 1;
         Ok(())
     }
 
@@ -269,29 +293,19 @@ impl RenderBackend for RegionShiftBackend {
     }
 
     fn flush(&mut self) -> Result<()> {
+        self.flush_ops += 1;
         Ok(())
     }
 }
 
 struct ReplayBackend {
-    size: Size,
     rows: Vec<Vec<char>>,
-    wide_as_narrow: bool,
 }
 
 impl ReplayBackend {
     fn blank(size: Size) -> Self {
         Self {
-            size,
             rows: vec![vec![' '; size.w as usize]; size.h as usize],
-            wide_as_narrow: false,
-        }
-    }
-
-    fn blank_with_narrow_wide(size: Size) -> Self {
-        Self {
-            wide_as_narrow: true,
-            ..Self::blank(size)
         }
     }
 
@@ -316,97 +330,16 @@ impl RenderBackend for ReplayBackend {
         }
         let mut x = loc.x as usize;
         for grapheme in txt.graphemes(true) {
-            let width = if self.wide_as_narrow {
-                1
-            } else {
-                grapheme_width(grapheme)
-            };
             if x < self.rows[y].len() {
                 let ch = grapheme.chars().next().unwrap_or(' ');
                 self.rows[y][x] = ch;
             }
-            x = x.saturating_add(width);
-        }
-        Ok(())
-    }
-
-    fn supports_char_shift(&self) -> bool {
-        true
-    }
-
-    fn shift_chars(&mut self, loc: Point, count: i32) -> Result<()> {
-        let y = loc.y as usize;
-        let start = loc.x as usize;
-        if y >= self.rows.len() || start >= self.rows[y].len() || count == 0 {
-            return Ok(());
-        }
-
-        let width = self.rows[y].len();
-        if count > 0 {
-            let count = count as usize;
-            for x in (start..width).rev() {
-                self.rows[y][x] = x
-                    .checked_sub(count)
-                    .filter(|source| *source >= start)
-                    .map_or(' ', |source| self.rows[y][source]);
-            }
-        } else {
-            let count = (-count) as usize;
-            for x in start..width {
-                let source = x.saturating_add(count);
-                self.rows[y][x] = if source < width {
-                    self.rows[y][source]
-                } else {
-                    ' '
-                };
-            }
-        }
-        Ok(())
-    }
-
-    fn supports_line_shift(&self) -> bool {
-        true
-    }
-
-    fn shift_lines(&mut self, top: u32, bottom: u32, count: i32) -> Result<()> {
-        let top = top as usize;
-        let bottom = bottom.min(self.size.h.saturating_sub(1)) as usize;
-        if top > bottom || count == 0 {
-            return Ok(());
-        }
-        let original = self.rows.clone();
-        if count > 0 {
-            let count = count as usize;
-            for y in (top..=bottom).rev() {
-                self.rows[y] = y
-                    .checked_sub(count)
-                    .filter(|source| *source >= top)
-                    .map_or(vec![' '; self.size.w as usize], |source| {
-                        original[source].clone()
-                    });
-            }
-        } else {
-            let count = (-count) as usize;
-            for y in top..=bottom {
-                let source = y.saturating_add(count);
-                self.rows[y] = if source <= bottom {
-                    original[source].clone()
-                } else {
-                    vec![' '; self.size.w as usize]
-                };
-            }
+            x = x.saturating_add(1);
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        for row in &mut self.rows {
-            row.fill(' ');
-        }
         Ok(())
     }
 }
@@ -935,22 +868,30 @@ fn diff_vertical_shift_uses_scroll_interior() {
 
 #[test]
 fn diff_interior_shift_replays_to_the_full_repaint() {
+    let style = def_style();
     let prev = buf_from_rows(&["#####", "#abc#", "#def#", "#ghi#", "#####"]);
     let cur = buf_from_rows(&["#####", "#xxx#", "#abc#", "#def#", "#####"]);
-    let mut backend = ReplayBackend::blank(Size::new(5, 5));
+    let mut backend = ModelBackend {
+        model: ModelBuffer::new(Size::new(5, 5), style),
+        style,
+    };
     prev.render(&mut backend).unwrap();
     cur.diff(&prev, &mut backend).unwrap();
-    assert_eq!(backend.screen_text(), cur.screen_text());
+    backend.model.assert_matches(&cur).unwrap();
 }
 
 #[test]
 fn diff_skips_the_interior_shift_when_a_side_column_varies() {
+    let style = def_style();
     let prev = buf_from_rows(&["#####", "1abc#", "2def#", "3ghi#", "#####"]);
     let cur = buf_from_rows(&["#####", "1xxx#", "2abc#", "3def#", "#####"]);
-    let mut backend = ReplayBackend::blank(Size::new(5, 5));
+    let mut backend = ModelBackend {
+        model: ModelBuffer::new(Size::new(5, 5), style),
+        style,
+    };
     prev.render(&mut backend).unwrap();
     cur.diff(&prev, &mut backend).unwrap();
-    assert_eq!(backend.screen_text(), cur.screen_text());
+    backend.model.assert_matches(&cur).unwrap();
 }
 
 #[test]
@@ -1035,7 +976,7 @@ fn render_repositions_after_wide_graphemes() {
     tb.fill(&style, Rect::new(7, 0, 1, 1), '|')
         .expect("test buffer mutation should succeed");
 
-    let mut backend = ReplayBackend::blank_with_narrow_wide(Size::new(8, 1));
+    let mut backend = ReplayBackend::blank(Size::new(8, 1));
     tb.render(&mut backend).unwrap();
 
     assert_eq!(backend.screen_text(), "a界 bc  |");
@@ -1133,4 +1074,26 @@ fn empty_constructor_uses_canonical_empty_cells() {
         "XXXXX"
         "XXXXX"
     ]);
+}
+
+#[test]
+fn identical_multirow_buffers_emit_no_operations() -> Result<()> {
+    for rows in [["   ", "   ", "   "], ["abc", "abc", "abc"]] {
+        let current = buf_from_rows(&rows);
+        let previous = current.clone();
+        let mut backend = RegionShiftBackend::default();
+        current.diff(&previous, &mut backend)?;
+        assert_eq!(backend.shift, None);
+        assert_eq!(backend.text_ops, 0);
+        assert_eq!(backend.style_ops, 0);
+        assert_eq!(backend.flush_ops, 0);
+    }
+    let mut invalid = buf_from_rows(&["abc", "abc", "abc"]);
+    invalid.cells[0] = Cell::continuation(def_style());
+    assert!(
+        invalid
+            .diff(&invalid, &mut RegionShiftBackend::default())
+            .is_err()
+    );
+    Ok(())
 }

@@ -1,6 +1,10 @@
 use std::path::Path;
 
-use canopy::{layout::Edges, prelude::*};
+use canopy::{
+    Canopy, CanopyBuilder, Context, ContextExt, Loader, Widget,
+    error::Result,
+    layout::{Edges, Layout},
+};
 use canopy_widgets::{
     Frame, Pad,
     editor::{EditMode, Editor, EditorConfig, WrapMode, highlight::SyntectHighlighter},
@@ -10,9 +14,11 @@ use canopy_widgets::{
 const DEFAULT_BINDINGS: &str = r#"
 root.default_bindings()
 
-canopy.bind("Tab", { path = "widget_editor/", description = "Next focus" }, function()
-    root.focus("Next")
-end)
+canopy.bind("Tab", {
+    path = "widget_editor/",
+    phase = "before_widget",
+    description = "Next focus",
+}, command.root.focus("Next"))
 "#;
 
 /// Widget editor example that opens a Rust file with syntax highlighting.
@@ -67,12 +73,6 @@ impl Loader for WidgetEditor {
     }
 }
 
-/// Install key bindings for the widget editor example.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.eval_script(DEFAULT_BINDINGS)?;
-    Ok(())
-}
-
 /// Return a lowercase file extension hint for syntax selection.
 pub fn file_extension(path: &Path) -> String {
     path.extension()
@@ -88,4 +88,10 @@ pub fn file_title(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.bindings("widget_editor", DEFAULT_BINDINGS)
 }

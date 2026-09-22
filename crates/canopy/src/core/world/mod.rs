@@ -3,19 +3,27 @@
     reason = "Core methods are split by arena, layout, and dispatch concerns."
 )]
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
-
-use slotmap::SlotMap;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use self::focus::FocusRecoveryHint;
 use super::{
-    inputmap::{ExclusiveFrameToken, InputMap},
+    inputmap::InputMap,
+    wake::WakeRegistry,
     widget_access::{WidgetMutGuard, WidgetReadGuard, WidgetSlotGuard},
 };
 use crate::{
     ChangeOutcome,
     commands::{CommandScopeFrame, CommandSet},
-    core::{context::CoreContext, id::NodeId, node::Node},
+    core::{
+        context::CoreContext,
+        id::{NodeArena, NodeId},
+        node::Node,
+        path::Path,
+    },
     error::{Error, NodeOperationKind, Result},
     layout::Layout,
     state::NodeName,
@@ -23,12 +31,22 @@ use crate::{
     widget::Widget,
 };
 
+#[cfg(test)]
+mod change_tests;
 /// Event dispatch and bubbling helpers.
 mod dispatch;
 /// Focus and mouse-capture management.
 mod focus;
+/// Modal interaction scopes and retirement.
+pub mod interaction;
 /// Layout traversal, measurement, and hit-testing.
 pub mod layout_driver;
+/// Viewport scroll mutation and default input actions.
+pub mod scroll;
+/// Scoped application identity and index invariants.
+mod semantic;
+/// Removal requests completed after callback restoration.
+mod teardown;
 /// Widgets and node builders shared by the world test modules.
 #[cfg(test)]
 pub mod test_support;
@@ -39,8 +57,14 @@ mod tree;
 
 /// Core state for the arena, layout engine, and focus.
 pub struct Core {
+    /// Changes awaiting frame publication.
+    pub(crate) changes: crate::ChangeSet,
     /// Node storage arena.
-    pub(crate) nodes: SlotMap<NodeId, Node>,
+    pub(crate) nodes: NodeArena<Node>,
+    /// Application keys unique within explicit arena scopes.
+    semantic_keys: HashMap<(NodeId, String), NodeId>,
+    /// Runtime-owned modal interaction scopes.
+    interaction: interaction::InteractionState,
     /// Root node ID.
     pub(crate) root: NodeId,
     /// Currently focused node.
@@ -55,6 +79,16 @@ pub struct Core {
     pub(crate) focus_hint: Option<FocusRecoveryHint>,
     /// Active tree edit and its rollback state.
     tree_edit: Option<TreeEditJournal>,
+    /// Monotonic widget and attachment generation source, outside rollback.
+    next_generation: u64,
+    /// Last call-order stamp given to a scroll or reveal, outside rollback.
+    scroll_stamp: u64,
+    /// Widget slots currently extracted by mutation callbacks.
+    pub(crate) callback_depth: usize,
+    /// Completion-boundary removal queue and dispatch nesting.
+    completion: teardown::CompletionBatch,
+    /// Cross-thread work handles synchronized with committed structural state.
+    pub(crate) wake_registry: WakeRegistry,
     /// Whether lifecycle cleanup is unwinding a failed tree edit.
     rolling_back_tree_edit: bool,
     /// Registered command specs.
@@ -75,10 +109,6 @@ struct TreeEditJournal {
     mounted: Vec<MountedWidget>,
     /// Mounted widgets already unmounted by a later nested edit.
     unmounted: HashSet<usize>,
-    /// Node owners whose widget identity was replaced during the edit.
-    replaced_binding_owners: HashSet<NodeId>,
-    /// Exclusive frames that existed before the outer edit.
-    exclusive_frames_before: HashSet<ExclusiveFrameToken>,
 }
 
 /// A successfully mounted widget retained for reverse-order cleanup.
@@ -109,8 +139,14 @@ struct RemovalEntry {
 
 /// Core-owned state restored when a tree edit fails.
 struct TreeStateSnapshot {
+    /// Requests preceding this structural checkpoint.
+    removal_checkpoint: usize,
     /// Arena contents and all node metadata.
-    nodes: SlotMap<NodeId, Node>,
+    nodes: NodeArena<Node>,
+    /// Scoped identities captured with arena metadata.
+    semantic_keys: HashMap<(NodeId, String), NodeId>,
+    /// Modal scopes captured with structural state.
+    interaction: interaction::InteractionState,
     /// Root node ID.
     root: NodeId,
     /// Focus target.
@@ -123,10 +159,6 @@ struct TreeStateSnapshot {
     mouse_capture: Option<NodeId>,
     /// Focus recovery candidates.
     focus_hint: Option<FocusRecoveryHint>,
-    /// Registered commands.
-    commands: CommandSet,
-    /// Active command-dispatch scopes.
-    command_scope: Vec<CommandScopeFrame>,
     /// Pending diagnostic target.
     pending_diagnostic_dump: Option<NodeId>,
 }
@@ -169,11 +201,16 @@ impl WidgetOperation {
 impl Core {
     /// Create a new Core with a default root node.
     pub fn new() -> Self {
-        let mut nodes = SlotMap::with_key();
-        let root = nodes.insert(Node::new(Box::new(RootContainer)));
+        let mut nodes = NodeArena::new();
+        let mut root_node = Node::new(Box::new(RootContainer), 1);
+        root_node.attachment_generation = Some(1);
+        let root = nodes.insert(root_node);
 
         Self {
+            changes: crate::ChangeSet::default(),
             nodes,
+            semantic_keys: HashMap::new(),
+            interaction: interaction::InteractionState::default(),
             root,
             focus: None,
             exit_requested: None,
@@ -181,8 +218,13 @@ impl Core {
             mouse_capture: None,
             focus_hint: None,
             tree_edit: None,
+            next_generation: 2,
+            scroll_stamp: 0,
+            callback_depth: 0,
+            completion: teardown::CompletionBatch::default(),
+            wake_registry: WakeRegistry::default(),
             rolling_back_tree_edit: false,
-            commands: CommandSet::new(),
+            commands: CommandSet::default(),
             input_map: InputMap::new(),
             command_scope: Vec::new(),
             pending_diagnostic_dump: None,
@@ -194,21 +236,6 @@ impl Core {
         if self.exit_requested.is_none() {
             self.exit_requested = Some(code);
         }
-    }
-
-    /// Take the pending exit request, if any.
-    pub(crate) fn take_exit_request(&mut self) -> Option<i32> {
-        self.exit_requested.take()
-    }
-
-    /// Request a diagnostic dump for a target node.
-    pub(crate) fn request_diagnostic_dump(&mut self, target: NodeId) {
-        self.pending_diagnostic_dump = Some(target);
-    }
-
-    /// Take and clear any pending diagnostic dump request.
-    pub(crate) fn take_diagnostic_dump_request(&mut self) -> Option<NodeId> {
-        self.pending_diagnostic_dump.take()
     }
 
     /// Return the current command-scope frame, if any.
@@ -239,7 +266,7 @@ impl Core {
     }
 
     /// Take a mutable reference to a widget for a single call.
-    pub(crate) fn with_widget_mut<R>(
+    pub(crate) fn with_widget_dyn_mut<R>(
         &mut self,
         node_id: NodeId,
         f: impl FnOnce(&mut dyn Widget, &mut Self) -> R,
@@ -251,7 +278,15 @@ impl Core {
                 error,
             )
         })?;
-        Ok(f(guard.widget_mut(), self))
+        self.invalidate(crate::Invalidation::Layout);
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.layout_dirty = true;
+        }
+        self.callback_depth += 1;
+        let result = f(guard.widget_mut(), self);
+        drop(guard);
+        self.callback_depth -= 1;
+        Ok(result)
     }
 
     /// Borrow a widget mutably alongside a context bound to the same node.
@@ -260,14 +295,14 @@ impl Core {
         node_id: NodeId,
         f: impl FnOnce(&mut dyn Widget, &mut CoreContext<'_>) -> R,
     ) -> Result<R> {
-        self.with_widget_mut(node_id, |widget, core| {
+        self.with_widget_dyn_mut(node_id, |widget, core| {
             let mut ctx = CoreContext::new(core, node_id);
             f(widget, &mut ctx)
         })
     }
 
     /// Borrow a widget immutably for a read-only core query.
-    pub(crate) fn with_widget_read<R>(
+    pub(crate) fn with_widget<R>(
         &self,
         node_id: NodeId,
         operation: WidgetOperation,
@@ -327,11 +362,11 @@ impl Core {
         if !self.nodes.contains_key(node_id) {
             return "<missing>".into();
         }
-        let path = self.node_path(self.root, node_id).to_string();
-        if path == "/" && node_id != self.root {
+        let path = self.path_of(self.root, node_id);
+        if path == Path::empty() {
             "<detached>".into()
         } else {
-            path
+            path.to_string()
         }
     }
 }
@@ -346,5 +381,12 @@ impl Widget for RootContainer {
 
     fn name(&self) -> NodeName {
         NodeName::convert("root")
+    }
+}
+
+impl Core {
+    /// Record pending work. Flags survive callback and preparation errors.
+    pub(crate) fn invalidate(&mut self, invalidation: crate::Invalidation) {
+        self.changes.invalidate(invalidation);
     }
 }

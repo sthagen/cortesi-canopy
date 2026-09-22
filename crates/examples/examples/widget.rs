@@ -7,13 +7,16 @@ use std::{
     time::Duration,
 };
 
-use canopy::prelude::*;
+use canopy::{
+    CanopyBuilder, Loader,
+    error::{self, Result},
+};
 use canopy_examples::{
-    imgview, print_luau_api,
+    imgview,
     widget::{DemoHost, DemoSize, FontDemo, FontSource, ListDemo, TermDemo},
     widget_editor::{self, WidgetEditor},
 };
-use canopy_widgets::{FontEffects, ImageView};
+use canopy_widgets::{ImageView, font::FontEffects};
 use clap::{Parser, Subcommand};
 
 /// Default text for the font demo.
@@ -139,12 +142,10 @@ struct EditorArgs {
 /// Run the widget demo.
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut cnpy = canopy_examples::demo_canopy()?;
-
-    load_widget_api(&mut cnpy, &args.command)?;
+    let builder = widget_builder(&args.command);
 
     if args.api {
-        print_luau_api(&mut cnpy)?;
+        print!("{}", builder.build()?.script_api()?);
         return Ok(());
     }
 
@@ -174,7 +175,6 @@ fn main() -> Result<()> {
             )
         }
         Command::Image(image_args) => {
-            imgview::setup_bindings(&mut cnpy)?;
             let view = ImageView::from_path(&image_args.path)?;
             DemoHost::new(view, size, true)
                 .with_inner_padding(0)
@@ -193,17 +193,12 @@ fn main() -> Result<()> {
             };
             DemoHost::new(ListDemo::new(interval), size, args.frame)
         }
-        Command::Term => {
-            setup_term_bindings(&mut cnpy)?;
-            DemoHost::new(TermDemo::new(), size, args.frame)
-        }
+        Command::Term => DemoHost::new(TermDemo::new(), size, args.frame),
         Command::Editor(editor_args) => {
             let contents = fs::read_to_string(&editor_args.path)
                 .map_err(|err| error::Error::Internal(err.to_string()))?;
             let extension = widget_editor::file_extension(&editor_args.path);
             let title = widget_editor::file_title(&editor_args.path);
-
-            widget_editor::setup_bindings(&mut cnpy)?;
 
             DemoHost::new(
                 WidgetEditor::new(contents, extension, title),
@@ -213,39 +208,51 @@ fn main() -> Result<()> {
             .with_inner_padding(0)
         }
     };
-    let exit_code = canopy_examples::run_demo(cnpy, demo, args.inspector)?;
+    let exit_code = canopy_examples::run_demo(builder, demo, args.inspector)?;
     if exit_code != 0 {
         process::exit(exit_code);
     }
     Ok(())
 }
 
-/// Load the command surface needed by the selected widget demo.
-fn load_widget_api(cnpy: &mut Canopy, command: &Command) -> Result<()> {
+/// Queue the selected widget API and binding sources before assembly.
+fn widget_builder(command: &Command) -> CanopyBuilder {
+    let builder = canopy_examples::demo_canopy();
     match command {
-        Command::Font(_) | Command::List(_) => Ok(()),
-        Command::Image(_) => ImageView::load(cnpy),
-        Command::Term => cnpy.add_commands::<TermDemo>(),
-        Command::Editor(_) => WidgetEditor::load(cnpy),
+        Command::Font(_) | Command::List(_) => builder,
+        Command::Image(_) => imgview::binding_setup(builder.configure(ImageView::load)),
+        Command::Term => builder
+            .configure(|canopy| canopy.add_commands::<TermDemo>())
+            .bindings("widget-terminal", TERM_BINDINGS),
+        Command::Editor(_) => widget_editor::binding_setup(builder.configure(WidgetEditor::load)),
     }
 }
 
 /// Load fonts from a directory, returning stable ordering by filename.
 fn load_font_sources(path: &Path) -> Result<Vec<FontSource>> {
-    let mut entries: Vec<PathBuf> = fs::read_dir(path)
-        .map_err(|err| {
+    let directory = fs::read_dir(path).map_err(|err| {
+        error::Error::Invalid(format!(
+            "failed to read font directory {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for entry in directory {
+        let entry = entry.map_err(|err| {
             error::Error::Invalid(format!(
-                "failed to read font directory {}: {err}",
+                "failed to read entry in font directory {}: {err}",
                 path.display()
             ))
-        })?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("ttf"))
-        })
-        .collect();
+        })?;
+        let entry_path = entry.path();
+        if entry_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ttf"))
+        {
+            entries.push(entry_path);
+        }
+    }
     entries.sort();
 
     let mut sources = Vec::new();
@@ -270,14 +277,59 @@ fn load_font_sources(path: &Path) -> Result<Vec<FontSource>> {
     Ok(sources)
 }
 
-/// Register keybindings for the terminal demo.
-fn setup_term_bindings(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.eval_script(
-        r#"
-canopy.bind("ctrl-Tab", { path = "term_demo/**/", description = "Next tab" }, function()
+/// Terminal controls evaluated after API registration and before assembly.
+const TERM_BINDINGS: &str = r#"
+canopy.bind("ctrl-Tab", { path = "term_demo/**/", phase = "before_widget", description = "Next tab" }, function()
     term_demo.next_tab()
 end)
-"#,
-    )?;
-    Ok(())
+"#;
+
+#[cfg(test)]
+mod tests {
+    use canopy::testing::dummyctx::DummyContext;
+
+    use super::*;
+
+    #[test]
+    fn font_discovery_preserves_order_filters_extensions_and_rejects_empty_directories()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "canopy-font-discovery-{}-{}",
+            process::id(),
+            rand::random::<u64>(),
+        ));
+        fs::create_dir(&directory)?;
+        let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+            fs::write(directory.join("z.ttf"), b"invalid font z")?;
+            fs::write(directory.join("a.TTF"), b"invalid font a")?;
+            fs::write(directory.join("ignored.txt"), b"not a font source")?;
+            let sources = load_font_sources(&directory)?;
+            assert_eq!(sources.len(), 2);
+            for (source, name) in sources.into_iter().zip(["a.TTF", "z.ttf"]) {
+                // FontDemo reports the selected source label when parsing
+                // fails.
+                let mut demo = FontDemo::new(
+                    "test",
+                    vec![source],
+                    Duration::from_secs(1),
+                    false,
+                    FontEffects::default(),
+                );
+                let error = demo.on_mount(&mut DummyContext::default()).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("font parse failed for {name}:"))
+                );
+            }
+            fs::remove_file(directory.join("a.TTF"))?;
+            fs::remove_file(directory.join("z.ttf"))?;
+            let error = load_font_sources(&directory).unwrap_err();
+            assert!(error.to_string().contains("no fonts found in"));
+            assert!(error.to_string().contains(directory.to_str().unwrap()));
+            Ok(())
+        })();
+        fs::remove_dir_all(&directory)?;
+        result
+    }
 }

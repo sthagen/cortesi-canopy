@@ -1,16 +1,22 @@
-local focused = canopy.focused()
-canopy.assert(focused ~= nil, "modal_open should focus a node")
-
-local modal = canopy.find_node("root/main_pane/todo/center")
-canopy.assert(modal ~= nil, "modal fixture should create the modal subtree")
-if modal == nil then
+canopy.flush()
+local frame = canopy.snapshot()
+if frame == nil then error("missing completed frame") end
+local scope = canopy.find_node("**/todo")
+canopy.assert(scope ~= nil, "todo scope must exist")
+if scope == nil then
     return
 end
-
-canopy.assert(canopy.node_info(modal).hidden == false, "modal should be visible")
-
-if focused == nil then
-    return
+local input = canopy.find_identity("todo.input", scope)
+canopy.assert(input ~= nil, "modal fixture must create a keyed input")
+canopy.assert(frame.focus == input, "modal_open must focus its keyed input")
+local found = false
+for _, node in frame.nodes do
+    if node.id == input then
+        found = true
+        canopy.assert(node.attached and node.displayed and node.intersects_viewport)
+        canopy.assert(node.semantics.role == "input")
+        canopy.assert(node.semantics.label == "New todo item")
+        canopy.assert(node.semantics.value == "")
+    end
 end
-local input = canopy.node_info(focused)
-canopy.assert(input.name == "input", "modal_open should focus the add-item input")
+canopy.assert(found, "keyed input must appear in the completed frame")

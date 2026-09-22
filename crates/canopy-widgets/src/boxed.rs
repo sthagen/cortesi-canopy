@@ -1,10 +1,8 @@
 use canopy::{
-    ViewContext, Widget, derive_commands,
+    NodeName, Render, ViewContext, Widget, derive_commands,
     error::Result,
     geom,
     layout::{Edges, Layout},
-    render::Render,
-    state::NodeName,
 };
 
 /// Defines the set of glyphs used to draw the box.
@@ -114,6 +112,12 @@ impl Border {
     /// Enable interior fill using the default fill style name.
     pub fn with_fill(mut self) -> Self {
         self.fill_style = Some("fill".to_string());
+        self
+    }
+
+    /// Set the border paint role while preserving inherited component layers.
+    pub fn with_border_style(mut self, style: impl Into<String>) -> Self {
+        self.border_style = style.into();
         self
     }
 }

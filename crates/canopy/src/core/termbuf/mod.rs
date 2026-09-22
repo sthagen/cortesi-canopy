@@ -1,4 +1,4 @@
-use std::mem;
+use std::{mem, ops::Range};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -41,7 +41,7 @@ impl RenderLimits {
     }
 
     /// Validate a visible target size and return its exact cell count.
-    pub(crate) fn cell_count(self, size: Size) -> Result<usize> {
+    pub fn cell_count(self, size: Size) -> Result<usize> {
         if size.w > self.max_width {
             return Err(Error::RenderWidthLimit {
                 requested: size.w,
@@ -238,20 +238,22 @@ impl TermBuf {
         y.checked_mul(width)?.checked_add(x)
     }
 
-    /// Clear the complete grapheme occupying one cell index.
-    fn clear_grapheme_at(&mut self, index: usize, style: ResolvedStyle) {
-        let Ok(width) = usize::try_from(self.size.w) else {
-            return;
-        };
+    /// Return the absolute cell range of the complete grapheme at a cell index.
+    fn grapheme_span(&self, index: usize) -> Option<Range<usize>> {
+        let width = usize::try_from(self.size.w).ok()?;
         if width == 0 || index >= self.cells.len() {
-            return;
+            return None;
         }
         let row_start = index / width * width;
         let row_end = row_start.saturating_add(width).min(self.cells.len());
-        let x = index - row_start;
-        let range = grapheme_range(&self.cells[row_start..row_end], x, 1);
-        if let Some((start, end)) = range {
-            self.cells[row_start + start..row_start + end].fill(Cell::new(NULL, style));
+        let (start, end) = grapheme_range(&self.cells[row_start..row_end], index - row_start, 1)?;
+        Some(row_start + start..row_start + end)
+    }
+
+    /// Clear the complete grapheme occupying one cell index.
+    fn clear_grapheme_at(&mut self, index: usize, style: ResolvedStyle) {
+        if let Some(range) = self.grapheme_span(index) {
+            self.cells[range].fill(Cell::new(NULL, style));
         }
     }
 
@@ -333,6 +335,19 @@ impl TermBuf {
         Ok(())
     }
 
+    /// Restyle the complete grapheme at a cell without changing its text.
+    pub(crate) fn restyle_grapheme(&mut self, location: Point, style: ResolvedStyle) {
+        let Some(idx) = self.idx(location) else {
+            return;
+        };
+        let Some(range) = self.grapheme_span(idx) else {
+            return;
+        };
+        for cell in &mut self.cells[range] {
+            cell.style = style;
+        }
+    }
+
     /// Overlay a cursor on a cell by adjusting its style.
     pub fn overlay_cursor(&mut self, location: Point, shape: cursor::CursorShape) {
         let Some(idx) = self.idx(location) else {
@@ -341,17 +356,10 @@ impl TermBuf {
         if self.cells[idx].is_empty() {
             self.cells[idx] = Cell::new(' ', self.cells[idx].style);
         }
-        let Ok(width) = usize::try_from(self.size.w) else {
+        let Some(range) = self.grapheme_span(idx) else {
             return;
         };
-        let row_start = idx / width * width;
-        let row_end = row_start.saturating_add(width).min(self.cells.len());
-        let Some((start, end)) =
-            grapheme_range(&self.cells[row_start..row_end], idx - row_start, 1)
-        else {
-            return;
-        };
-        for cell in &mut self.cells[row_start + start..row_start + end] {
+        for cell in &mut self.cells[range] {
             match shape {
                 cursor::CursorShape::Underscore => {
                     cell.style.attrs = cell.style.attrs.with(Attr::Underline);
@@ -515,6 +523,9 @@ impl TermBuf {
         if self.size != prev.size {
             return self.render(backend);
         }
+        if self.cells == prev.cells {
+            return Ok(());
+        }
         if backend.supports_line_shift() {
             let full = self.rect();
             if let Some(shift) = detect_row_shift_in_rect(self, prev, full, MAX_ROW_SHIFT) {
@@ -526,6 +537,7 @@ impl TermBuf {
         }
         let width = self.size.w as usize;
         let can_shift = backend.supports_char_shift();
+        let mut text = String::new();
         for y in 0..self.size.h {
             let row_start = y as usize * width;
             let row_end = row_start + width;
@@ -543,10 +555,10 @@ impl TermBuf {
                 let gap = shift.unsigned_abs() as usize;
                 backend.shift_chars(Point { x: 0, y }, shift)?;
                 if shift > 0 {
-                    render_line_range(backend, current_row, y, 0, gap)?;
+                    render_line_range(backend, current_row, y, 0, gap, &mut text)?;
                 } else {
                     let start = width.saturating_sub(gap);
-                    render_line_range(backend, current_row, y, start, gap)?;
+                    render_line_range(backend, current_row, y, start, gap, &mut text)?;
                 }
                 wrote = true;
                 continue;
@@ -576,7 +588,7 @@ impl TermBuf {
                     continue;
                 }
 
-                render_line_range(backend, current_row, y, start_x, end_x - start_x)?;
+                render_line_range(backend, current_row, y, start_x, end_x - start_x, &mut text)?;
                 wrote = true;
                 x = end_x;
             }
@@ -593,11 +605,12 @@ impl TermBuf {
         self.validate_canonical()?;
         let mut wrote = false;
         let width = self.size.w as usize;
+        let mut text = String::new();
         for y in 0..self.size.h {
             let row_start = y as usize * width;
             let row_end = row_start + width;
             let row = &self.cells[row_start..row_end];
-            render_line_range(backend, row, y, 0, width)?;
+            render_line_range(backend, row, y, 0, width, &mut text)?;
             wrote = true;
         }
         if wrote {
@@ -784,10 +797,11 @@ fn render_shifted_rect<R: RenderBackend>(
     };
     // The backend scrolls the full terminal width, so repaint the whole exposed
     // row.
+    let mut text = String::new();
     for y in exposed {
         let row_start = y as usize * width;
         let row = &buf.cells[row_start..row_start + width];
-        render_line_range(backend, row, y, 0, width)?;
+        render_line_range(backend, row, y, 0, width, &mut text)?;
     }
     backend.flush()
 }
@@ -869,6 +883,7 @@ fn render_line_range<R: RenderBackend>(
     y: u32,
     start: usize,
     len: usize,
+    text: &mut String,
 ) -> Result<()> {
     let Some((start, end)) = grapheme_range(row, start, len) else {
         return Ok(());
@@ -876,7 +891,7 @@ fn render_line_range<R: RenderBackend>(
 
     let mut x = start;
     while x < end {
-        x = render_styled_cells(backend, row, y, x, end)?;
+        x = render_styled_cells(backend, row, y, x, end, text)?;
     }
     Ok(())
 }
@@ -888,9 +903,10 @@ fn render_styled_cells<R: RenderBackend>(
     y: u32,
     start: usize,
     end: usize,
+    text: &mut String,
 ) -> Result<usize> {
     let style = &row[start].style;
-    let mut text = String::new();
+    text.clear();
     let mut x = start;
     let mut split_after_wide = false;
 
@@ -908,7 +924,7 @@ fn render_styled_cells<R: RenderBackend>(
         }
 
         let width = cell.rendered_width();
-        cell.push_text(&mut text);
+        cell.push_text(text);
         split_after_wide = width > 1;
         x += 1;
     }
@@ -919,7 +935,7 @@ fn render_styled_cells<R: RenderBackend>(
         return Ok(x.max(start + 1));
     }
 
-    backend.text(Point { x: start as u32, y }, &text)?;
+    backend.text(Point { x: start as u32, y }, text)?;
     Ok(x)
 }
 

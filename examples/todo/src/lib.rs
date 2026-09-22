@@ -1,20 +1,24 @@
 #![deny(unsafe_code)]
 //! Todo application used as Canopy's end-to-end example and smoke-test target.
 
-use std::{fmt::Display, mem, path::Path};
+use std::{collections::HashMap, fmt::Display, path::Path};
 
 use anyhow::Result as AnyResult;
 use canopy::{
-    command, derive_commands,
-    error::Error,
-    prelude::*,
-    style::{effects, solarized},
+    Canopy, CanopyBuilder, Context, ContextExt, InteractionToken, Loader, ModalBindings,
+    ModalOptions, NodeId, NodeName, Render, ViewContext, ViewContextExt, Widget,
+    commands::CommandStatus,
+    derive_commands,
+    error::{Error, Result},
+    geom::{Rect, Size},
+    layout::{Constraint, Direction, Layout, LayoutOverride, MeasureConstraints, Measurement},
+    style::canopy as palette,
 };
-use canopy_widgets::{Center, Frame, Input, List, Root, Selectable};
+use canopy_widgets::{Center, Frame, Input, List, Root, Selectable, ValueExposure};
 
 // Typed keys for keyed children
-canopy::key!(MainSlot: MainContent);
-canopy::key!(ModalSlot: Center);
+canopy::slot!(MainSlot: MainContent);
+canopy::slot!(ModalSlot: Center);
 
 pub mod store;
 
@@ -24,6 +28,9 @@ const FIXTURE_WITH_ITEMS: &[&str] = &[
     "Ship fixture-driven smoke tests",
     "Review MCP bindings",
 ];
+
+/// Columns reserved for the selection indicator and its spacer.
+const TODO_GUTTER_WIDTH: u32 = 2;
 
 /// Widget for a todo entry.
 pub struct TodoEntry {
@@ -39,7 +46,6 @@ impl Selectable for TodoEntry {
     }
 }
 
-#[derive_commands]
 impl TodoEntry {
     /// Create a new todo entry widget.
     pub(crate) fn new(t: store::Todo) -> Self {
@@ -61,9 +67,14 @@ impl Widget for TodoEntry {
             Constraint::Exact(n) | Constraint::AtMost(n) => n.max(1),
             Constraint::Unbounded => 80,
         };
-        let width = available_width as usize;
-        let lines = textwrap::wrap(&self.todo.item, width);
-        let height = lines.len().max(1) as u32;
+        let text_width = available_width.saturating_sub(TODO_GUTTER_WIDTH);
+        let height = if text_width == 0 {
+            1
+        } else {
+            textwrap::wrap(&self.todo.item, text_width as usize)
+                .len()
+                .max(1) as u32
+        };
         c.clamp(Size::new(available_width, height))
     }
 
@@ -88,8 +99,8 @@ impl Widget for TodoEntry {
         }
 
         // Text content starts at column 2
-        let text_start_x = area.tl.x + 2;
-        let text_visible_width = area.w.saturating_sub(2);
+        let text_start_x = area.tl.x + TODO_GUTTER_WIDTH;
+        let text_visible_width = area.w.saturating_sub(TODO_GUTTER_WIDTH);
 
         if text_visible_width > 0 {
             let width = text_visible_width as usize;
@@ -135,116 +146,131 @@ impl Widget for MainContent {}
 
 /// Root node for the todo demo.
 pub(crate) struct Todo {
-    /// Entries waiting for the widget tree to mount.
-    pending: Vec<store::Todo>,
-    /// Whether the add-item modal is active.
-    adder_active: bool,
+    /// Database owned by this application.
+    store: store::Store,
+    /// Owned interaction scope for the add-item modal.
+    adder: Option<InteractionToken>,
 }
 
 #[derive_commands]
 impl Todo {
-    /// Load a todo widget from the current store.
-    pub(crate) fn new() -> AnyResult<Self> {
-        let pending = store::get()?.todos()?;
-        Ok(Self {
-            pending,
-            adder_active: false,
-        })
+    /// Load a todo widget from its database.
+    pub(crate) fn new(store: store::Store) -> Self {
+        Self { store, adder: None }
     }
 
     /// Build the Todo widget subtree once.
-    fn ensure_tree(&mut self, c: &mut dyn Context) -> Result<()> {
-        if c.has_child::<MainSlot>()? {
+    fn ensure_tree(&self, c: &mut dyn Context) -> Result<()> {
+        if c.has_slot::<MainSlot>()? {
             return Ok(());
         }
 
-        // Create the main content container (list + status bar in column layout)
-        let main_content_id = c.add_keyed::<MainSlot>(MainContent)?;
-        let frame_id = c.add_child_to(main_content_id, Frame::new())?;
-        let list_id = c.add_child_to(frame_id, List::<TodoEntry>::new())?;
-        let status_id = c.add_child_to(main_content_id, StatusBar)?;
-        let main_content_node = NodeId::from(main_content_id);
-
-        // Set Todo (self) to use Stack direction for modal overlay support
-        c.set_layout(Layout::fill().direction(Direction::Stack))?;
-
-        // Main content fills the space
-        c.set_layout_of(main_content_id, Layout::fill())?;
-
-        c.set_layout_of(list_id, Layout::fill())?;
-
-        c.set_layout_of(status_id, Layout::row().flex_horizontal(1).fixed_height(1))?;
-
-        // Initially only show main content
-        c.set_children(vec![main_content_node])?;
-
-        if !self.pending.is_empty() {
-            let pending = mem::take(&mut self.pending);
-            c.with_widget(list_id, |list: &mut List<TodoEntry>, ctx| {
-                for item in pending {
-                    list.append(ctx, TodoEntry::new(item))?;
-                }
+        let scope = c.node_id();
+        c.compose(scope, |tree| {
+            tree.keyed::<MainSlot>(MainContent, |main| {
+                main.layout_override(LayoutOverride::full(Layout::fill()))?;
+                main.child(Frame::new(), |frame| {
+                    frame.child(List::<TodoEntry, i64>::new(), |list| {
+                        list.semantic_key(scope, "todo.list")
+                    })?;
+                    Ok(())
+                })?;
+                main.child(StatusBar, |status| {
+                    status.layout_override(LayoutOverride::full(
+                        Layout::row().flex_horizontal(1).fixed_height(1),
+                    ))
+                })?;
                 Ok(())
             })?;
-        }
+            Ok(())
+        })?;
+        let items = self.store.todos().map_err(store_error)?;
+        self.reconcile_items(c, items)?;
+        self.with_list(c, |list, ctx| list.select_first(ctx))?;
 
         Ok(())
     }
 
     /// Build the add-item modal once.
     fn ensure_modal(&self, c: &mut dyn Context) -> Result<()> {
-        if c.has_child::<ModalSlot>()? {
+        if c.has_slot::<ModalSlot>()? {
             return Ok(());
         }
 
-        // Create the modal with an input frame
-        let modal_id = c.add_keyed::<ModalSlot>(Center::new())?;
-        let adder_frame_id = c.add_child_to(modal_id, Frame::new())?;
-        let input_id = c.add_child_to(adder_frame_id, Input::new(""))?;
+        let scope = c.node_id();
+        c.compose(scope, |tree| {
+            tree.keyed::<ModalSlot>(Center::new(), |modal| {
+                modal.child(Frame::new(), |frame| {
+                    frame.layout_override(LayoutOverride {
+                        min_width: Some(Some(30)),
+                        max_width: Some(Some(50)),
+                        ..LayoutOverride::new().fixed_height(3)
+                    })?;
+                    frame.child(
+                        Input::new("")
+                            .with_label("New todo item")
+                            .with_value_exposure(ValueExposure::Public),
+                        |input| {
+                            input.layout_override(LayoutOverride::full(Layout::fill()))?;
+                            input.semantic_key(scope, "todo.input")
+                        },
+                    )?;
+                    Ok(())
+                })?;
+                Ok(())
+            })?;
+            Ok(())
+        })
+    }
 
-        let mut layout = Frame::new().layout();
-        layout.min_height = Some(3);
-        layout.max_height = Some(3);
-        layout.min_width = Some(30);
-        layout.max_width = Some(50);
-        c.set_layout_of(adder_frame_id, layout)?;
-
-        c.set_layout_of(input_id, Layout::fill())?;
-
+    /// Close only this application's modal effects and restore prior focus.
+    fn close_adder(&self, c: &mut dyn Context) -> Result<()> {
+        if let Some(token) = self.adder {
+            c.close_modal(token)?;
+        }
         Ok(())
     }
 
-    /// Synchronize modal visibility and the main-content dimming effect.
-    fn sync_modal_state(&self, c: &mut dyn Context) -> Result<()> {
-        let main_content_id = c
-            .get_child::<MainSlot>()?
-            .expect("main content not initialized");
-        let main_content_node = NodeId::from(main_content_id);
+    /// Reconcile database rows by their persistent identifiers.
+    fn reconcile_items(&self, c: &mut dyn Context, items: Vec<store::Todo>) -> Result<()> {
+        let keys: Vec<i64> = items.iter().map(|item| item.id).collect();
+        let items: HashMap<i64, store::Todo> =
+            items.into_iter().map(|item| (item.id, item)).collect();
+        self.with_list(c, |list, ctx| {
+            list.reconcile(
+                ctx,
+                keys,
+                |key| Ok(TodoEntry::new(items[key].clone())),
+                |key, id, ctx| {
+                    ctx.with_widget_mut(id, |entry: &mut TodoEntry, _| {
+                        entry.todo = items[key].clone();
+                        Ok(())
+                    })
+                },
+            )?;
+            Ok(())
+        })
+    }
 
-        if self.adder_active {
-            self.ensure_modal(c)?;
-            c.push_effect(main_content_node, effects::brightness(0.5))?;
-            c.with_child::<ModalSlot, _>(|_, ctx| {
-                ctx.set_hidden(false)?;
-                Ok(())
-            })?;
-        } else {
-            // Clear dimming when modal is not active
-            c.clear_effects(main_content_node)?;
-            let _ = c.try_with_child::<ModalSlot, _>(|_, ctx| {
-                ctx.set_hidden(true)?;
-                Ok(())
-            })?;
-        }
-        Ok(())
+    /// Resolve the node for the unique todo list.
+    fn list_id(&self, c: &dyn ViewContext) -> Result<NodeId> {
+        c.find_identity(c.node_id(), "todo.list")?
+            .ok_or_else(|| Error::Internal("todo list is not initialized".into()))
+    }
+
+    /// Resolve the node for the unique modal input.
+    fn input_id(&self, c: &dyn ViewContext) -> Result<NodeId> {
+        c.find_identity(c.node_id(), "todo.input")?
+            .ok_or_else(|| Error::Internal("todo input is not initialized".into()))
     }
 
     /// Run a mutation against the unique todo list.
     fn with_list<F, R>(&self, c: &mut dyn Context, f: F) -> Result<R>
     where
-        F: FnOnce(&mut List<TodoEntry>, &mut dyn Context) -> Result<R>,
+        F: FnOnce(&mut List<TodoEntry, i64>, &mut dyn Context) -> Result<R>,
     {
-        c.with_unique_descendant::<List<TodoEntry>, _>(f)
+        let id = self.list_id(c)?;
+        c.with_widget_mut(id, f)
     }
 
     /// Run a mutation against the unique modal input.
@@ -252,9 +278,8 @@ impl Todo {
     where
         F: FnOnce(&mut Input) -> Result<R>,
     {
-        c.with_child::<ModalSlot, _>(|_, ctx| {
-            ctx.with_unique_descendant::<Input, _>(|input, _| f(input))
-        })
+        let id = self.input_id(c)?;
+        c.with_widget_mut(id, |input: &mut Input, _| f(input))
     }
 
     /// Replace list state and set the requested modal state for a fixture.
@@ -266,24 +291,19 @@ impl Todo {
     ) -> Result<()> {
         self.ensure_tree(c)?;
         let empty = items.is_empty();
-        self.with_list(c, |list, ctx| {
-            list.clear(ctx)?;
-            for item in items {
-                list.append(ctx, TodoEntry::new(item))?;
-            }
-            if !empty {
-                list.select_first(ctx)?;
-            }
-            Ok(())
-        })?;
-
+        self.reconcile_items(c, items)?;
+        self.with_list(c, |list, ctx| list.select(ctx, 0))?;
         if modal_open {
             self.open_adder(c)?;
         } else {
-            self.adder_active = false;
-            self.sync_modal_state(c)?;
-            if empty {
-                c.set_focus(c.node_id())?;
+            let was_open = self.adder.is_some_and(|token| c.modal_is_open(token));
+            self.close_adder(c)?;
+            if !was_open {
+                if empty {
+                    c.set_focus(c.node_id())?;
+                } else {
+                    self.with_list(c, |list, ctx| list.select_first(ctx))?;
+                }
             }
         }
         Ok(())
@@ -298,66 +318,73 @@ impl Todo {
 
     /// Show the add-item modal with an empty input and focus it.
     fn open_adder(&mut self, c: &mut dyn Context) -> Result<()> {
-        self.adder_active = true;
-        self.sync_modal_state(c)?;
+        self.ensure_modal(c)?;
         self.with_input(c, |input| {
             input.set_value("");
             Ok(())
         })?;
-        if let Some(input_id) = (c as &dyn ViewContext).unique_descendant::<Input>()? {
-            c.set_focus(NodeId::from(input_id))?;
+        let input = self.input_id(c)?;
+        if !self.adder.is_some_and(|token| c.modal_is_open(token)) {
+            let modal = c.get_slot::<ModalSlot>()?.expect("modal initialized");
+            let main = c.get_slot::<MainSlot>()?.expect("main initialized");
+            self.adder = Some(c.open_modal(ModalOptions {
+                owner: c.node_id(),
+                modal: modal.into(),
+                initial_focus: input,
+                dim_target: Some(main.into()),
+                bindings: ModalBindings::Application,
+            })?);
+        } else {
+            c.set_focus(input)?;
         }
         Ok(())
     }
 
-    #[command]
+    /// Delete eligibility follows the current list selection.
+    fn can_delete(&self, ctx: &dyn ViewContext) -> Result<CommandStatus> {
+        let Ok(list) = self.list_id(ctx) else {
+            return Ok(CommandStatus::Disabled("No item selected".into()));
+        };
+        ctx.with_widget(ctx.typed_id::<List<TodoEntry, i64>>(list)?, |list| {
+            Ok(if list.selected_item().is_some() {
+                CommandStatus::Enabled
+            } else {
+                CommandStatus::Disabled("No item selected".into())
+            })
+        })
+    }
+
+    #[command(enabled = "can_delete")]
     /// Delete the selected todo entry.
     pub fn delete_item(&self, c: &mut dyn Context) -> Result<()> {
-        // Read the selected item's todo id before deleting it.
-        let to_delete = self.with_list(c, |list, ctx| {
-            let id = match list.selected_item() {
-                Some(item_id) => {
-                    Some(ctx.with_widget(item_id, |entry: &mut TodoEntry, _| Ok(entry.todo.id))?)
-                }
-                None => None,
+        self.with_list(c, |list, ctx| {
+            let Some(id) = list.selected_key().copied() else {
+                return Ok(());
             };
+            self.store.delete_todo(id).map_err(store_error)?;
             let _ = list.delete_selected(ctx)?;
-            Ok(id)
-        })?;
-
-        if let Some(id) = to_delete {
-            current_store()?.delete_todo(id).map_err(store_error)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     #[command]
     /// Store the pending input and close the add-item modal.
-    pub fn accept_add(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub fn accept_add(&self, c: &mut dyn Context) -> Result<()> {
         let value = self.with_input(c, |input| Ok(input.value().to_string()))?;
 
         if !value.is_empty() {
-            let item = current_store()?.add_todo(&value).map_err(store_error)?;
-            self.with_list(c, |list, ctx| {
-                list.append(ctx, TodoEntry::new(item))?;
-                list.select_last(ctx)?;
-                Ok(())
-            })?;
+            let item = self.store.add_todo(&value).map_err(store_error)?;
+            self.reconcile_items(c, self.store.todos().map_err(store_error)?)?;
+            self.with_list(c, |list, ctx| list.select_key(ctx, &item.id))?;
         }
 
-        self.adder_active = false;
-        self.sync_modal_state(c)?;
-        c.set_focus(c.node_id())?;
-        Ok(())
+        self.close_adder(c)
     }
 
     #[command]
     /// Discard pending input and close the add-item modal.
-    pub fn cancel_add(&mut self, c: &mut dyn Context) -> Result<()> {
-        self.adder_active = false;
-        self.sync_modal_state(c)?;
-        c.set_focus(c.node_id())?;
-        Ok(())
+    pub fn cancel_add(&self, c: &mut dyn Context) -> Result<()> {
+        self.close_adder(c)
     }
 
     #[command]
@@ -380,6 +407,10 @@ impl Todo {
 }
 
 impl Widget for Todo {
+    fn layout(&self) -> Layout {
+        Layout::fill().direction(Direction::Stack)
+    }
+
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
         self.ensure_tree(c)
     }
@@ -392,7 +423,7 @@ impl Widget for Todo {
 impl Loader for Todo {
     fn load(c: &mut Canopy) -> Result<()> {
         c.add_commands::<Self>()?;
-        c.add_commands::<List<TodoEntry>>()?;
+        c.add_commands::<List<TodoEntry, i64>>()?;
         c.add_commands::<Input>()?;
         Ok(())
     }
@@ -401,44 +432,45 @@ impl Loader for Todo {
 /// Default Luau bindings for the todo app.
 pub(crate) const DEFAULT_BINDINGS: &str = r#"
 canopy.bind("?", {
-    description = "Show key bindings",
     path = "/root/**/",
+    phase = "before_widget",
     tier = "global",
-}, function() root.toggle_help() end)
-canopy.bind("q", { description = "Quit" }, function() root.quit() end)
-canopy.bind("d", { description = "Delete item" }, function() todo.delete_item() end)
-canopy.bind("a", { description = "Add item" }, function() todo.enter_item() end)
-canopy.bind("g", { description = "First item" }, function() todo.select_first() end)
-canopy.bind("j", { description = "Next item" }, function() todo.select_by(1) end)
-canopy.bind("Down", { description = "Next item" }, function() todo.select_by(1) end)
-canopy.bind("k", { description = "Previous item" }, function() todo.select_by(-1) end)
-canopy.bind("Up", { description = "Previous item" }, function() todo.select_by(-1) end)
-canopy.bind("Space", { description = "Page down" }, function() todo.page(1) end)
-canopy.bind("PageDown", { description = "Page down" }, function() todo.page(1) end)
-canopy.bind("PageUp", { description = "Page up" }, function() todo.page(-1) end)
+    description = "Show key bindings",
+}, command.root.toggle_help())
+canopy.keymap({
+    { key = "q", description = "Quit", action = command.root.quit() },
+    { key = "d", description = "Delete item", action = command.todo.delete_item() },
+    { key = "a", description = "Add item", action = command.todo.enter_item() },
+    { key = "g", description = "First item", action = command.todo.select_first() },
+    { key = { "j", "Down" }, description = "Next item", action = command.todo.select_by(1) },
+    { key = { "k", "Up" }, description = "Previous item", action = command.todo.select_by(-1) },
+    { key = { "Space", "PageDown" }, description = "Page down", action = command.todo.page(1) },
+    { key = "PageUp", description = "Page up", action = command.todo.page(-1) },
+    {
+        mouse = "ScrollUp",
+        description = "Previous item",
+        action = function()
+            todo.select_by(-1)
+        end,
+    },
+    {
+        mouse = "ScrollDown",
+        description = "Next item",
+        action = function()
+            todo.select_by(1)
+        end,
+    },
+})
 
-canopy.bind_mouse("ScrollUp", { description = "Previous item" }, function()
-    todo.select_by(-1)
-end)
-canopy.bind_mouse("ScrollDown", { description = "Next item" }, function()
-    todo.select_by(1)
-end)
-
-canopy.bind("Left", { path = "input", description = "Cursor left" }, function()
-    input.left()
-end)
-canopy.bind("Right", { path = "input", description = "Cursor right" }, function()
-    input.right()
-end)
-canopy.bind("Backspace", { path = "input", description = "Delete char" }, function()
-    input.backspace()
-end)
-canopy.bind("Enter", { path = "input", description = "Confirm new item" }, function()
-    todo.accept_add()
-end)
-canopy.bind("Escape", { path = "input", description = "Cancel add" }, function()
-    todo.cancel_add()
-end)
+canopy.keymap({
+    path = "input",
+    phase = "before_widget",
+    { key = "Left", description = "Cursor left", action = command.input.left() },
+    { key = "Right", description = "Cursor right", action = command.input.right() },
+    { key = "Backspace", description = "Delete char", action = command.input.backspace() },
+    { key = "Enter", description = "Confirm new item", action = command.todo.accept_add() },
+    { key = "Escape", description = "Cancel add", action = command.todo.cancel_add() },
+})
 "#;
 
 /// Install the todo application's style rules.
@@ -449,11 +481,9 @@ pub(crate) fn style(cnpy: &mut Canopy) {
         .rules()
         .style(
             "statusbar/text",
-            StyleBuilder::new()
-                .fg(solarized::BASE02)
-                .bg(solarized::BASE1),
+            StyleBuilder::new().fg(palette::SUBTEXT).bg(palette::PANEL),
         )
-        .fg("list/selected", solarized::BLUE)
+        .fg("list/selected", palette::ACCENT)
         .apply();
 }
 
@@ -462,21 +492,9 @@ fn store_error(error: impl Display) -> Error {
     Error::Invalid(error.to_string())
 }
 
-/// Return the current thread's store as an application result.
-fn current_store() -> Result<store::Store> {
-    store::get().map_err(store_error)
-}
-
-/// Register and finalize the todo application API with default bindings.
-pub fn setup_app(cnpy: &mut Canopy) -> Result<()> {
-    setup_app_with_config(cnpy, None)
-}
-
-/// Replace store contents with fixture data.
-fn store_fixture_items(items: &[&str]) -> Result<Vec<store::Todo>> {
-    current_store()?
-        .replace_todos(items.iter().copied())
-        .map_err(store_error)
+/// Build the todo command and fixture API without assembling a widget tree.
+pub fn api_app() -> Result<Canopy> {
+    app_builder(None).build()
 }
 
 /// Run a mutation against the unique Todo widget.
@@ -493,8 +511,8 @@ fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
         "empty",
         "App with no todo items and no modal open",
         |cnpy| {
-            let items = store_fixture_items(&[])?;
             with_todo(cnpy, |todo, ctx| {
+                let items = todo.store.replace_todos([]).map_err(store_error)?;
                 todo.apply_items_fixture(ctx, items, false)
             })
         },
@@ -503,8 +521,11 @@ fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
         "with_items",
         "App with a pre-populated todo list",
         |cnpy| {
-            let items = store_fixture_items(FIXTURE_WITH_ITEMS)?;
             with_todo(cnpy, |todo, ctx| {
+                let items = todo
+                    .store
+                    .replace_todos(FIXTURE_WITH_ITEMS.iter().copied())
+                    .map_err(store_error)?;
                 todo.apply_items_fixture(ctx, items, false)
             })
         },
@@ -513,40 +534,175 @@ fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
         "modal_open",
         "App with the add-item modal open and ready for typing",
         |cnpy| {
-            let items = store_fixture_items(FIXTURE_WITH_ITEMS)?;
-            with_todo(cnpy, |todo, ctx| todo.apply_items_fixture(ctx, items, true))
+            with_todo(cnpy, |todo, ctx| {
+                let items = todo
+                    .store
+                    .replace_todos(FIXTURE_WITH_ITEMS.iter().copied())
+                    .map_err(store_error)?;
+                todo.apply_items_fixture(ctx, items, true)
+            })
         },
     ))?;
     Ok(())
 }
 
-/// Register commands, finalize the Luau API, and apply default/user bindings.
-pub(crate) fn setup_app_with_config(cnpy: &mut Canopy, config: Option<&Path>) -> Result<()> {
-    Root::load(cnpy)?;
-    <Todo as Loader>::load(cnpy)?;
-    style(cnpy);
-    register_fixtures(cnpy)?;
-    cnpy.finalize_api()?;
-    cnpy.eval_script(DEFAULT_BINDINGS)?;
+/// Queue API registration and binding sources without constructing a database.
+fn app_builder(config: Option<&Path>) -> CanopyBuilder {
+    let builder = CanopyBuilder::new()
+        .configure(|cnpy| {
+            Root::load(cnpy)?;
+            <Todo as Loader>::load(cnpy)?;
+            style(cnpy);
+            register_fixtures(cnpy)
+        })
+        .bindings("todo-defaults", DEFAULT_BINDINGS);
     if let Some(config) = config {
-        cnpy.run_config(config)?;
+        builder.config(config.to_owned())
+    } else {
+        builder
     }
-    Ok(())
 }
 
-/// Create a fully configured todo application backed by `db_path`.
-pub fn create_app(db_path: &str) -> AnyResult<Canopy> {
-    create_app_with_config(db_path, None)
+/// Create a todo application with an explicit database and optional user
+/// config.
+pub fn create_app(store: store::Store, config: Option<&Path>) -> AnyResult<Canopy> {
+    Ok(app_builder(config)
+        .assemble(move |cnpy| {
+            let todo = Todo::new(store);
+            Root::new().install(cnpy, todo)?;
+            Ok(())
+        })
+        .build()?)
 }
 
-/// Create a todo canopy app with optional user config.
-pub fn create_app_with_config(db_path: &str, config: Option<&Path>) -> AnyResult<Canopy> {
-    store::open(db_path)?;
+#[cfg(test)]
+mod tests {
+    use canopy::{
+        ContextExt,
+        geom::Point,
+        style::{ResolvedStyle, effects},
+        testing::harness::Harness,
+    };
 
-    let mut cnpy = Canopy::new();
-    setup_app_with_config(&mut cnpy, config)?;
+    use super::*;
 
-    let todo = Todo::new()?;
-    Root::install_app(&mut cnpy, todo)?;
-    Ok(cnpy)
+    #[test]
+    fn todo_entry_measures_text_after_the_gutter() {
+        for (text, width, height) in [
+            ("aaaa bbb", 8, 2),
+            ("aaaa bbb", 10, 1),
+            ("aaaa bbb", 0, 1),
+            ("aaaa bbb", 1, 1),
+            ("aaaa bbb", 2, 1),
+            ("", 8, 1),
+        ] {
+            let entry = TodoEntry::new(store::Todo {
+                id: 1,
+                item: text.to_owned(),
+            });
+            assert_eq!(
+                entry.measure(MeasureConstraints {
+                    width: Constraint::Exact(width),
+                    height: Constraint::Unbounded,
+                }),
+                Measurement::Fixed(Size::new(width, height))
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_todo_entry_renders_every_wrapped_line() -> AnyResult<()> {
+        let entry = TodoEntry::new(store::Todo {
+            id: 1,
+            item: "aaaa bbb".to_owned(),
+        });
+        let Measurement::Fixed(size) = entry.measure(MeasureConstraints {
+            width: Constraint::Exact(8),
+            height: Constraint::Unbounded,
+        }) else {
+            panic!("todo entry has a fixed measurement");
+        };
+        let mut canopy = Canopy::new();
+        canopy.replace_root(entry)?;
+        let mut harness = Harness::from_canopy(canopy, size)?;
+        harness.render()?;
+        assert!(harness.tbuf().contains_text("aaaa"));
+        assert!(harness.tbuf().contains_text("bbb"));
+        Ok(())
+    }
+
+    fn status_style(harness: &Harness) -> ResolvedStyle {
+        let buffer = harness.buf();
+        buffer
+            .get(Point {
+                x: 0,
+                y: buffer.size().h - 1,
+            })
+            .expect("status cell")
+            .style
+    }
+
+    #[test]
+    fn semantic_controls_survive_decorative_wrappers_and_reorder() -> AnyResult<()> {
+        let store = store::Store::open(":memory:")?;
+        let first = store.add_todo("first")?;
+        let second = store.add_todo("second")?;
+        let mut canopy = create_app(store, None)?;
+        with_todo(&mut canopy, |todo, ctx| {
+            let scope = ctx.node_id();
+            let list = ctx.find_identity(scope, "todo.list")?.expect("keyed list");
+            let frame = ctx.parent_of(list).expect("list frame");
+            ctx.edit_structure(&mut |ctx| {
+                let wrapper = ctx.create_detached(Frame::new())?;
+                ctx.detach(list)?;
+                ctx.attach(wrapper.into(), list)?;
+                ctx.attach(frame, wrapper.into())
+            })?;
+            assert_eq!(ctx.find_identity(scope, "todo.list")?, Some(list));
+            let first_node = todo.with_list(ctx, |list, ctx| {
+                list.select_key(ctx, &first.id)?;
+                Ok(list.selected_item().expect("first entry"))
+            })?;
+            todo.reconcile_items(ctx, vec![second.clone(), first.clone()])?;
+            todo.with_list(ctx, |list, _| {
+                assert_eq!(list.selected_key(), Some(&first.id));
+                assert_eq!(list.selected_index(), Some(1));
+                assert_eq!(list.selected_item(), Some(first_node));
+                Ok(())
+            })?;
+            todo.open_adder(ctx)?;
+            let input = ctx
+                .find_identity(scope, "todo.input")?
+                .expect("keyed input");
+            assert_eq!(ctx.focused_node(), Some(input));
+            todo.close_adder(ctx)
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_modal_opening_keeps_one_dimming_effect() -> AnyResult<()> {
+        let store = store::Store::open(":memory:")?;
+        let mut harness = Harness::from_canopy(create_app(store, None)?, Size::new(80, 24))?;
+        with_todo(&mut harness.canopy, |_, ctx| {
+            let main = ctx.get_slot::<MainSlot>()?.expect("main initialized");
+            ctx.push_effect(main.into(), effects::brightness(0.8))?;
+            Ok(())
+        })?;
+        harness.render()?;
+        let normal = status_style(&harness);
+        harness.script("todo.enter_item()")?;
+        let dimmed = status_style(&harness);
+        assert_ne!(normal, dimmed);
+        harness.script("todo.enter_item()")?;
+        assert_eq!(status_style(&harness), dimmed);
+        for _ in 0..2 {
+            harness.canopy.apply_fixture("modal_open")?;
+            harness.render()?;
+            assert_eq!(status_style(&harness), dimmed);
+        }
+        harness.script("todo.cancel_add()")?;
+        assert_eq!(status_style(&harness), normal);
+        Ok(())
+    }
 }

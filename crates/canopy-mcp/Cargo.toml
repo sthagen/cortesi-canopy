@@ -21,4 +21,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "syn
 workspace = true
 
 [dev-dependencies]
+canopy = { path = "../canopy", features = ["testing"] }
+futures.workspace = true
 tempfile.workspace = true

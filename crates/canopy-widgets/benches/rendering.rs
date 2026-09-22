@@ -3,13 +3,13 @@
 use std::hint::black_box;
 
 use canopy::{
-    Context, Loader, Widget, derive_commands, error::Result, layout::Layout,
+    Context, ContextExt, Loader, Widget, derive_commands, error::Result, layout::Layout,
     testing::harness::Harness,
 };
 use canopy_widgets::Text;
 use criterion::{Criterion, criterion_group, criterion_main};
 
-canopy::key!(TextSlot: Text);
+canopy::slot!(TextSlot: Text);
 
 /// Wrapper node used for text render benchmarks.
 struct BenchmarkTextWrapper {
@@ -30,7 +30,7 @@ impl BenchmarkTextWrapper {
 impl Widget for BenchmarkTextWrapper {
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
         let text_id = c
-            .add_keyed::<TextSlot>(Text::new(self.content.clone()))
+            .add_slot::<TextSlot>(Text::new(self.content.clone()))
             .expect("Failed to attach text");
 
         c.set_layout(Layout::fill()).expect("Failed to style root");

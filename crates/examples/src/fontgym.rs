@@ -1,22 +1,24 @@
 use std::{f32::consts::TAU, time::Duration};
 
 use canopy::{
-    Canopy, Context, EventOutcome, Loader, NodeId, ViewContext, Widget,
+    CanopyBuilder, ChangeOutcome, Context, ContextExt, EventOutcome, Loader, NodeId, NodeName,
+    Render, ViewContext, Widget,
     cursor::{Cursor, CursorShape},
     error::Result,
     event::{Event, key},
-    geom::{Line, Point},
-    layout::{Align, Edges, Layout, MeasureConstraints, Measurement, Size},
-    render::Render,
+    geom::{Line, Point, Size},
+    layout::{Align, Edges, Layout, MeasureConstraints, Measurement},
     rgb,
-    state::NodeName,
     style::{Attr, Color, StyleMap},
     text,
 };
 use canopy_widgets::{
-    Font, FontBanner, FontEffects, FontRenderer, Frame, LayoutOptions, List, Pad, SINGLE_THICK,
-    Selectable, Text, VStack,
+    Container, Frame, List, Pad, SINGLE_THICK, Selectable, Text,
+    font::{Font, FontBanner, FontEffects, FontRenderer, LayoutOptions},
+    wrap,
 };
+
+use crate::fixed_row;
 
 /// Initial text rendered by the banners.
 const DEFAULT_TEXT: &str = "Canopy";
@@ -143,7 +145,7 @@ impl Widget for FontGym {
         let list_id = ctx.create_detached(List::new())?;
         ctx.set_layout_of(list_id, Layout::fill())?;
 
-        let blocks = ctx.with_widget(list_id, |list: &mut List<FontBlock>, ctx| {
+        let blocks = ctx.with_widget_mut(list_id, |list: &mut List<FontBlock>, ctx| {
             let mut ids = Vec::new();
             let centered = LayoutOptions {
                 h_align: Align::Center,
@@ -193,13 +195,18 @@ impl Widget for FontGym {
         ))?;
         ctx.set_layout_of(input_id, Layout::fill())?;
 
-        let input_frame = Frame::wrap_with(ctx, input_id, Frame::new().with_title("Text input"))?;
-        let stack = VStack::new()
-            .push_fixed(input_frame, INPUT_HEIGHT)
-            .push_fixed(status_row_id, STATUS_HEIGHT)
-            .push_flex(font_frame_id, 1);
-        let stack_id = ctx.add_child(stack)?;
-        ctx.set_layout_of(stack_id, Layout::fill())?;
+        let input_frame = wrap(ctx, input_id, Frame::new().with_title("Text input"))?;
+        let stack_id = ctx.add_child(Container::column())?;
+        ctx.set_children_of(
+            stack_id.into(),
+            vec![
+                input_frame.into(),
+                status_row_id.into(),
+                font_frame_id.into(),
+            ],
+        )?;
+        ctx.set_layout_override_of(input_frame.into(), fixed_row(INPUT_HEIGHT))?;
+        ctx.set_layout_override_of(status_row_id.into(), fixed_row(STATUS_HEIGHT))?;
         ctx.set_focus(input_id.into())?;
         Ok(())
     }
@@ -232,9 +239,11 @@ impl FocusFrame {
     fn scroll_list(
         &self,
         ctx: &mut dyn Context,
-        action: impl FnOnce(&mut dyn Context) -> bool,
+        action: impl FnOnce(&mut dyn Context) -> ChangeOutcome,
     ) -> Result<bool> {
-        ctx.with_widget(self.list_id, |_, list_ctx| Ok(action(list_ctx)))
+        ctx.with_widget_mut(self.list_id, |_: &mut List<FontBlock>, list_ctx| {
+            Ok(action(list_ctx).changed())
+        })
     }
 }
 
@@ -298,30 +307,32 @@ impl FontBlock {
         }
     }
 
-    /// Update the banner text.
-    fn set_text(&mut self, ctx: &mut dyn Context, text: String) -> Result<()> {
+    /// Apply a mutation to the mounted banner, or to the unmounted banner
+    /// widget before it is mounted.
+    fn with_banner(
+        &mut self,
+        ctx: &mut dyn Context,
+        f: impl FnOnce(&mut FontBanner),
+    ) -> Result<()> {
         if let Some(banner_id) = self.banner_id {
-            ctx.with_widget(banner_id, |banner, _| {
-                banner.set_text(text);
+            ctx.with_widget_mut(banner_id, |banner: &mut FontBanner, _| {
+                f(banner);
                 Ok(())
             })?;
         } else if let Some(banner) = self.banner.as_mut() {
-            banner.set_text(text);
+            f(banner);
         }
         Ok(())
     }
 
+    /// Update the banner text.
+    fn set_text(&mut self, ctx: &mut dyn Context, text: String) -> Result<()> {
+        self.with_banner(ctx, |banner| banner.set_text(text))
+    }
+
     /// Update the banner effects.
     fn set_effects(&mut self, ctx: &mut dyn Context, effects: FontEffects) -> Result<()> {
-        if let Some(banner_id) = self.banner_id {
-            ctx.with_widget(banner_id, |banner, _| {
-                banner.set_effects(effects);
-                Ok(())
-            })?;
-        } else if let Some(banner) = self.banner.as_mut() {
-            banner.set_effects(effects);
-        }
-        Ok(())
+        self.with_banner(ctx, |banner| banner.set_effects(effects))
     }
 
     /// Update the banner height.
@@ -391,7 +402,7 @@ impl Widget for FontLabel {
         if view_rect.w == 0 || view_rect.h == 0 {
             return Ok(());
         }
-        let full_width = text::slice_by_columns(&self.text, 0, usize::MAX).1 as u32;
+        let full_width = text::display_width(&self.text) as u32;
         let available = view_rect.w.max(1);
         let offset = if full_width >= available {
             0
@@ -408,7 +419,7 @@ impl Widget for FontLabel {
     }
 
     fn measure(&self, c: MeasureConstraints) -> Measurement {
-        let width = text::slice_by_columns(&self.text, 0, usize::MAX).1.max(1) as u32;
+        let width = text::display_width(&self.text).max(1) as u32;
         c.clamp(Size::new(width, 1))
     }
 
@@ -497,7 +508,9 @@ impl FontGymInput {
     /// Push the current text into all target banners.
     fn sync_targets(&self, ctx: &mut dyn Context) -> Result<()> {
         for target in &self.targets {
-            ctx.with_widget(*target, |block, ctx| block.set_text(ctx, self.text.clone()))?;
+            ctx.with_widget_mut(*target, |block: &mut FontBlock, ctx| {
+                block.set_text(ctx, self.text.clone())
+            })?;
         }
         Ok(())
     }
@@ -505,7 +518,7 @@ impl FontGymInput {
     /// Update block layouts to the current height.
     fn sync_heights(&self, ctx: &mut dyn Context) -> Result<()> {
         for target in &self.targets {
-            ctx.with_widget(*target, |block, ctx| {
+            ctx.with_widget_mut(*target, |block: &mut FontBlock, ctx| {
                 block.set_banner_height(ctx, self.banner_height)
             })?;
             ctx.set_layout_of(*target, block_layout(self.banner_height))?;
@@ -517,7 +530,9 @@ impl FontGymInput {
     fn sync_effects(&self, ctx: &mut dyn Context) -> Result<()> {
         let effects = self.style_state;
         for target in &self.targets {
-            ctx.with_widget(*target, |block, ctx| block.set_effects(ctx, effects))?;
+            ctx.with_widget_mut(*target, |block: &mut FontBlock, ctx| {
+                block.set_effects(ctx, effects)
+            })?;
         }
         Ok(())
     }
@@ -555,8 +570,8 @@ impl FontGymInput {
     /// Update the status panel contents.
     fn sync_status(&self, ctx: &mut dyn Context) -> Result<()> {
         let status = status_text(self.banner_height, self.style_state);
-        ctx.with_widget(self.status_text, |text, _| {
-            text.set_raw(status);
+        ctx.with_widget_mut(self.status_text, |text: &mut Text, _| {
+            text.set_text(status);
             Ok(())
         })?;
         Ok(())
@@ -575,7 +590,12 @@ impl Widget for FontGymInput {
     fn cursor(&self) -> Option<Cursor> {
         Some(Cursor {
             location: Point {
-                x: self.cursor as u32,
+                x: text::slice_by_columns(
+                    &self.text[..byte_index_for_char(&self.text, self.cursor)],
+                    0,
+                    usize::MAX,
+                )
+                .1 as u32,
                 y: 0,
             },
             shape: CursorShape::Block,
@@ -670,7 +690,7 @@ impl Widget for FontGymInput {
     }
 
     fn measure(&self, c: MeasureConstraints) -> Measurement {
-        let width = self.text.chars().count().max(1) as u32;
+        let width = text::display_width(&self.text).max(1) as u32;
         c.clamp(Size::new(width, 1))
     }
 
@@ -854,12 +874,12 @@ fn panel(
     title: &str,
     min_width: u32,
 ) -> Result<NodeId> {
-    let pad = Pad::wrap_with(
+    let pad = wrap(
         ctx,
         child,
         Pad::new(Edges::symmetric(PANEL_PADDING_V, PANEL_PADDING_H)),
     )?;
-    let frame = Frame::wrap_with(
+    let frame = wrap(
         ctx,
         pad,
         Frame::new().with_title(title).with_glyphs(SINGLE_THICK),
@@ -871,7 +891,7 @@ fn panel(
             .min_width(min_width)
             .padding(Edges::all(1)),
     )?;
-    Ok(frame)
+    Ok(frame.into())
 }
 
 /// Build a label string for a font.
@@ -941,17 +961,95 @@ fn status_text(height: u32, state: FontEffects) -> String {
     .join("\n")
 }
 
-/// Install key bindings for focus navigation.
-pub fn setup_bindings(c: &mut Canopy) -> Result<()> {
-    c.eval_script(
-        r#"
-canopy.bind("Tab", { description = "Next focus" }, function()
-    root.focus("Next")
-end)
-canopy.bind("BackTab", { description = "Previous focus" }, function()
-    root.focus("Prev")
-end)
-"#,
-    )?;
-    Ok(())
+/// Focus controls shared by eager and builder setup.
+const DEFAULT_BINDINGS: &str = r#"
+canopy.keymap({
+    { key = "Tab", description = "Next focus", action = command.root.focus("Next") },
+    { key = "BackTab", description = "Previous focus", action = command.root.focus("Prev") },
+})
+"#;
+
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.bindings("fontgym", DEFAULT_BINDINGS)
+}
+
+#[cfg(test)]
+mod tests {
+    use canopy::{ViewContextExt, layout::Constraint, testing::harness::Harness};
+
+    use super::*;
+    use crate::tests::{Mount, root_harness};
+
+    fn font_list_scroll(harness: &Harness) -> Point {
+        harness.canopy.with_root_view(|ctx| {
+            let list = ctx
+                .unique_descendant::<List<FontBlock>>()
+                .expect("list lookup")
+                .expect("font list");
+            ctx.view_of(list.into()).expect("font list view").scroll
+        })
+    }
+
+    #[test]
+    fn page_down_scrolls_the_font_list() -> Result<()> {
+        let mut harness = root_harness(
+            FontGym::new(),
+            binding_setup,
+            Size::new(80, 24),
+            Mount::Wrap,
+        )?;
+        let before = font_list_scroll(&harness);
+
+        let frame = harness
+            .canopy
+            .with_root_view(|ctx| ctx.unique_descendant::<FocusFrame>())
+            .expect("frame lookup")
+            .expect("focus frame");
+        harness.canopy.with_root_context(|ctx| {
+            ctx.set_focus(frame.into())?;
+            Ok(())
+        })?;
+
+        harness.key(key::Key::parse_spec("PageDown").expect("valid key"))?;
+
+        let after = font_list_scroll(&harness);
+        assert!(after.y > before.y, "PageDown must scroll the font list");
+        Ok(())
+    }
+
+    #[test]
+    fn input_cursor_and_measurement_use_display_columns() -> Result<()> {
+        let mut canopy = canopy::Canopy::new();
+        let status = canopy.create_detached(Text::new(""))?;
+        for (text, columns, width) in [
+            ("界a", vec![0, 2, 3], 3),
+            ("e\u{301}a", vec![0, 1, 1, 2], 2),
+            ("abc", vec![0, 1, 2, 3], 3),
+            ("", vec![0], 1),
+        ] {
+            let mut input = FontGymInput::new(text, Vec::new(), 1, FontEffects::default(), status);
+            for (position, column) in columns.into_iter().enumerate() {
+                input.cursor = position;
+                let cursor = input.cursor().expect("input cursor");
+                assert_eq!(cursor.location, Point { x: column, y: 0 });
+            }
+            assert_eq!(
+                input.measure(MeasureConstraints {
+                    width: Constraint::Unbounded,
+                    height: Constraint::Unbounded,
+                }),
+                Measurement::Fixed(Size::new(width, 1))
+            );
+            assert_eq!(
+                input.measure(MeasureConstraints {
+                    width: Constraint::AtMost(1),
+                    height: Constraint::Exact(1),
+                }),
+                Measurement::Fixed(Size::new(1, 1))
+            );
+        }
+        Ok(())
+    }
 }

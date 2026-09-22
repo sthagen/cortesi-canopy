@@ -1,7 +1,8 @@
 use canopy::geom::Point;
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{LineChange, TextBuffer, TextPosition, WrapMode, display_width};
+use super::{WrapMode, display_width};
+use crate::text_buffer::{LineChange, TextBuffer, TextPosition};
 
 /// A wrapped segment of a logical line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,20 +172,11 @@ impl LayoutCache {
         tab_stop: usize,
     ) -> Point {
         let line = position.line.min(self.lines.len().saturating_sub(1));
-        let layout = self.lines.get(line);
-        if layout.is_none() {
+        let Some(layout) = self.lines.get(line) else {
             return Point { x: 0, y: 0 };
-        }
-        let layout = layout.expect("layout present");
+        };
         let display_col = buffer.column_for_position(position, tab_stop);
-        let seg_idx = layout.segment_for_column(display_col);
-        let seg = layout.segment(seg_idx).expect("segment present");
-        let x = display_col.saturating_sub(seg.start_col);
-        let y = self.line_offset(line).saturating_add(seg_idx);
-        Point {
-            x: x as u32,
-            y: y as u32,
-        }
+        segment_point(layout, display_col, self.line_offset(line))
     }
 
     /// Map display coordinates to the closest text position.
@@ -303,6 +295,57 @@ impl LayoutCache {
     }
 }
 
+/// Map a text position to display coordinates by laying out the lines up to
+/// it, without a cache.
+pub fn point_for_position(
+    buffer: &TextBuffer,
+    position: TextPosition,
+    wrap_mode: WrapMode,
+    wrap_width: usize,
+    tab_stop: usize,
+) -> Point {
+    let line = position.line.min(buffer.line_count().max(1) - 1);
+    let layout_of = |index| layout_line(&buffer.line_text(index), wrap_mode, wrap_width, tab_stop);
+    let row = match wrap_mode {
+        WrapMode::None => line,
+        WrapMode::Soft => (0..line)
+            .map(|index| layout_of(index).display_lines())
+            .sum(),
+    };
+    let display_col = buffer.column_for_position(position, tab_stop);
+    segment_point(&layout_of(line), display_col, row)
+}
+
+/// Return the display point of a column in a line whose first segment starts
+/// at display row `row`.
+fn segment_point(layout: &LineLayout, display_col: usize, row: usize) -> Point {
+    let index = layout.segment_for_column(display_col);
+    let start = layout.segment(index).map_or(0, |segment| segment.start_col);
+    Point {
+        x: display_col.saturating_sub(start) as u32,
+        y: row.saturating_add(index) as u32,
+    }
+}
+
+/// Compute `(display_line_count, max_line_width)` by scanning the buffer.
+///
+/// `display_width` is independent of wrapping, so one pass supplies both.
+pub fn metrics(
+    buffer: &TextBuffer,
+    wrap_mode: WrapMode,
+    wrap_width: usize,
+    tab_stop: usize,
+) -> (usize, usize) {
+    let mut lines = 0usize;
+    let mut max_width = 1usize;
+    for line in 0..buffer.line_count().max(1) {
+        let layout = layout_line(&buffer.line_text(line), wrap_mode, wrap_width, tab_stop);
+        lines = lines.saturating_add(layout.display_lines());
+        max_width = max_width.max(layout.display_width);
+    }
+    (lines.max(1), max_width)
+}
+
 /// Build layout segments for a single logical line.
 pub fn layout_line(
     text: &str,
@@ -368,7 +411,7 @@ pub fn layout_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::TextRange;
+    use crate::text_buffer::TextRange;
 
     #[test]
     fn wrap_layout_splits_lines() {
@@ -376,6 +419,18 @@ mod tests {
         let layout = layout_line(line, WrapMode::Soft, 2, 4);
         assert_eq!(layout.segments.len(), 3);
         assert_eq!(layout.display_width, 5);
+    }
+
+    #[test]
+    fn crlf_and_lf_have_equivalent_wrapping() {
+        let mut lf = TextBuffer::new("abcd\nefgh\n");
+        let mut crlf = TextBuffer::new("abcd\r\nefgh\r\n");
+        let mut lf_cache = LayoutCache::new();
+        let mut crlf_cache = LayoutCache::new();
+        lf_cache.sync(&mut lf, 2, WrapMode::Soft, 4);
+        crlf_cache.sync(&mut crlf, 2, WrapMode::Soft, 4);
+        assert_eq!(lf_cache.lines, crlf_cache.lines);
+        assert_eq!(lf_cache.line_offsets, crlf_cache.line_offsets);
     }
 
     #[test]

@@ -1,45 +1,57 @@
-use std::mem;
-
 use canopy::{
-    Canopy, ChildKey, Context, ExclusiveFrameToken, FocusScope, FrameworkBindingGroup, InputSpec,
-    Loader, NodeId, TypedId, Widget, command,
-    commands::{
-        CommandArgs, CommandId, CommandInvocation, CommandNode, CommandSpec, FocusDirection,
-    },
+    Canopy, ChildSlot, Context, ContextExt, FocusDirection, FocusScope, FrameworkBindingGroup,
+    InteractionToken, Loader, ModalBindings, ModalOptions, NodeId, NodeName, TypedId, ViewContext,
+    Widget,
+    commands::CommandCall,
     derive_commands,
     error::{Error, Result},
     event::key::Key,
-    geom,
     layout::{Direction, Layout, Sizing},
-    state::NodeName,
-    style::effects,
 };
 
-use crate::{help::Help, inspector::Inspector};
+#[cfg(feature = "devtools")]
+use crate::inspector::Inspector;
+use crate::{
+    Button, Container,
+    center::Center,
+    help::{BindingList, Help, ModeHelp},
+};
 
 /// Default root bindings exposed through `root.default_bindings()`.
+///
+/// Button activation comes first, so an application that takes the root
+/// defaults can activate a button without knowing that buttons carry bindings,
+/// and can still rebind either afterwards.
 const DEFAULT_BINDINGS: &str = r#"
+button.default_bindings()
+
+canopy.bind("q", { path = "root", description = "Quit" }, command.root.quit())
+"#;
+
+/// Additional root bindings installed with developer tools.
+#[cfg(feature = "devtools")]
+const DEVTOOLS_BINDINGS: &str = r#"
 inspector.default_bindings()
 
-canopy.bind("ctrl-Right", { path = "root", description = "Toggle inspector" }, function()
-    root.toggle_inspector()
-end)
-canopy.bind("q", { path = "root", description = "Quit" }, function()
-    root.quit()
-end)
-canopy.bind("a", { path = "inspector", description = "Focus app" }, function()
-    root.focus_app()
-end)
+canopy.bind("ctrl-Right", {
+    path = "root",
+    description = "Toggle inspector",
+}, command.root.toggle_inspector())
+canopy.bind("a", { path = "inspector", description = "Focus app" }, command.root.focus_app())
 "#;
 
 /// Framework binding group used while contextual help is open.
 const HELP_BINDINGS: FrameworkBindingGroup = FrameworkBindingGroup::new("root.help");
 
 // Typed key for the inspector slot
-canopy::key!(InspectorSlot: Inspector);
+#[cfg(feature = "devtools")]
+canopy::slot!(InspectorSlot: Inspector);
 
 // Typed key for the help slot
-canopy::key!(HelpSlot: Help);
+canopy::slot!(HelpSlot: Help);
+
+// Typed key for the transient mode help slot
+canopy::slot!(ModeHelpSlot: Center);
 
 /// Key for the application subtree under root (widget type varies).
 const KEY_APP: &str = "AppSlot";
@@ -50,98 +62,68 @@ const KEY_MAIN_PANE: &str = "MainPane";
 /// A Root widget that lives at the base of a Canopy app.
 pub struct Root {
     /// Whether the inspector is visible.
+    #[cfg(feature = "devtools")]
     inspector_active: bool,
-    /// Context saved while the help modal is open.
-    help_state: HelpState,
+    /// Token for the open help modal, if any.
+    help_token: Option<InteractionToken>,
 }
 
-/// Root-owned contextual help state.
-enum HelpState {
-    /// Help is not visible.
-    Closed,
-    /// Help is visible and owns one exclusive binding frame.
-    Open {
-        /// Focus node to restore when it remains live.
-        origin_focus: Option<NodeId>,
-        /// Application or inspector pane used for fallback focus.
-        origin_pane: Option<NodeId>,
-        /// Exact exclusive frame to remove when help closes.
-        exclusive_token: ExclusiveFrameToken,
-    },
-}
-
-impl HelpState {
-    /// Return true when help is open.
-    fn is_open(&self) -> bool {
-        matches!(self, Self::Open { .. })
+impl Default for Root {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[derive_commands]
 impl Root {
     /// Construct a root widget wrapping the application and inspector nodes.
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            #[cfg(feature = "devtools")]
             inspector_active: false,
-            help_state: HelpState::Closed,
+            help_token: None,
         }
     }
 
+    /// Return true when the help modal is open.
+    fn help_is_open(&self, context: &dyn ViewContext) -> bool {
+        self.help_token
+            .is_some_and(|token| context.modal_is_open(token))
+    }
+
     /// Start with the inspector open.
-    fn with_inspector(mut self, state: bool) -> Self {
+    #[cfg(feature = "devtools")]
+    pub fn with_inspector(mut self, state: bool) -> Self {
         self.inspector_active = state;
         self
     }
 
-    /// Synchronize the root layout based on inspector and help visibility.
-    fn sync_layout(&self, c: &mut dyn Context) -> Result<()> {
-        let main_pane = self.main_pane_id(c)?;
-        let app = self.app_id(c)?;
-        let inspector = self.inspector_id(c)?;
-        let help = self.help_id(c)?;
-
-        c.set_hidden_of(inspector, !self.inspector_active)?;
-        c.with_layout_of(app, &mut |layout| {
-            *layout = layout.width(Sizing::Flex(1)).height(Sizing::Flex(1));
-        })?;
-
-        // Help overlay
-        c.set_hidden_of(help, !self.help_state.is_open())?;
-
-        // Dim effect on main pane when help is visible
-        if self.help_state.is_open() {
-            c.push_effect(main_pane, effects::brightness(0.5))?;
-        } else {
-            c.clear_effects(main_pane)?;
-        }
-
-        Ok(())
-    }
-
     /// Main pane (app + inspector container) node id.
     fn main_pane_id(&self, c: &dyn Context) -> Result<NodeId> {
-        c.child_keyed(KEY_MAIN_PANE)
+        c.child_slot(KEY_MAIN_PANE)
             .ok_or_else(|| Error::NotFound("main_pane".into()))
     }
 
     /// Application node id (inside main pane).
+    #[cfg(feature = "devtools")]
     fn app_id(&self, c: &dyn Context) -> Result<NodeId> {
         let main_pane = self.main_pane_id(c)?;
-        c.child_keyed_in(main_pane, KEY_APP)
+        c.child_slot_of(main_pane, KEY_APP)
             .ok_or_else(|| Error::NotFound("app".into()))
     }
 
     /// Inspector node id (inside main pane).
+    #[cfg(feature = "devtools")]
     fn inspector_id(&self, c: &dyn Context) -> Result<NodeId> {
         let main_pane = self.main_pane_id(c)?;
-        c.get_child_in::<InspectorSlot>(main_pane)?
+        c.get_slot_of::<InspectorSlot>(main_pane)?
             .map(Into::into)
             .ok_or_else(|| Error::NotFound("inspector".into()))
     }
 
     /// Help node id.
     fn help_id(&self, c: &dyn Context) -> Result<NodeId> {
-        c.get_child::<HelpSlot>()?
+        c.get_slot::<HelpSlot>()?
             .map(Into::into)
             .ok_or_else(|| Error::NotFound("help".into()))
     }
@@ -150,13 +132,16 @@ impl Root {
     /// Exit from the program, restoring terminal state. If help or inspector is
     /// open, close them first.
     pub fn quit(&mut self, c: &mut dyn Context) -> Result<()> {
-        if self.help_state.is_open() {
+        if self.help_is_open(c) {
             self.hide_help(c)?;
-        } else if self.inspector_active {
-            self.hide_inspector(c)?;
-        } else {
-            c.exit(0);
+            return Ok(());
         }
+        #[cfg(feature = "devtools")]
+        if self.inspector_active {
+            self.hide_inspector(c)?;
+            return Ok(());
+        }
+        c.exit(0);
         Ok(())
     }
 
@@ -172,22 +157,17 @@ impl Root {
     /// @param direction The direction to move focus.
     #[command]
     pub fn focus(&mut self, c: &mut dyn Context, direction: FocusDirection) -> Result<()> {
-        match direction {
-            FocusDirection::Next => c.focus_next(FocusScope::Root),
-            FocusDirection::Prev => c.focus_prev(FocusScope::Root),
-            FocusDirection::Up => c.focus_dir(FocusScope::Root, geom::Direction::Up),
-            FocusDirection::Down => c.focus_dir(FocusScope::Root, geom::Direction::Down),
-            FocusDirection::Left => c.focus_dir(FocusScope::Root, geom::Direction::Left),
-            FocusDirection::Right => c.focus_dir(FocusScope::Root, geom::Direction::Right),
-        }?;
+        c.focus_move(FocusScope::Root, direction)?;
         Ok(())
     }
 
     #[command]
     /// Hide the inspector.
+    #[cfg(feature = "devtools")]
     pub fn hide_inspector(&mut self, c: &mut dyn Context) -> Result<()> {
         self.inspector_active = false;
-        self.sync_layout(c)?;
+        let inspector = self.inspector_id(c)?;
+        c.set_hidden_of(inspector, true)?;
         let app = self.app_id(c)?;
         c.focus_first(FocusScope::Node(app))?;
         Ok(())
@@ -195,31 +175,34 @@ impl Root {
 
     #[command]
     /// Show the inspector.
-    pub fn activate_inspector(&mut self, c: &mut dyn Context) -> Result<()> {
+    #[cfg(feature = "devtools")]
+    pub fn show_inspector(&mut self, c: &mut dyn Context) -> Result<()> {
         self.inspector_active = true;
-        self.sync_layout(c)?;
         let inspector = self.inspector_id(c)?;
+        c.set_hidden_of(inspector, false)?;
         c.focus_first(FocusScope::Node(inspector))?;
         Ok(())
     }
 
     #[command]
     /// Toggle inspector visibility.
+    #[cfg(feature = "devtools")]
     pub fn toggle_inspector(&mut self, c: &mut dyn Context) -> Result<()> {
         if self.inspector_active {
             self.hide_inspector(c)
         } else {
-            self.activate_inspector(c)
+            self.show_inspector(c)
         }
     }
 
     #[command]
     /// If we're currently focused in the inspector, shift focus into the app
     /// pane instead.
+    #[cfg(feature = "devtools")]
     pub fn focus_app(&mut self, c: &mut dyn Context) -> Result<()> {
         let inspector = self.inspector_id(c)?;
         let app = self.app_id(c)?;
-        if c.node_is_on_focus_path(inspector) {
+        if c.is_on_focus_path_of(inspector) {
             c.focus_first(FocusScope::Node(app))?;
         }
         Ok(())
@@ -228,63 +211,39 @@ impl Root {
     #[command]
     /// Show the help modal with contextual bindings and commands.
     pub fn show_help(&mut self, c: &mut dyn Context) -> Result<()> {
-        if self.help_state.is_open() {
+        if self.help_is_open(c) {
             return Ok(());
         }
 
         let help = self.help_id(c)?;
         let list = Help::binding_list_id(c, help)?;
         let origin_focus = c.focused_node();
-        let app = self.app_id(c)?;
-        let inspector = self.inspector_id(c)?;
-        let origin_pane = if c.node_is_on_focus_path(app) {
-            Some(app)
-        } else if c.node_is_on_focus_path(inspector) {
-            Some(inspector)
-        } else {
-            None
-        };
         let snapshot = c.available_bindings(origin_focus)?;
-        let (previous_snapshot, previous_scroll) = c.with_widget(list, |list, context| {
-            let previous = list.replace_snapshot(Some(snapshot));
-            let scroll = context.view().tl;
-            context.scroll_to(0, 0);
-            Ok((previous, scroll))
-        })?;
+        let (previous_snapshot, previous_scroll) =
+            c.with_widget_mut(list, |list: &mut BindingList, context| {
+                let previous = list.replace_snapshot(Some(snapshot));
+                let scroll = context.view().scroll;
+                context.scroll_to(0, 0);
+                Ok((previous, scroll))
+            })?;
 
-        let mut token = None;
-        let mut prior_capture = None;
-        let opened = (|| {
-            let exclusive = c.push_exclusive_bindings(HELP_BINDINGS)?;
-            token = Some(exclusive);
-            prior_capture = c.take_mouse_capture()?;
-            self.help_state = HelpState::Open {
-                origin_focus,
-                origin_pane,
-                exclusive_token: exclusive,
-            };
-            self.sync_layout(c)?;
-            c.set_focus(NodeId::from(list))?;
-            Ok(())
-        })();
-        if let Err(error) = opened {
-            self.help_state = HelpState::Closed;
-            drop(self.sync_layout(c));
-            if let Some(token) = token {
-                drop(c.pop_exclusive_bindings(token));
+        let opened = c.open_modal(ModalOptions {
+            owner: c.node_id(),
+            modal: help,
+            initial_focus: list.into(),
+            dim_target: Some(self.main_pane_id(c)?),
+            bindings: ModalBindings::Framework(HELP_BINDINGS),
+        });
+        match opened {
+            Ok(token) => self.help_token = Some(token),
+            Err(error) => {
+                c.with_widget_mut(list, |list: &mut BindingList, context| {
+                    list.replace_snapshot(previous_snapshot);
+                    context.scroll_to(previous_scroll.x, previous_scroll.y);
+                    Ok(())
+                })?;
+                return Err(error);
             }
-            if let Some(capture) = prior_capture {
-                drop(c.restore_mouse_capture(capture));
-            }
-            drop(c.with_widget(list, |list, context| {
-                list.replace_snapshot(previous_snapshot);
-                context.scroll_to(previous_scroll.x, previous_scroll.y);
-                Ok(())
-            }));
-            if let Some(origin) = origin_focus {
-                drop(c.set_focus(origin));
-            }
-            return Err(error);
         }
         Ok(())
     }
@@ -292,113 +251,63 @@ impl Root {
     #[command]
     /// Hide the help modal.
     pub fn hide_help(&mut self, c: &mut dyn Context) -> Result<()> {
-        let HelpState::Open {
-            origin_focus,
-            origin_pane,
-            exclusive_token,
-        } = mem::replace(&mut self.help_state, HelpState::Closed)
-        else {
+        let Some(token) = self.help_token else {
             return Ok(());
         };
-        let help = self.help_id(c)?;
-        let list = Help::binding_list_id(c, help)?;
-        self.sync_layout(c)?;
-        c.with_widget(list, |list, context| {
-            list.replace_snapshot(None);
-            context.scroll_to(0, 0);
-            Ok(())
-        })?;
-        c.pop_exclusive_bindings(exclusive_token)?;
-
-        let focusable = c.focusable_leaves(c.root_id());
-        if let Some(origin) = origin_focus
-            && focusable.contains(&origin)
-        {
-            c.set_focus(origin)?;
-            return Ok(());
-        }
-        if let Some(pane) = origin_pane
-            && c.node_is_attached(pane)
-            && c.focus_first(FocusScope::Node(pane))?.changed()
-        {
-            return Ok(());
-        }
-        let main_pane = self.main_pane_id(c)?;
-        c.focus_first(FocusScope::Node(main_pane))?;
-        Ok(())
+        c.close_modal(token)
     }
 
     #[command]
     /// Toggle help modal visibility.
     pub fn toggle_help(&mut self, c: &mut dyn Context) -> Result<()> {
-        if self.help_state.is_open() {
+        if self.help_is_open(c) {
             self.hide_help(c)
         } else {
             self.show_help(c)
         }
     }
 
-    /// Helper to install a root widget into a canopy app.
-    pub fn install_app<W>(canopy: &mut Canopy, app: W) -> Result<TypedId<W>>
+    /// Install the application, shared help, and enabled developer tools.
+    pub fn install<W>(self, canopy: &mut Canopy, app: W) -> Result<TypedId<W>>
     where
         W: Widget + 'static,
     {
-        Self::install_app_with_inspector(canopy, app, false)
-    }
-
-    /// Helper to install a root widget into the canopy with an optional
-    /// inspector pane.
-    pub fn install_app_with_inspector<W>(
-        canopy: &mut Canopy,
-        app: W,
-        inspector_active: bool,
-    ) -> Result<TypedId<W>>
-    where
-        W: Widget + 'static,
-    {
+        #[cfg(feature = "devtools")]
+        let inspector_active = self.inspector_active;
         let app_id = canopy.create_detached(app)?;
         let app_node = NodeId::from(app_id);
-        let root = Self::new().with_inspector(inspector_active);
-        let root_id: NodeId = canopy.replace_root(root)?.into();
+        let root_id: NodeId = canopy.replace_root(self)?.into();
         canopy.with_root_context(|context| {
             // Main pane holds the app beside the inspector.
-            let main_pane: NodeId = context.create_detached(MainPane)?.into();
-            let inspector = Inspector::install(context)?;
-            context.attach_keyed(main_pane, KEY_APP, app_node)?;
-            context.attach_keyed(main_pane, InspectorSlot::KEY, inspector)?;
+            let main_pane: NodeId = context
+                .create_detached(Container::row().with_name("main_pane"))?
+                .into();
+            context.attach_slot(main_pane, KEY_APP, app_node)?;
+            #[cfg(feature = "devtools")]
+            let inspector: NodeId = {
+                let inspector = Inspector::install(context)?;
+                context.attach_slot(main_pane, InspectorSlot::KEY, inspector)?;
+                inspector
+            };
 
-            // The help modal overlays the main pane.
+            // Mode help overlays the main pane, and the help modal overlays
+            // both.
+            let mode_help = ModeHelp::install(context)?;
             let help = Help::install(context)?;
-            context.attach_keyed(root_id, KEY_MAIN_PANE, main_pane)?;
-            context.attach_keyed(root_id, HelpSlot::KEY, help)?;
+            context.attach_slot(root_id, KEY_MAIN_PANE, main_pane)?;
+            context.attach_slot(root_id, ModeHelpSlot::KEY, mode_help)?;
+            context.attach_slot(root_id, HelpSlot::KEY, help)?;
+            context.set_hidden_of(mode_help, true)?;
+            context.set_hidden_of(help, true)?;
+
+            #[cfg(feature = "devtools")]
+            context.set_hidden_of(inspector, !inspector_active)?;
+            context.with_layout_of(app_node, &mut |layout| {
+                *layout = layout.width(Sizing::Flex(1)).height(Sizing::Flex(1));
+            })?;
             Ok(())
         })?;
-        canopy.with_root_context(|context| {
-            let root_id = context.node_id();
-            context.with_node(root_id, |root: &mut Self, context| {
-                root.sync_layout(context)
-            })
-        })?;
         Ok(app_id)
-    }
-}
-
-/// Simple container widget for the main pane (app + inspector).
-struct MainPane;
-
-impl Widget for MainPane {
-    fn layout(&self) -> Layout {
-        Layout::fill().direction(Direction::Row)
-    }
-
-    fn name(&self) -> NodeName {
-        NodeName::convert("main_pane")
-    }
-}
-
-impl CommandNode for MainPane {
-    fn commands() -> &'static [&'static CommandSpec] {
-        &[]
     }
 }
 
@@ -416,41 +325,61 @@ impl Widget for Root {
 impl Loader for Root {
     fn load(c: &mut Canopy) -> Result<()> {
         c.add_commands::<Self>()?;
+        #[cfg(feature = "devtools")]
+        {
+            c.register_default_bindings(
+                "root",
+                &format!("{DEFAULT_BINDINGS}\n{DEVTOOLS_BINDINGS}"),
+            )?;
+            Inspector::load(c)?;
+        }
+        #[cfg(not(feature = "devtools"))]
         c.register_default_bindings("root", DEFAULT_BINDINGS)?;
-        Inspector::load(c)?;
+        Button::load(c)?;
         Help::load(c)?;
         register_help_bindings(c)?;
+        c.register_mode_hook("root.mode_help", sync_mode_help);
         Ok(())
     }
 }
 
-/// Register the Root-owned controls admitted by the help exclusive frame.
+/// Show the keys of a transient mode while it waits, and hide them after.
+fn sync_mode_help(context: &mut dyn Context) -> Result<()> {
+    let Some(overlay) = context.get_slot::<ModeHelpSlot>()? else {
+        return Ok(());
+    };
+    ModeHelp::sync(context, overlay.into())
+}
+
+/// Register the Root-owned controls admitted by the help modal.
 fn register_help_bindings(canopy: &mut Canopy) -> Result<()> {
-    let bindings = [
-        ("Up", "Scroll up", "binding_list::scroll_up"),
-        ("k", "Scroll up", "binding_list::scroll_up"),
-        ("Down", "Scroll down", "binding_list::scroll_down"),
-        ("j", "Scroll down", "binding_list::scroll_down"),
-        ("PageUp", "Page up", "binding_list::page_up"),
-        ("PageDown", "Page down", "binding_list::page_down"),
-        ("Space", "Page down", "binding_list::page_down"),
-        ("Home", "First binding", "binding_list::scroll_to_top"),
-        ("g", "First binding", "binding_list::scroll_to_top"),
-        ("End", "Last binding", "binding_list::scroll_to_bottom"),
-        ("G", "Last binding", "binding_list::scroll_to_bottom"),
-        ("Esc", "Close help", "root::hide_help"),
-        ("?", "Close help", "root::toggle_help"),
+    let bindings: [(&str, &str, CommandCall); 13] = [
+        ("Up", "Scroll up", BindingList::call_scroll_up()),
+        ("k", "Scroll up", BindingList::call_scroll_up()),
+        ("Down", "Scroll down", BindingList::call_scroll_down()),
+        ("j", "Scroll down", BindingList::call_scroll_down()),
+        ("PageUp", "Page up", BindingList::call_page_up()),
+        ("PageDown", "Page down", BindingList::call_page_down()),
+        ("Space", "Page down", BindingList::call_page_down()),
+        ("Home", "First binding", BindingList::call_scroll_to_top()),
+        ("g", "First binding", BindingList::call_scroll_to_top()),
+        ("End", "Last binding", BindingList::call_scroll_to_bottom()),
+        ("G", "Last binding", BindingList::call_scroll_to_bottom()),
+        ("Esc", "Close help", Root::call_hide_help()),
+        ("?", "Close help", Root::call_toggle_help()),
     ];
     for (key, description, command) in bindings {
         canopy.bind_framework(
             HELP_BINDINGS,
-            InputSpec::Key(Key::parse_spec(key).map_err(Error::Invalid)?),
-            "/root/help/**/",
-            description,
-            CommandInvocation {
-                id: CommandId(command),
-                args: CommandArgs::default(),
+            Key::parse_spec(key)?,
+            canopy::BindingOptions {
+                path: Some("/root/help/**/".parse()?),
+                scope: canopy::BindingScope::Exclusive(HELP_BINDINGS),
+                description: description.to_string(),
+                source: None,
+                phase: canopy::BindingPhase::BeforeWidget,
             },
+            command,
         )?;
     }
     Ok(())
@@ -460,22 +389,20 @@ fn register_help_bindings(canopy: &mut Canopy) -> Result<()> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(feature = "devtools")]
+    use canopy::testing::harness::Harness;
     use canopy::{
-        BindingScope, Context, EventOutcome, ViewContext, Widget,
+        BindingScope, Cell, Context, EventOutcome, NodeName, Render, ViewContext, Widget,
         commands::{CommandNode, CommandSpec},
         error::Result,
         event::Event,
-        geom::Size,
+        geom::{Line, Size},
         help::BindingSnapshot,
         layout::Layout,
         render::NopBackend,
-        state::NodeName,
-        testing::harness::Harness,
     };
 
     use super::*;
-    use crate::help::BindingList;
-
     static APP_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
     struct App;
@@ -543,7 +470,7 @@ mod tests {
         let mut canopy = Canopy::new();
         Root::load(&mut canopy)?;
 
-        let app_id = Root::install_app(&mut canopy, App)?;
+        let app_id = Root::new().install(&mut canopy, App)?;
         let left = canopy.create_detached(FocusLeaf::new("left"))?;
         let right = canopy.create_detached(FocusLeaf::new("right"))?;
         canopy.with_root_context(|context| {
@@ -562,22 +489,24 @@ mod tests {
     }
 
     fn install_help_trigger(canopy: &mut Canopy) -> Result<()> {
-        canopy.eval_script(
-            r#"
+        canopy
+            .eval_script(
+                r#"
             canopy.bind("?", {
-                description = "Show key bindings",
                 path = "/root/**/",
+                phase = "before_widget",
                 tier = "global",
-            }, function()
-                root.toggle_help()
-            end)
+                description = "Show key bindings",
+            }, command.root.toggle_help())
             "#,
-        )
+            )
+            .map(|_| ())
     }
 
     fn binding_list_id(canopy: &Canopy) -> NodeId {
-        let matches =
-            canopy.with_root_view(|context| context.find_nodes("root/help/**/binding_list"));
+        let matches = canopy
+            .with_root_view(|context| context.find_nodes("root/help/**/binding_list"))
+            .expect("valid binding filter");
         assert_eq!(matches.len(), 1);
         matches[0]
     }
@@ -585,7 +514,7 @@ mod tests {
     fn modal_snapshot(canopy: &mut Canopy) -> Result<BindingSnapshot> {
         let list = binding_list_id(canopy);
         canopy.with_root_context(|context| {
-            context.with_node(list, |list: &mut BindingList, _context| {
+            context.with_widget_mut(list, |list: &mut BindingList, _context| {
                 list.snapshot()
                     .cloned()
                     .ok_or_else(|| Error::NotFound("help snapshot".to_string()))
@@ -594,11 +523,13 @@ mod tests {
     }
 
     fn send_key(canopy: &mut Canopy, key: &str) -> Result<()> {
-        canopy.eval_script(&format!("canopy.send_key({key:?})"))
+        canopy
+            .eval_script(&format!("canopy.send_key({key:?})"))
+            .map(|_| ())
     }
 
     fn run_script(canopy: &mut Canopy, script: &str) -> Result<()> {
-        canopy.eval_script(script)
+        canopy.eval_script(script).map(|_| ())
     }
 
     #[test]
@@ -606,18 +537,19 @@ mod tests {
         let mut canopy = Canopy::new();
         Root::load(&mut canopy)?;
 
-        let app = Root::install_app(&mut canopy, RowApp)?;
-        let layout = canopy.with_root_view(|context| context.node_layout(app.into()));
+        let app = Root::new().install(&mut canopy, RowApp)?;
+        let layout = canopy.with_root_view(|context| context.layout_of(app.into()));
 
         assert_eq!(layout.map(|layout| layout.direction), Some(Direction::Row));
         Ok(())
     }
 
     #[test]
+    #[cfg(feature = "devtools")]
     fn inspector_pane_draws_its_frame() -> Result<()> {
         let mut canopy = Canopy::new();
         Root::load(&mut canopy)?;
-        Root::install_app_with_inspector(&mut canopy, App, true)?;
+        Root::new().with_inspector(true).install(&mut canopy, App)?;
         canopy.finalize_api()?;
 
         let mut harness = Harness::from_canopy(canopy, Size::new(40, 8))?;
@@ -750,8 +682,8 @@ mod tests {
         let before = modal_snapshot(&mut canopy)?;
         send_key(&mut canopy, "Down")?;
         canopy.render(&mut backend)?;
-        let scroll =
-            canopy.with_root_view(|context| context.node_view(list).expect("binding-list view").tl);
+        let scroll = canopy
+            .with_root_view(|context| context.view_of(list).expect("binding-list view").scroll);
 
         canopy.eval_script("root.show_help()")?;
 
@@ -769,7 +701,9 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            canopy.with_root_view(|context| context.node_view(list).expect("binding-list view").tl),
+            canopy.with_root_view(|context| {
+                context.view_of(list).expect("binding-list view").scroll
+            }),
             scroll
         );
         send_key(&mut canopy, "?")?;
@@ -805,7 +739,7 @@ mod tests {
         send_key(&mut canopy, "x")?;
         let list = binding_list_id(&canopy);
         let view =
-            canopy.with_root_view(|context| context.node_view(list).expect("binding-list view"));
+            canopy.with_root_view(|context| context.view_of(list).expect("binding-list view"));
         let x = view.content.tl.x + i32::try_from(view.content.w.saturating_sub(1)).unwrap();
         let y = view.content.tl.y + i32::try_from(view.content.h.saturating_sub(1)).unwrap();
         canopy.eval_script(&format!(
@@ -820,6 +754,33 @@ mod tests {
         send_key(&mut canopy, "x")?;
         assert_eq!(canopy.input_mode(), "leaked");
         assert_eq!(APP_EVENTS.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_outer_dispatch_keeps_help_close_retryable() -> Result<()> {
+        let (mut canopy, _backend, left, _right) = setup_root_tree()?;
+        canopy.eval_script("root.show_help()")?;
+        let before = modal_snapshot(&mut canopy)?;
+        let result = canopy.with_root_context(|context| {
+            context.dispatch_exact(context.node_id(), &Root::call_hide_help().invocation())?;
+            Err::<(), _>(Error::Invalid("outer dispatch failed".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            canopy.available_bindings(None)?.exclusive_group,
+            Some(HELP_BINDINGS)
+        );
+        assert_eq!(
+            modal_snapshot(&mut canopy)?.bindings.len(),
+            before.bindings.len()
+        );
+        canopy.eval_script("root.hide_help()")?;
+        assert_eq!(canopy.available_bindings(None)?.exclusive_group, None);
+        assert_eq!(
+            canopy.with_root_view(|context| context.focused_node()),
+            Some(left)
+        );
         Ok(())
     }
 
@@ -843,7 +804,7 @@ mod tests {
     fn failed_open_preserves_focus_capture_and_token_balance() -> Result<()> {
         let (mut canopy, _backend, left, _right) = setup_root_tree()?;
         let help = canopy
-            .with_root_view(|context| context.find_nodes("root/help"))
+            .with_root_view(|context| context.find_nodes("root/help"))?
             .into_iter()
             .next()
             .expect("help node");
@@ -866,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_an_open_root_retires_its_exclusive_frame() -> Result<()> {
+    fn replacing_an_open_root_retires_its_modal_bindings() -> Result<()> {
         let (mut canopy, _backend, _left, _right) = setup_root_tree()?;
         install_help_trigger(&mut canopy)?;
         send_key(&mut canopy, "?")?;
@@ -879,6 +840,98 @@ mod tests {
 
         assert_eq!(canopy.available_bindings(None)?.exclusive_group, None);
         Ok(())
+    }
+
+    /// Application that draws one word in its top left corner.
+    struct Banner;
+
+    impl CommandNode for Banner {
+        fn commands() -> &'static [&'static CommandSpec] {
+            &[]
+        }
+    }
+
+    impl Widget for Banner {
+        fn render(&mut self, render: &mut Render, _ctx: &dyn ViewContext) -> Result<()> {
+            render.text("text", Line::new(0, 0, 6), "BANNER")
+        }
+    }
+
+    #[test]
+    fn help_overlays_the_dimmed_application() -> Result<()> {
+        let mut canopy = Canopy::new();
+        Root::load(&mut canopy)?;
+        Root::new().install(&mut canopy, Banner)?;
+        canopy.finalize_api()?;
+        canopy.set_root_size(Size::new(60, 14))?;
+        let mut backend = NopBackend::new();
+        let mut corner = |canopy: &mut Canopy| -> Result<Cell> {
+            canopy.render(&mut backend)?;
+            Ok(canopy.snapshot().expect("published frame").cells[0].clone())
+        };
+        let before = corner(&mut canopy)?;
+        assert_eq!(before.ch, 'B');
+
+        canopy.eval_script("root.show_help()")?;
+        let during = corner(&mut canopy)?;
+        assert_eq!(during.ch, 'B', "help leaves the application visible");
+        assert_ne!(
+            (during.style.fg, during.style.bg),
+            (before.style.fg, before.style.bg),
+            "help dims the application"
+        );
+
+        canopy.eval_script("root.hide_help()")?;
+        let after = corner(&mut canopy)?;
+        assert_eq!(
+            (after.style.fg, after.style.bg),
+            (before.style.fg, before.style.bg),
+            "closing help restores the application"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_transient_mode_shows_its_keys_until_the_next_key() -> Result<()> {
+        let (mut canopy, _backend, _left, _right) = setup_root_tree()?;
+        install_help_trigger(&mut canopy)?;
+        run_script(
+            &mut canopy,
+            r#"
+            canopy.bind("a", { description = "Default key" }, function() end)
+            canopy.bind("p", { description = "Pane keys" }, function()
+                canopy.push_mode("panes", { transient = true })
+            end)
+            canopy.keymap({
+                mode = "panes",
+                { key = "e", description = "Equal widths", action = function() end },
+            })
+
+            canopy.send_key("p")
+            canopy.flush()
+            local screen = canopy.screen_text()
+            canopy.assert(screen:find("panes") ~= nil, "the panel should name the mode")
+            canopy.assert(screen:find("Equal widths") ~= nil, "the panel should list the mode keys")
+            canopy.assert(screen:find("Default key") == nil, "the panel should omit other keys")
+
+            canopy.send_key("x")
+            canopy.flush()
+            canopy.assert(canopy.input_mode() == "", "any key should end the mode")
+            canopy.assert(
+                canopy.screen_text():find("Equal widths") == nil,
+                "the panel should hide when the mode ends"
+            )
+
+            canopy.send_key("p")
+            canopy.send_key("?")
+            canopy.flush()
+            canopy.assert(
+                canopy.screen_text():find("Equal widths") == nil,
+                "contextual help should not show the panel"
+            )
+            canopy.send_key("?")
+            "#,
+        )
     }
 
     #[test]
@@ -894,9 +947,9 @@ mod tests {
         send_key(&mut canopy, "?")?;
         let second = modal_snapshot(&mut canopy)?;
 
-        assert!(!first.bindings.iter().any(|binding| binding.key == 'z'));
+        assert!(!first.bindings.iter().any(|binding| binding.input == 'z'));
         assert!(second.bindings.iter().any(|binding| {
-            binding.key == 'z'
+            binding.input == 'z'
                 && binding.scope == BindingScope::Default
                 && binding.description == "Added later"
         }));

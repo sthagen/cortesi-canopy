@@ -2,10 +2,14 @@
 //! Example widgets used by canopy demos.
 
 use canopy::{
-    Canopy, Loader, Widget,
+    CanopyBuilder, Context, FocusDirection, Loader, Widget,
     error::Result,
-    style::{Color, GradientSpec, GradientStop, Paint},
-    terminal::runloop,
+    layout::{LayoutOverride, Sizing},
+    style::{
+        AttrSet, Color, GradientSpec, GradientStop, Paint, StyleBuilder, StyleRules,
+        canopy as palette,
+    },
+    terminal::{RunOptions, runloop_with_options},
 };
 use canopy_widgets::Root;
 
@@ -13,12 +17,11 @@ use canopy_widgets::Root;
 const HELP_BINDING: &str = r#"
 function setup()
     canopy.bind("?", {
-        description = "Show key bindings",
         path = "/root/**/",
+        phase = "before_widget",
         tier = "global",
-    }, function()
-        root.toggle_help()
-    end)
+        description = "Show key bindings",
+    }, command.root.toggle_help())
 end
 "#;
 
@@ -51,13 +54,6 @@ pub mod widget;
 /// Widget editor example nodes.
 pub mod widget_editor;
 
-/// Finalize and print the Luau API definitions for a demo app.
-pub fn print_luau_api(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.finalize_api()?;
-    print!("{}", cnpy.script_api()?);
-    Ok(())
-}
-
 /// Build a four-stop gradient paint at a fixed angle, evenly weighted toward
 /// the tail.
 pub(crate) fn banner_gradient(angle_deg: f32, colors: [Color; 4]) -> Paint {
@@ -72,79 +68,134 @@ pub(crate) fn banner_gradient(angle_deg: f32, colors: [Color; 4]) -> Paint {
     ))
 }
 
+/// Scroll a context by one line in the given direction.
+pub(crate) fn scroll_in(c: &mut dyn Context, dir: FocusDirection) {
+    match dir {
+        FocusDirection::Up | FocusDirection::Prev => c.scroll_up(),
+        FocusDirection::Down | FocusDirection::Next => c.scroll_down(),
+        FocusDirection::Left => c.scroll_left(),
+        FocusDirection::Right => c.scroll_right(),
+    };
+}
+
+/// Page a context by a signed delta; negative moves up, positive moves down.
+pub(crate) fn page_by(c: &mut dyn Context, delta: i32) {
+    if delta < 0 {
+        c.page_up();
+    } else if delta > 0 {
+        c.page_down();
+    }
+}
+
+/// Add the standard normal and selected entry rules under a path prefix.
+pub(crate) fn selectable_entry_styles<'a>(rules: StyleRules<'a>, prefix: &str) -> StyleRules<'a> {
+    let selected_attrs = AttrSet {
+        bold: true,
+        ..AttrSet::default()
+    };
+    let normal = StyleBuilder::new().fg(palette::TEXT).bg(palette::BG);
+    let selected = StyleBuilder::new()
+        .fg(palette::BG)
+        .bg(palette::ACCENT)
+        .attrs(selected_attrs);
+    rules
+        .prefix(prefix)
+        .style_all(&["border", "fill", "text"], normal)
+        .style_all(
+            &["selected/border", "selected/fill", "selected/text"],
+            selected,
+        )
+}
+
 /// Binding template for a full-window scrollable demo.
 ///
 /// `{receiver}` is the Luau command owner. `{path}` is the binding path.
 const TEXT_SCROLL_BINDINGS: &str = r#"
-canopy.bind("g", { path = "{path}", description = "Top" }, function()
-    {receiver}.scroll_to(0, 0)
-end)
-canopy.bind("j", { path = "{path}", description = "Scroll down" }, function()
-    {receiver}.scroll("Down")
-end)
-canopy.bind("Down", { path = "{path}", description = "Scroll down" }, function()
-    {receiver}.scroll("Down")
-end)
-canopy.bind_mouse("ScrollDown", { path = "{path}", description = "Scroll down" }, function()
-    {receiver}.scroll("Down")
-end)
-canopy.bind("k", { path = "{path}", description = "Scroll up" }, function()
-    {receiver}.scroll("Up")
-end)
-canopy.bind("Up", { path = "{path}", description = "Scroll up" }, function()
-    {receiver}.scroll("Up")
-end)
-canopy.bind_mouse("ScrollUp", { path = "{path}", description = "Scroll up" }, function()
-    {receiver}.scroll("Up")
-end)
-canopy.bind("h", { path = "{path}", description = "Scroll left" }, function()
-    {receiver}.scroll("Left")
-end)
-canopy.bind("Left", { path = "{path}", description = "Scroll left" }, function()
-    {receiver}.scroll("Left")
-end)
-canopy.bind("l", { path = "{path}", description = "Scroll right" }, function()
-    {receiver}.scroll("Right")
-end)
-canopy.bind("Right", { path = "{path}", description = "Scroll right" }, function()
-    {receiver}.scroll("Right")
-end)
-canopy.bind("PageDown", { path = "{path}", description = "Page down" }, function()
-    {receiver}.page(1)
-end)
-canopy.bind("Space", { path = "{path}", description = "Page down" }, function()
-    {receiver}.page(1)
-end)
-canopy.bind("PageUp", { path = "{path}", description = "Page up" }, function()
-    {receiver}.page(-1)
-end)
-canopy.bind("q", { path = "root", description = "Quit" }, function()
-    root.quit()
-end)
+canopy.keymap({
+    path = "{path}",
+    { key = "g", description = "Top", action = command.{receiver}.scroll_to(0, 0) },
+    {
+        key = { "j", "Down" },
+        mouse = "ScrollDown",
+        description = "Scroll down",
+        action = command.{receiver}.scroll("Down"),
+    },
+    {
+        key = { "k", "Up" },
+        mouse = "ScrollUp",
+        description = "Scroll up",
+        action = command.{receiver}.scroll("Up"),
+    },
+    { key = { "h", "Left" }, description = "Scroll left", action = command.{receiver}.scroll("Left") },
+    { key = { "l", "Right" }, description = "Scroll right", action = command.{receiver}.scroll("Right") },
+    { key = { "PageDown", "Space" }, description = "Page down", action = command.{receiver}.page(1) },
+    { key = "PageUp", description = "Page up", action = command.{receiver}.page(-1) },
+})
+canopy.bind("q", { path = "root", description = "Quit" }, command.root.quit())
 "#;
 
 /// Render the shared scroll bindings for one receiver and binding path.
-pub fn text_scroll_bindings(receiver: &str, path: &str) -> String {
+pub(crate) fn text_scroll_bindings(receiver: &str, path: &str) -> String {
     TEXT_SCROLL_BINDINGS
         .replace("{receiver}", receiver)
         .replace("{path}", path)
 }
 
-/// Build a `Canopy` for a demo launcher, with `Root` loaded and the help
-/// binding installed.
-pub fn demo_canopy() -> Result<Canopy> {
-    let mut cnpy = Canopy::new();
-    Root::load(&mut cnpy)?;
-    cnpy.register_startup_script("examples-help", HELP_BINDING)?;
-    Ok(cnpy)
+/// Start demo registration with Root and its first-preparation help setup.
+#[must_use]
+pub fn demo_canopy() -> CanopyBuilder {
+    CanopyBuilder::new().configure(|cnpy| {
+        Root::load(cnpy)?;
+        cnpy.register_startup_script("examples-help", HELP_BINDING)
+    })
 }
 
 /// Install one demo app under a root and run the terminal loop.
-pub fn run_demo<T: Widget + 'static>(mut cnpy: Canopy, app: T, inspector: bool) -> Result<i32> {
-    Root::install_app_with_inspector(&mut cnpy, app, inspector)?;
-    cnpy.run_startup_scripts()?;
-    runloop(cnpy)
+pub fn run_demo<T: Widget + 'static>(
+    builder: CanopyBuilder,
+    app: T,
+    inspector: bool,
+) -> Result<i32> {
+    run_demo_with_options(builder, app, inspector, RunOptions::default())
+}
+
+/// Install a demo and run it with explicit terminal interrupt behavior.
+pub fn run_demo_with_options<T: Widget + 'static>(
+    builder: CanopyBuilder,
+    app: T,
+    inspector: bool,
+    options: RunOptions,
+) -> Result<i32> {
+    let canopy = builder
+        .assemble(move |cnpy| {
+            Root::new().with_inspector(inspector).install(cnpy, app)?;
+            Ok(())
+        })
+        .build()?;
+    runloop_with_options(canopy, options)
 }
 
 #[cfg(test)]
 mod tests;
+
+/// Override a column child to fill the width at a fixed outer height.
+pub(crate) fn fixed_row(height: u32) -> LayoutOverride {
+    LayoutOverride {
+        height: Some(Sizing::Measure),
+        ..LayoutOverride::new()
+            .flex_horizontal(1)
+            .fixed_height(height)
+    }
+}
+
+/// Override a column child to fill the width and share the remaining height by
+/// `weight`, without height bounds.
+pub(crate) fn flex_row(weight: u32) -> LayoutOverride {
+    LayoutOverride {
+        min_height: Some(None),
+        max_height: Some(None),
+        ..LayoutOverride::new()
+            .flex_horizontal(1)
+            .flex_vertical(weight)
+    }
+}

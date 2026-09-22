@@ -1,7 +1,7 @@
 //! Grid test utility for creating configurable grid layouts.
 
 use crate::{
-    Canopy, Context, NodeId, ViewContext, derive_commands,
+    Canopy, Context, ContextExt, NodeId, ViewContext,
     error::Result,
     geom::Size,
     layout::{Layout, Sizing},
@@ -28,7 +28,6 @@ struct GridNode {
     kind: GridKind,
 }
 
-#[derive_commands]
 impl GridNode {
     /// Construct a new grid node.
     fn new(name: String, kind: GridKind) -> Self {
@@ -81,7 +80,7 @@ pub struct Grid {
 }
 
 impl Grid {
-    /// Build a grid, attach it under the root, and size the root to hold it.
+    /// Build and prepare a grid with the root sized to hold it.
     pub fn install(canopy: &mut Canopy, recursion: usize, divisions: usize) -> Result<Self> {
         let grid = canopy.with_root_context(|context| {
             let grid_root = build_node(context, 0, 0, recursion, divisions)?;
@@ -99,6 +98,7 @@ impl Grid {
             })
         })?;
         canopy.set_root_size(grid.expected_size())?;
+        canopy.turn(crate::Work::Prepare)?;
         Ok(grid)
     }
 

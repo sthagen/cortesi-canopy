@@ -1,12 +1,12 @@
 //! Selector widget for multi-value selection with checkbox-style items.
 
 use canopy::{
-    Context, EventOutcome, ViewContext, Widget, command, derive_commands,
+    Context, EventOutcome, NodeName, Render, RevealAlign, ViewContext, Widget, derive_commands,
     error::Result,
     event::{Event, mouse},
-    layout::{MeasureConstraints, Measurement, Size},
-    render::Render,
-    state::NodeName,
+    geom::{Rect, Size},
+    layout::{MeasureConstraints, Measurement},
+    text,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -16,6 +16,7 @@ use crate::label::Label;
 ///
 /// Items can be toggled on/off independently. The selected indices are tracked
 /// in the order they were selected, allowing for ordered selection if needed.
+/// Navigation scrolls the focused row into view after layout.
 pub struct Selector<T>
 where
     T: Label,
@@ -70,7 +71,7 @@ where
 
     /// Move focus by a signed offset.
     #[command]
-    pub fn select_by(&mut self, _c: &mut dyn Context, delta: i32) -> Result<()> {
+    pub fn select_by(&mut self, c: &mut dyn Context, delta: i32) -> Result<()> {
         if self.items.is_empty() {
             return Ok(());
         }
@@ -79,15 +80,17 @@ where
             .focused
             .saturating_add_signed(delta as isize)
             .min(self.items.len() - 1);
+        self.reveal_focused(c);
         debug_assert!(self.selection_invariant_holds());
         Ok(())
     }
 
     /// Move focus to the first item.
     #[command]
-    pub fn select_first(&mut self, _c: &mut dyn Context) -> Result<()> {
+    pub fn select_first(&mut self, c: &mut dyn Context) -> Result<()> {
         if !self.items.is_empty() {
             self.focused = 0;
+            self.reveal_focused(c);
         }
         debug_assert!(self.selection_invariant_holds());
         Ok(())
@@ -95,9 +98,10 @@ where
 
     /// Move focus to the last item.
     #[command]
-    pub fn select_last(&mut self, _c: &mut dyn Context) -> Result<()> {
+    pub fn select_last(&mut self, c: &mut dyn Context) -> Result<()> {
         if !self.items.is_empty() {
             self.focused = self.items.len() - 1;
+            self.reveal_focused(c);
         }
         debug_assert!(self.selection_invariant_holds());
         Ok(())
@@ -111,14 +115,23 @@ where
         Ok(())
     }
 
+    /// Reveal the focused row without changing horizontal scroll.
+    fn reveal_focused(&self, c: &mut dyn Context) {
+        c.reveal_area(
+            Rect::new(c.view().scroll.x, self.focused as u32, 1, 1),
+            RevealAlign::Nearest,
+        );
+    }
+
     /// Focus and toggle the clicked row.
     fn handle_click(&mut self, c: &mut dyn Context, event: mouse::MouseEvent) -> Result<()> {
         if event.action != mouse::Action::Down || event.button != mouse::Button::Left {
             return Ok(());
         }
-        let clicked_row = event.location.y as usize;
-        if clicked_row < self.items.len() {
-            self.focused = clicked_row;
+        if let Some(point) = c.view().content_point(event.location)
+            && (point.y as usize) < self.items.len()
+        {
+            self.focused = point.y as usize;
             self.toggle(c)?;
         }
         Ok(())
@@ -166,7 +179,8 @@ where
         if let Event::Mouse(mouse_event) = event {
             self.handle_click(ctx, *mouse_event)?;
         }
-        // Ignore so mouse bindings can also fire, for example to trigger effects.
+        // Ignore so mouse bindings can also fire, for example to trigger
+        // effects.
         Ok(EventOutcome::Ignore)
     }
 
@@ -175,8 +189,8 @@ where
         let rect = view.view_rect_local();
         let is_widget_focused = ctx.is_focused();
 
-        for (idx, item) in self.items.iter().enumerate() {
-            let Ok(row) = u32::try_from(idx) else {
+        for (idx, item) in self.items.iter().enumerate().skip(view.scroll.y as usize) {
+            let Ok(row) = u32::try_from(idx - view.scroll.y as usize) else {
                 break;
             };
             if row >= rect.h {
@@ -190,20 +204,22 @@ where
             // Checkbox prefix
             let prefix = if is_selected { "[x] " } else { "[ ] " };
             let display = format!("{}{}", prefix, label);
+            let (display, _) =
+                text::slice_by_columns(&display, view.scroll.x as usize, rect.w as usize);
 
             // Show focus highlight only when the widget has focus
             if is_item_focused && is_widget_focused {
                 // Focused item - highlight background
-                rndr.fill("selector/focus", line_rect.into(), ' ')?;
+                rndr.fill("selector/focus", line_rect.rect(), ' ')?;
                 if is_selected {
-                    rndr.text("selector/focus/selected", line_rect, &display)?;
+                    rndr.text("selector/focus/selected", line_rect, display)?;
                 } else {
-                    rndr.text("selector/focus", line_rect, &display)?;
+                    rndr.text("selector/focus", line_rect, display)?;
                 }
             } else if is_selected {
-                rndr.text("selector/selected", line_rect, &display)?;
+                rndr.text("selector/selected", line_rect, display)?;
             } else {
-                rndr.text("selector", line_rect, &display)?;
+                rndr.text("selector", line_rect, display)?;
             }
         }
 
@@ -256,8 +272,8 @@ mod tests {
         assert!(selector.selected.is_empty());
 
         // Toggle focused item (index 0)
-        // Note: We can't easily call commands without a Context, so test the logic
-        // directly
+        // Note: We can't easily call commands without a Context, so test the
+        // logic directly
         selector.selected.push(0);
         assert!(selector.selected.contains(&0));
         assert_eq!(selector.selected.len(), 1);

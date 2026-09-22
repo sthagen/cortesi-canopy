@@ -1,10 +1,90 @@
 use quote::quote;
-use syn::{ImplItem, ItemImpl};
+use syn::{FnArg, ImplItem, ItemImpl, ReceiverKind, ReturnType, Type};
 
 use crate::{
     model::{CommandMeta, ParamKind, ParamMeta, ReturnKind, ReturnMeta, UserBindingSource},
-    parse::{owner_name, parse_command_method},
+    parse::{
+        cfg_attributes, extract_result_type, is_context_ref, owner_name, parse_command_method,
+    },
 };
+
+/// Validate enabled hooks at their declarations so failures point to the
+/// method that must change instead of generated adapter code.
+fn validate_enabled_hooks(input: &ItemImpl, commands: &[CommandMeta]) -> syn::Result<()> {
+    for command in commands {
+        // The proc macro runs before cfg expansion, so a disabled command can
+        // legitimately name a hook (and types) that do not exist in this
+        // build. Active conditional commands are still checked by the
+        // generated status adapter.
+        if !command.cfg_attrs.is_empty() {
+            continue;
+        }
+        let Some(enabled) = &command.enabled else {
+            continue;
+        };
+        let Some(method) = input.items.iter().find_map(|item| match item {
+            ImplItem::Fn(method) if method.sig.ident == *enabled => Some(method),
+            _ => None,
+        }) else {
+            return Err(syn::Error::new_spanned(
+                enabled,
+                "enabled hook must name a method in the same impl",
+            ));
+        };
+
+        let mut inputs = method.sig.inputs.iter();
+        let Some(FnArg::Receiver(receiver)) = inputs.next() else {
+            return Err(syn::Error::new_spanned(
+                &method.sig,
+                "enabled hook must take &self and &dyn ViewContext",
+            ));
+        };
+        if !matches!(receiver.kind, ReceiverKind::Reference(_, _, None)) {
+            return Err(syn::Error::new_spanned(
+                receiver,
+                "enabled hook receiver must be &self",
+            ));
+        }
+        let Some(FnArg::Typed(context)) = inputs.next() else {
+            return Err(syn::Error::new_spanned(
+                &method.sig,
+                "enabled hook must take &dyn ViewContext after &self",
+            ));
+        };
+        if inputs.next().is_some() || is_context_ref(&context.ty, "ViewContext") != Some(false) {
+            return Err(syn::Error::new_spanned(
+                context,
+                "enabled hook must take exactly one &dyn ViewContext argument",
+            ));
+        }
+        if !is_command_status_result(&method.sig.output) {
+            return Err(syn::Error::new_spanned(
+                &method.sig.output,
+                "enabled hook must return Result<CommandStatus>",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return whether a hook output is a `Result` whose success type is
+/// `CommandStatus`.
+fn is_command_status_result(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    extract_result_type(ty).is_some_and(|inner| {
+        matches!(
+            inner,
+            Type::Path(path)
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "CommandStatus")
+        )
+    })
+}
 
 /// Render an `Option<&str>` metadata field from an optional string.
 fn opt_str_tokens(value: Option<&str>) -> proc_macro2::TokenStream {
@@ -47,6 +127,12 @@ impl ParamMeta {
             }
             ParamKind::Context { .. } => return None,
         };
+        let requirement = if self.kind == ParamKind::Injected {
+            let ty = &self.ty;
+            quote! { Some(<#ty as canopy::commands::Inject>::requirement) }
+        } else {
+            quote! { None }
+        };
         let name = self.name_lit();
         let ty = self.ty_lit();
         let optional = self.is_option;
@@ -63,6 +149,7 @@ impl ParamMeta {
                     doc: #doc,
                 },
                 optional: #optional,
+                requirement: #requirement,
             }
         })
     }
@@ -233,6 +320,14 @@ impl CommandMeta {
         )
     }
 
+    /// Identifier for the generated argument check.
+    fn check_ident(&self) -> syn::Ident {
+        syn::Ident::new(
+            &format!("__canopy_cmd_check_{}", self.name),
+            proc_macro2::Span::call_site(),
+        )
+    }
+
     /// Identifier for the generated parameter spec constant.
     fn params_const_ident(&self) -> syn::Ident {
         syn::Ident::new(
@@ -261,6 +356,14 @@ impl CommandMeta {
     fn accessor_ident(&self) -> syn::Ident {
         syn::Ident::new(
             &format!("cmd_{}", self.name),
+            proc_macro2::Span::call_site(),
+        )
+    }
+
+    /// Identifier for the erased read-only eligibility shim.
+    fn status_ident(&self) -> syn::Ident {
+        syn::Ident::new(
+            &format!("__canopy_cmd_status_{}", self.name),
             proc_macro2::Span::call_site(),
         )
     }
@@ -350,7 +453,67 @@ impl CommandMeta {
     /// Render a reference to this command's spec constant.
     fn spec_ref_tokens(&self) -> proc_macro2::TokenStream {
         let spec_const_ident = self.spec_const_ident();
-        quote! { &Self::#spec_const_ident }
+        let cfg_attrs = &self.cfg_attrs;
+        quote! { #(#cfg_attrs)* &Self::#spec_const_ident }
+    }
+
+    /// Render the positional arity check shared by invoke and check.
+    fn arity_check_tokens(&self) -> proc_macro2::TokenStream {
+        let (min_required, max_allowed) = self.arity_bounds();
+        quote! {
+            let got = values.len();
+            let expected_min = #min_required;
+            let expected_max = #max_allowed;
+            if got < expected_min || got > expected_max {
+                let expected = if got < expected_min {
+                    expected_min
+                } else {
+                    expected_max
+                };
+                return Err(canopy::commands::CommandError::ArityMismatch {
+                    expected,
+                    got,
+                });
+            }
+        }
+    }
+
+    /// Render the generated argument check for this command.
+    ///
+    /// The check shares the arity bounds and parameter conversions of the
+    /// invoke shim, and it needs no target, context, or call.
+    fn check_tokens(&self) -> proc_macro2::TokenStream {
+        let check_ident = self.check_ident();
+        let names_const_ident = self.names_const_ident();
+        let positional_bindings = self.positional_bindings();
+        let named_bindings = self.named_bindings();
+        let arity_check = self.arity_check_tokens();
+
+        quote! {
+            #[allow(unused_variables)]
+            fn #check_ident(
+                args: &canopy::commands::CommandArgs,
+            ) -> ::std::result::Result<(), canopy::commands::CommandError>
+            where
+                Self: 'static,
+            {
+                match args {
+                    canopy::commands::CommandArgs::Positional(values) => {
+                        #arity_check
+                        #(#positional_bindings)*
+                        Ok(())
+                    }
+                    canopy::commands::CommandArgs::Named(values) => {
+                        let normalized = canopy::commands::normalize_named_args(
+                            values,
+                            Self::#names_const_ident,
+                        )?;
+                        #(#named_bindings)*
+                        Ok(())
+                    }
+                }
+            }
+        }
     }
 
     /// Render the generated invoke function for this command.
@@ -361,7 +524,7 @@ impl CommandMeta {
         let mutable_context_bindings = self.mutable_context_bindings();
         let positional_bindings = self.positional_bindings();
         let named_bindings = self.named_bindings();
-        let (min_required, max_allowed) = self.arity_bounds();
+        let arity_check = self.arity_check_tokens();
         let target_ident = syn::Ident::new("target", proc_macro2::Span::call_site());
         let method_ident = self.name_ident();
         let call_args = self.call_args();
@@ -387,20 +550,7 @@ impl CommandMeta {
                 #(#shared_bindings)*
                 match &inv.args {
                     canopy::commands::CommandArgs::Positional(values) => {
-                        let got = values.len();
-                        let expected_min = #min_required;
-                        let expected_max = #max_allowed;
-                        if got < expected_min || got > expected_max {
-                            let expected = if got < expected_min {
-                                expected_min
-                            } else {
-                                expected_max
-                            };
-                            return Err(canopy::commands::CommandError::ArityMismatch {
-                                expected,
-                                got,
-                            });
-                        }
+                        #arity_check
                         #(#positional_bindings)*
                         #(#mutable_context_bindings)*
                         #call_tokens
@@ -446,11 +596,18 @@ impl CommandMeta {
         let spec_const_ident = self.spec_const_ident();
         let params_const_ident = self.params_const_ident();
         let invoke_ident = self.invoke_ident();
+        let check_ident = self.check_ident();
         let id = self.command_id();
         let name = &self.name;
         let owner = &self.owner;
         let ret = self.ret.spec_tokens(self.ignore_result);
         let doc = opt_str_tokens(self.doc.as_deref());
+        let status = if self.enabled.is_some() {
+            let status_ident = self.status_ident();
+            quote! { Some(Self::#status_ident) }
+        } else {
+            quote! { None }
+        };
 
         quote! {
             const #spec_const_ident: canopy::commands::CommandSpec = canopy::commands::CommandSpec {
@@ -461,6 +618,8 @@ impl CommandMeta {
                 ret: #ret,
                 doc: #doc,
                 invoke: Self::#invoke_ident,
+                check: Self::#check_ident,
+                status: #status,
             };
         }
     }
@@ -477,26 +636,72 @@ impl CommandMeta {
         }
     }
 
+    /// Render a positional call builder with the original user parameter types.
+    fn call_builder_tokens(&self) -> proc_macro2::TokenStream {
+        let builder_ident = syn::Ident::new(
+            &format!("call_{}", self.name),
+            proc_macro2::Span::call_site(),
+        );
+        let accessor = self.accessor_ident();
+        let params = self.user_params();
+        let names: Vec<&syn::Ident> = params.iter().map(|param| &param.user_ident).collect();
+        let types = params.iter().map(|param| &param.ty);
+        quote! {
+            #[doc = "Build a positional call with typed user arguments."]
+            pub fn #builder_ident(#(#names: #types),*) -> canopy::commands::CommandCall {
+                Self::#accessor().call_with(canopy::commands::CommandArgs::Positional(vec![
+                    #(canopy::commands::ToArgValue::to_arg_value(#names)),*
+                ]))
+            }
+        }
+    }
+
+    /// Render the checked immutable target adapter for an eligibility method.
+    fn status_tokens(&self) -> proc_macro2::TokenStream {
+        let Some(method) = &self.enabled else {
+            return quote! {};
+        };
+        let status_ident = self.status_ident();
+        quote! {
+            fn #status_ident(
+                target: &dyn ::std::any::Any,
+                ctx: &dyn canopy::ViewContext,
+            ) -> canopy::error::Result<canopy::commands::CommandStatus>
+            where
+                Self: 'static,
+            {
+                let target = target.downcast_ref::<Self>().ok_or_else(|| {
+                    canopy::error::Error::Invalid("command status target type mismatch".into())
+                })?;
+                target.#method(ctx)
+            }
+        }
+    }
+
     /// Render all generated impl items for this command.
     fn generated_items(&self) -> proc_macro2::TokenStream {
-        let names = self.names_const_tokens();
-        let params = self.params_const_tokens();
-        let invoke = self.invoke_tokens();
-        let spec = self.spec_const_tokens();
-        let accessor = self.accessor_tokens();
-        quote! {
-            #names
-            #params
-            #invoke
-            #spec
-            #accessor
-        }
+        let cfg_attrs = &self.cfg_attrs;
+        [
+            self.names_const_tokens(),
+            self.params_const_tokens(),
+            self.invoke_tokens(),
+            self.check_tokens(),
+            self.spec_const_tokens(),
+            self.accessor_tokens(),
+            self.call_builder_tokens(),
+            self.status_tokens(),
+        ]
+        .into_iter()
+        .filter(|item| !item.is_empty())
+        .map(|item| quote! { #(#cfg_attrs)* #item })
+        .collect()
     }
 }
 
 /// Generate command metadata and wrappers for `#[command]` methods in an impl
 /// block.
 pub fn expand_derive_commands(input: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+    let cfg_attrs = cfg_attributes(&input.attrs)?;
     let owner = owner_name(input)?;
     let name = input.self_ty.clone();
     let (impl_generics, _, where_clause) = input.generics.split_for_impl();
@@ -509,6 +714,7 @@ pub fn expand_derive_commands(input: &ItemImpl) -> syn::Result<proc_macro2::Toke
             commands.push(command);
         }
     }
+    validate_enabled_hooks(input, &commands)?;
 
     let mut generated = proc_macro2::TokenStream::new();
     let mut spec_refs = Vec::new();
@@ -516,6 +722,13 @@ pub fn expand_derive_commands(input: &ItemImpl) -> syn::Result<proc_macro2::Toke
     for command in &commands {
         spec_refs.push(command.spec_ref_tokens());
         generated.extend(command.generated_items());
+    }
+
+    let mut cleaned_input = input.clone();
+    for item in &mut cleaned_input.items {
+        if let ImplItem::Fn(method) = item {
+            method.attrs.retain(|attr| !attr.path().is_ident("command"));
+        }
     }
 
     let commands_const_ident = syn::Ident::new("__CANOPY_COMMANDS", proc_macro2::Span::call_site());
@@ -526,12 +739,14 @@ pub fn expand_derive_commands(input: &ItemImpl) -> syn::Result<proc_macro2::Toke
     });
 
     Ok(quote! {
-        #input
+        #cleaned_input
 
+        #(#cfg_attrs)*
         impl #impl_generics #name #where_clause {
             #generated
         }
 
+        #(#cfg_attrs)*
         impl #impl_generics canopy::commands::CommandNode for #name #where_clause {
             fn commands() -> &'static [&'static canopy::commands::CommandSpec] {
                 Self::#commands_const_ident

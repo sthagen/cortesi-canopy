@@ -1,17 +1,14 @@
 use std::mem;
 
 use canopy::{
-    Context, EventOutcome,
+    Context, EventOutcome, Render,
     error::Result,
     event::{Event, key},
     geom::{Line, Point, Rect},
-    render::Render,
 };
 
-use super::{
-    Selection, TextBuffer, TextPosition, TextRange,
-    widget::{Editor, prompt_text},
-};
+use super::widget::{Editor, prompt_text};
+use crate::text_buffer::{Selection, TextBuffer, TextPosition, TextRange};
 
 /// Search direction for navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +32,8 @@ pub struct SearchState {
     current: Option<usize>,
     /// Buffer revision that matches were computed for.
     revision: u64,
+    /// Whether matching ignores ASCII case.
+    ignore_case: bool,
 }
 
 impl SearchState {
@@ -46,6 +45,7 @@ impl SearchState {
             matches: Vec::new(),
             current: None,
             revision: 0,
+            ignore_case: false,
         }
     }
 
@@ -58,6 +58,7 @@ impl SearchState {
     ) {
         self.query = query.into();
         self.direction = direction;
+        self.ignore_case = false;
         self.recompute(buffer);
         self.current = if self.matches.is_empty() {
             None
@@ -68,11 +69,94 @@ impl SearchState {
         };
     }
 
+    /// Set a forward query with smart case, and make the first match at or
+    /// after `from` current.
+    ///
+    /// A query without uppercase letters ignores ASCII case. When no match
+    /// follows `from`, the search wraps to the first match.
+    pub fn set_smart_query(
+        &mut self,
+        buffer: &TextBuffer,
+        query: impl Into<String>,
+        from: TextPosition,
+    ) {
+        self.query = query.into();
+        self.direction = SearchDirection::Forward;
+        self.ignore_case = !self.query.chars().any(char::is_uppercase);
+        self.recompute(buffer);
+        self.current = (!self.matches.is_empty()).then(|| {
+            self.matches
+                .iter()
+                .position(|range| {
+                    (range.start.line, range.start.column) >= (from.line, from.column)
+                })
+                .unwrap_or(0)
+        });
+    }
+
+    /// Install precomputed match ranges, making the first match at or after
+    /// `from` current.
+    ///
+    /// The ranges must arrive in ascending order without spanning lines, the
+    /// way [`find_matches`] produces them, because the per-line renderer
+    /// locates one line's slice by partition points. The query stays empty:
+    /// the buffer is read-only under an installed set, and a new buffer
+    /// replaces the search state outright, so no recompute can clobber these
+    /// ranges. When no match follows `from`, the search wraps to the first.
+    pub fn set_matches(
+        &mut self,
+        buffer: &TextBuffer,
+        matches: Vec<TextRange>,
+        from: TextPosition,
+    ) {
+        debug_assert!(
+            matches.windows(2).all(|pair| {
+                (pair[0].start.line, pair[0].start.column)
+                    <= (pair[1].start.line, pair[1].start.column)
+            }),
+            "installed matches must arrive in ascending order"
+        );
+        self.query.clear();
+        self.direction = SearchDirection::Forward;
+        self.ignore_case = false;
+        self.matches = matches;
+        self.revision = buffer.revision();
+        self.current = (!self.matches.is_empty()).then(|| {
+            self.matches
+                .iter()
+                .position(|range| {
+                    (range.start.line, range.start.column) >= (from.line, from.column)
+                })
+                .unwrap_or(0)
+        });
+    }
+
+    /// Return the number of matches.
+    pub fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    /// Return all match ranges in ascending order.
+    pub fn matches(&self) -> &[TextRange] {
+        &self.matches
+    }
+
+    /// Return the index of the current match.
+    pub fn current_index(&self) -> Option<usize> {
+        self.current
+    }
+
     /// Update match cache if the buffer changed.
     pub fn update(&mut self, buffer: &TextBuffer) {
         if self.query.is_empty() {
-            self.matches.clear();
-            self.current = None;
+            // Without a query there is nothing to recompute. An installed
+            // match set pins its revision, so a matching revision keeps it;
+            // only a changed buffer drops it. Clearing an already empty set
+            // is a no-op either way, so no existing flow changes behavior.
+            if self.revision != buffer.revision() {
+                self.matches.clear();
+                self.current = None;
+            }
             return;
         }
         if self.revision != buffer.revision() {
@@ -100,14 +184,17 @@ impl SearchState {
     }
 
     /// Return match ranges for a line.
-    pub fn matches_for_line(&self, line: usize) -> Vec<(usize, usize)> {
-        let mut ranges = Vec::new();
-        for range in &self.matches {
-            if range.start.line == line {
-                ranges.push((range.start.column, range.end.column));
-            }
-        }
-        ranges
+    ///
+    /// Matches are stored in ascending order, so the slice for one line is
+    /// located with two partition points and borrowed without allocating.
+    pub fn matches_for_line(&self, line: usize) -> &[TextRange] {
+        let start = self
+            .matches
+            .partition_point(|range| range.start.line < line);
+        let end = self
+            .matches
+            .partition_point(|range| range.start.line <= line);
+        &self.matches[start..end]
     }
 
     /// Move to the next match and return its position.
@@ -138,21 +225,61 @@ impl SearchState {
 
     /// Recompute match cache for the current query.
     fn recompute(&mut self, buffer: &TextBuffer) {
-        self.matches = find_matches(buffer, &self.query);
+        self.matches = find_matches_in(
+            buffer,
+            &self.query,
+            TextPosition::new(0, 0),
+            self.ignore_case,
+        );
         self.revision = buffer.revision();
     }
 }
 
 /// Find text matches for a query within the buffer.
 pub fn find_matches(buffer: &TextBuffer, query: &str) -> Vec<TextRange> {
+    find_matches_from(buffer, query, TextPosition::new(0, 0))
+}
+
+/// Find matches entirely within the suffix beginning at a character position.
+fn find_matches_from(buffer: &TextBuffer, query: &str, start: TextPosition) -> Vec<TextRange> {
+    find_matches_in(buffer, query, start, false)
+}
+
+/// Find matches within the suffix beginning at a character position,
+/// optionally ignoring ASCII case.
+///
+/// ASCII case folding keeps every byte offset, so match columns index the
+/// original text.
+fn find_matches_in(
+    buffer: &TextBuffer,
+    query: &str,
+    start: TextPosition,
+    ignore_case: bool,
+) -> Vec<TextRange> {
     if query.is_empty() || query.contains('\n') {
         return Vec::new();
     }
+    let folded_query;
+    let query = if ignore_case {
+        folded_query = query.to_ascii_lowercase();
+        folded_query.as_str()
+    } else {
+        query
+    };
 
     let mut out = Vec::new();
-    for line_idx in 0..buffer.line_count() {
-        let line = buffer.line_text(line_idx);
-        let mut offset = 0usize;
+    for line_idx in start.line..buffer.line_count() {
+        let mut line = buffer.line_text(line_idx);
+        if ignore_case {
+            line.make_ascii_lowercase();
+        }
+        let mut offset = if line_idx == start.line {
+            line.char_indices()
+                .nth(start.column)
+                .map_or(line.len(), |(offset, _)| offset)
+        } else {
+            0
+        };
         while let Some(found) = line[offset..].find(query) {
             let byte_start = offset.saturating_add(found);
             let byte_end = byte_start.saturating_add(query.len());
@@ -191,6 +318,56 @@ mod tests {
         assert_ne!(first, second);
         let back = state.move_next(&buffer, true).unwrap();
         assert_eq!(back, first);
+    }
+
+    #[test]
+    fn installed_matches_make_the_first_match_at_or_after_from_current() {
+        let buffer = TextBuffer::new("one two one");
+        let ranges = find_matches(&buffer, "one");
+        assert_eq!(ranges.len(), 2);
+        let mut state = SearchState::new();
+        state.set_matches(&buffer, ranges.clone(), TextPosition::new(0, 4));
+        assert_eq!(state.match_count(), 2);
+        assert_eq!(state.current_index(), Some(1));
+        assert_eq!(state.current_match(), Some(ranges[1]));
+    }
+
+    #[test]
+    fn installed_matches_wrap_and_survive_navigation() {
+        let buffer = TextBuffer::new("one two one");
+        let ranges = find_matches(&buffer, "one");
+        let mut state = SearchState::new();
+        state.set_matches(&buffer, ranges.clone(), TextPosition::new(0, 99));
+        assert_eq!(state.current_match(), Some(ranges[0]));
+        // The buffer did not change, so navigation keeps the installed set
+        // instead of recomputing a literal query.
+        state.move_next(&buffer, false);
+        assert_eq!(state.current_match(), Some(ranges[1]));
+        state.move_next(&buffer, false);
+        assert_eq!(state.current_match(), Some(ranges[0]));
+    }
+
+    #[test]
+    fn suffix_search_starts_before_nonoverlapping_match_collection() {
+        let buffer = TextBuffer::new("ééé");
+        assert_eq!(
+            find_matches_from(&buffer, "éé", TextPosition::new(0, 1)),
+            [TextRange::new(
+                TextPosition::new(0, 1),
+                TextPosition::new(0, 3)
+            )]
+        );
+        assert!(find_matches_from(&buffer, "é", TextPosition::new(0, 99)).is_empty());
+        assert!(find_matches_from(&buffer, "é", TextPosition::new(1, 0)).is_empty());
+        assert!(find_matches(&buffer, "").is_empty());
+    }
+
+    #[test]
+    fn crlf_and_lf_have_equivalent_search_matches() {
+        let lf = TextBuffer::new("ab\nab\n");
+        let crlf = TextBuffer::new("ab\r\nab\r\n");
+        assert_eq!(find_matches(&lf, "ab"), find_matches(&crlf, "ab"));
+        assert!(find_matches(&crlf, "\r").is_empty());
     }
 }
 
@@ -338,6 +515,11 @@ impl Editor {
 
     /// Handle y/n/a/q during replace confirmation.
     fn handle_replace_confirm(&mut self, c: char, ctx: &mut dyn Context) -> EventOutcome {
+        if self.config.read_only && matches!(self.prompt, Some(PromptState::ReplaceConfirm { .. }))
+        {
+            self.prompt = None;
+            return EventOutcome::Handle;
+        }
         let Some(PromptState::ReplaceConfirm {
             query,
             replacement,
@@ -351,17 +533,16 @@ impl Editor {
 
         match c {
             'y' => {
-                let query = query.clone();
-                let replacement = replacement.clone();
-                let matches = mem::take(matches);
-                let index = *index;
-                let (new_matches, next_index) =
-                    self.replace_match(&query, &replacement, matches, index, ctx);
-                if let Some(PromptState::ReplaceConfirm { matches, index, .. }) =
-                    self.prompt.as_mut()
-                {
-                    *matches = new_matches;
-                    *index = next_index;
+                if let Some(range) = matches.get(*index).copied() {
+                    let query = query.clone();
+                    let replacement = replacement.clone();
+                    let new_matches = self.replace_match(&query, &replacement, range, ctx);
+                    if let Some(PromptState::ReplaceConfirm { matches, index, .. }) =
+                        self.prompt.as_mut()
+                    {
+                        *matches = new_matches;
+                        *index = 0;
+                    }
                 }
             }
             'n' => {
@@ -393,11 +574,9 @@ impl Editor {
             let replacement = replacement.clone();
             let mut matches = mem::take(matches);
             let mut index = *index;
-            while index < matches.len() {
-                let (new_matches, next_index) =
-                    self.replace_match(&query, &replacement, matches, index, ctx);
-                matches = new_matches;
-                index = next_index;
+            while let Some(range) = matches.get(index).copied() {
+                matches = self.replace_match(&query, &replacement, range, ctx);
+                index = 0;
             }
             self.prompt = None;
             return EventOutcome::Handle;
@@ -409,28 +588,19 @@ impl Editor {
         EventOutcome::Handle
     }
 
-    /// Replace a match at an index and return updated matches and next index.
+    /// Replace a match range and return the remaining matches from the cursor.
     pub(super) fn replace_match(
         &mut self,
         query: &str,
         replacement: &str,
-        matches: Vec<TextRange>,
-        index: usize,
+        range: TextRange,
         ctx: &mut dyn Context,
-    ) -> (Vec<TextRange>, usize) {
-        let Some(range) = matches.get(index).copied() else {
-            return (matches, index);
-        };
+    ) -> Vec<TextRange> {
         self.buffer
             .set_selection(Selection::new(range.start, range.end));
         self.handle_insert_text(replacement);
         self.ensure_cursor_visible(ctx);
-        let updated = find_matches(&self.buffer, query);
-        let next_index = updated
-            .iter()
-            .position(|candidate| candidate.start > range.start)
-            .unwrap_or(updated.len());
-        (updated, next_index)
+        find_matches_from(&self.buffer, query, self.buffer.cursor())
     }
 
     /// Render the search/replace prompt overlay.

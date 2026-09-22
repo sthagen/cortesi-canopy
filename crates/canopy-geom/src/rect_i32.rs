@@ -1,4 +1,4 @@
-use super::{Point, PointI32, Rect};
+use super::{Point, PointI32, Rect, Size};
 
 /// A half-open rectangle with a signed origin and unsigned size.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
@@ -22,8 +22,13 @@ impl RectI32 {
     }
 
     /// Does this rect have a zero size?
-    pub fn is_zero(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.w == 0 || self.h == 0
+    }
+
+    /// Return the rectangle's dimensions without its origin.
+    pub const fn size(&self) -> Size {
+        Size::new(self.w, self.h)
     }
 
     /// Convert a screen point to local coordinates relative to this rect.
@@ -40,7 +45,7 @@ impl RectI32 {
     /// Intersect this signed rect with an unsigned rect in the same coordinate
     /// space.
     pub fn intersect_rect(&self, other: Rect) -> Option<Rect> {
-        if self.is_zero() || other.is_zero() {
+        if self.is_empty() || other.is_empty() {
             return None;
         }
         let other_left = i64::from(other.tl.x);
@@ -83,7 +88,10 @@ impl RectI32 {
         i64::from(self.tl.y) + i64::from(self.h)
     }
 
-    /// Center point of the rect.
+    /// Center point as widened coordinates.
+    ///
+    /// The tuple preserves centers beyond `i32` when a large unsigned size
+    /// extends from a signed origin.
     pub fn center(&self) -> (i64, i64) {
         (
             self.left() + i64::from(self.w) / 2,
@@ -157,7 +165,7 @@ mod tests {
             let signed = RectI32::new(x, y, w, h);
             let other = Rect::new(other_x, other_y, other_w, other_h);
             if let Some(intersection) = signed.intersect_rect(other) {
-                prop_assert!(!intersection.is_zero());
+                prop_assert!(!intersection.is_empty());
                 prop_assert!(other.contains_rect(intersection));
                 let x = i64::from(intersection.tl.x);
                 let y = i64::from(intersection.tl.y);

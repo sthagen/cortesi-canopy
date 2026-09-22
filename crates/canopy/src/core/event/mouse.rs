@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{event::key, geom::Point};
+use crate::{error::ParseError, event::key, geom::PointI32};
 
 /// An abstract specification for a mouse action.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -47,9 +47,27 @@ pub enum Action {
     ScrollRight,
 }
 
+/// Cells one wheel step scrolls.
+const WHEEL_STEP: i32 = 3;
+
 impl Action {
+    /// Return the scroll offset one wheel step requests, or `None` for
+    /// actions that do not scroll.
+    ///
+    /// Positive values move the view down or right.
+    pub fn scroll_delta(self) -> Option<PointI32> {
+        let (x, y) = match self {
+            Self::ScrollUp => (0, -WHEEL_STEP),
+            Self::ScrollDown => (0, WHEEL_STEP),
+            Self::ScrollLeft => (-WHEEL_STEP, 0),
+            Self::ScrollRight => (WHEEL_STEP, 0),
+            Self::Down | Self::Up | Self::Drag | Self::Moved => return None,
+        };
+        Some(PointI32 { x, y })
+    }
+
     /// Is this a button-driven action?
-    pub fn is_button(&self) -> bool {
+    fn is_button(&self) -> bool {
         match self {
             Self::Down => true,
             Self::Up => true,
@@ -75,8 +93,12 @@ impl From<MouseEvent> for Mouse {
 
 impl Mouse {
     /// Parse a mouse specification such as `ScrollUp` or `ctrl-LeftDown`.
-    pub fn parse_spec(spec: &str) -> Result<Self, String> {
-        let (modifiers, body) = key::parse_spec_parts(spec, &['-'])?;
+    ///
+    /// Modifiers separate with `-` or `+`, as they do for a key, so the label
+    /// [`Display`](fmt::Display) writes parses back to the same spec.
+    pub fn parse_spec(spec: &str) -> Result<Self, ParseError> {
+        let (modifiers, body) =
+            key::parse_spec_parts(spec, &['-', '+']).map_err(ParseError::new)?;
 
         let lower = body.to_ascii_lowercase();
         let action = [
@@ -91,7 +113,7 @@ impl Mouse {
         ]
         .into_iter()
         .find_map(|(suffix, action)| lower.ends_with(suffix).then_some((suffix, action)))
-        .ok_or_else(|| format!("unknown mouse action: {spec}"))?;
+        .ok_or_else(|| ParseError::new(format!("unknown mouse action: {spec}")))?;
 
         let button = match &body[..body.len() - action.0.len()] {
             "" => {
@@ -104,7 +126,7 @@ impl Mouse {
             prefix if prefix.eq_ignore_ascii_case("left") => Button::Left,
             prefix if prefix.eq_ignore_ascii_case("right") => Button::Right,
             prefix if prefix.eq_ignore_ascii_case("middle") => Button::Middle,
-            other => return Err(format!("unknown mouse button: {other}")),
+            other => return Err(ParseError::new(format!("unknown mouse button: {other}"))),
         };
 
         Ok(Self {
@@ -116,15 +138,21 @@ impl Mouse {
 }
 
 impl fmt::Display for Mouse {
+    /// Write the spec that [`Mouse::parse_spec`] reads back, such as
+    /// `Ctrl+LeftDown`.
+    ///
+    /// One label serves bindings, help, and script output, so it holds to the
+    /// spelling a binding is written in. It carries no space, which lets help
+    /// separate several inputs with one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.modifiers != key::Empty {
             write!(f, "{}+", self.modifiers)?;
         }
-        if matches!(self.button, Button::None) {
-            write!(f, "{:?}", self.action)
-        } else {
-            write!(f, "{:?} {:?}", self.button, self.action)
+        // A wheel or a move has no button, and naming `None` would not parse.
+        if !matches!(self.button, Button::None) {
+            write!(f, "{:?}", self.button)?;
         }
+        write!(f, "{:?}", self.action)
     }
 }
 
@@ -138,9 +166,19 @@ pub struct MouseEvent {
     pub button: Button,
     /// Keyboard modifiers.
     pub modifiers: key::Mods,
-    /// Cursor location in local coordinates relative to the node view. To map
-    /// back to screen coordinates, add the node view's outer top-left.
-    pub location: Point,
+    /// Cursor location.
+    ///
+    /// Incoming events carry screen coordinates. Events delivered to a widget
+    /// are relative to its content origin, before scroll. The location is
+    /// signed: a point in padding above or left of the content is negative, and
+    /// a captured event may lie anywhere. Use [`View::outer_point`],
+    /// [`View::viewport_point`], or [`View::content_point`] to find the cell
+    /// under the pointer in the space the widget paints.
+    ///
+    /// [`View::outer_point`]: crate::View::outer_point
+    /// [`View::viewport_point`]: crate::View::viewport_point
+    /// [`View::content_point`]: crate::View::content_point
+    pub location: PointI32,
 }
 
 #[cfg(test)]
@@ -161,7 +199,7 @@ mod tests {
             action: Action::Drag,
             button: Button::Middle,
             modifiers: key::Shift,
-            location: Point { x: 3, y: 4 },
+            location: PointI32 { x: 3, y: 4 },
         };
         assert_eq!(
             Mouse::from(event),
@@ -184,6 +222,33 @@ mod tests {
             Ok(spec(Action::Drag, Button::Middle, key::Shift))
         );
         assert!(Mouse::parse_spec("ctrl-nope").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_label_parses_back_to_the_spec_it_names() -> Result<()> {
+        for mouse in [
+            spec(Action::ScrollUp, Button::None, key::Empty),
+            spec(Action::Moved, Button::None, key::Shift),
+            spec(Action::Down, Button::Left, key::Empty),
+            spec(Action::Drag, Button::Middle, key::Ctrl + key::Shift),
+            spec(Action::Up, Button::Right, key::Alt),
+        ] {
+            let label = mouse.to_string();
+            assert!(
+                !label.contains(' '),
+                "a label carries no space, got {label:?}"
+            );
+            assert_eq!(Mouse::parse_spec(&label), Ok(mouse), "round trip {label:?}");
+        }
+        assert_eq!(
+            spec(Action::Down, Button::Left, key::Ctrl).to_string(),
+            "Ctrl+LeftDown"
+        );
+        assert_eq!(
+            spec(Action::ScrollDown, Button::None, key::Empty).to_string(),
+            "ScrollDown"
+        );
         Ok(())
     }
 }

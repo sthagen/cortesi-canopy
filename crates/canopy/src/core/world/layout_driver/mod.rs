@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use super::*;
 use crate::{
     core::view::View,
-    geom::{Point, Rect, RectI32, Size},
+    geom::{Point, PointI32, Rect, RectI32, Size},
     layout::{
         Align, CanvasChild, CanvasContext, Constraint, Direction as LayoutDirection, Display,
-        Layout, MeasureConstraints, Measurement, Sizing,
+        Layout, MeasureConstraints, MeasureOverflow, Measurement, Sizing,
     },
 };
 
@@ -16,16 +16,22 @@ impl Core {
         refresh_layouts(self)?;
         let root = self.root;
         let mut pass = LayoutPass::new(self);
-        pass.layout_node(root, screen_size, Overflow::none())?;
+        pass.layout_node(root, screen_size, Overflow::none(), Some(screen_size.w))?;
         let screen_view = View::new(
             RectI32::new(0, 0, screen_size.w, screen_size.h),
             RectI32::new(0, 0, screen_size.w, screen_size.h),
-            Point::zero(),
+            Point::ZERO,
             screen_size,
         );
         pass.update_views(root, screen_view)?;
 
+        // Focus recovery reads the published views. Reveals then run against
+        // the settled geometry, including the reveal of a recovered focus, and
+        // the views they move are published again.
         self.ensure_focus_valid(None)?;
+        if self.apply_reveals()? {
+            LayoutPass::new(self).update_views(root, screen_view)?;
+        }
         self.validate_invariants()?;
 
         Ok(())
@@ -34,15 +40,11 @@ impl Core {
     /// Locate the deepest node under a screen-space point.
     pub fn locate_node(&self, root: impl Into<NodeId>, point: Point) -> Result<Option<NodeId>> {
         let root = root.into();
-        let root_view = self
-            .nodes
-            .get(root)
-            .ok_or_else(|| Error::Internal("missing root node".into()))?
-            .view;
+        let root_view = self.nodes.get(root).ok_or(Error::NodeNotFound(root))?.view;
         let clip = root_view
             .outer
             .intersect_rect(Rect::new(0, 0, root_view.outer.w, root_view.outer.h))
-            .unwrap_or_else(Rect::zero);
+            .unwrap_or(Rect::ZERO);
         locate_recursive(self, root, point, clip)
     }
 }
@@ -55,14 +57,16 @@ pub(super) fn refresh_layouts(core: &mut Core) -> Result<()> {
         .filter_map(|(node_id, node)| node.layout_dirty.then_some(node_id))
         .collect::<Vec<_>>();
     for node_id in dirty {
-        let layout = core.with_widget_read(
+        let layout = core.with_widget(
             node_id,
             WidgetOperation::layout("layout refresh"),
             |widget, _core| widget.layout(),
         )?;
         layout.validate()?;
         if let Some(node) = core.nodes.get_mut(node_id) {
-            node.layout = layout;
+            let effective = node.layout_override.apply(layout)?;
+            node.base_layout = layout;
+            node.layout = effective;
             node.layout_dirty = false;
         }
     }
@@ -90,15 +94,18 @@ struct LayoutPass<'a> {
 /// Overflow flags propagated from parent layouts.
 struct Overflow {
     /// Allow horizontal overflow during measurement.
-    x: bool,
+    x: MeasureOverflow,
     /// Allow vertical overflow during measurement.
-    y: bool,
+    y: MeasureOverflow,
 }
 
 impl Overflow {
     /// Return a zero-overflow configuration.
     fn none() -> Self {
-        Self { x: false, y: false }
+        Self {
+            x: MeasureOverflow::Bounded,
+            y: MeasureOverflow::Bounded,
+        }
     }
 
     /// Build overflow flags from a layout.
@@ -120,11 +127,15 @@ impl<'a> LayoutPass<'a> {
     }
 
     /// Lay out a node subtree and return its outer size.
+    ///
+    /// `width_budget` is the width the parent resolved width fractions
+    /// against, or `None` when no finite width exists.
     fn layout_node(
         &mut self,
         node_id: NodeId,
         available_outer: Size,
         parent_overflow: Overflow,
+        width_budget: Option<u32>,
     ) -> Result<Size> {
         let (layout, hidden) = self.node_layout_snapshot(node_id)?;
         if hidden || layout.display == Display::None {
@@ -132,7 +143,7 @@ impl<'a> LayoutPass<'a> {
             return Ok(Size::ZERO);
         }
 
-        let mut effective_layout = layout;
+        let mut effective_layout = bound_width(layout, width_budget);
         effective_layout.inherit_overflow(parent_overflow.x, parent_overflow.y);
 
         let outer =
@@ -168,27 +179,23 @@ impl<'a> LayoutPass<'a> {
             .ok_or(Error::NodeNotFound(node_id))?;
 
         if node.hidden || node.layout.display == Display::None {
-            node.view = View::default();
-            return Ok(());
+            return self.clear_layout(node_id);
         }
 
         let outer_x = i64::from(parent_view.content.tl.x) + i64::from(node.rect.tl.x)
-            - i64::from(parent_view.tl.x);
+            - i64::from(parent_view.scroll.x);
         let outer_y = i64::from(parent_view.content.tl.y) + i64::from(node.rect.tl.y)
-            - i64::from(parent_view.tl.y);
+            - i64::from(parent_view.scroll.y);
 
-        let outer = RectI32::new(
-            clamp_i64_to_i32(outer_x),
-            clamp_i64_to_i32(outer_y),
-            node.rect.w,
-            node.rect.h,
-        );
+        let outer_tl = PointI32::clamped_from_i64(outer_x, outer_y);
+        let outer = RectI32::new(outer_tl.x, outer_tl.y, node.rect.w, node.rect.h);
 
         let content_x = i64::from(outer.tl.x) + i64::from(node.layout.padding.left);
         let content_y = i64::from(outer.tl.y) + i64::from(node.layout.padding.top);
+        let content_tl = PointI32::clamped_from_i64(content_x, content_y);
         let content = RectI32::new(
-            clamp_i64_to_i32(content_x),
-            clamp_i64_to_i32(content_y),
+            content_tl.x,
+            content_tl.y,
             node.content_size.w,
             node.content_size.h,
         );
@@ -224,7 +231,7 @@ impl<'a> LayoutPass<'a> {
                 layout.min_width,
                 layout.max_width,
                 pad_x,
-                layout.overflow_x,
+                layout.overflow_x == MeasureOverflow::Unbounded,
             ),
             height: constraint_for_axis(
                 layout.height,
@@ -232,7 +239,7 @@ impl<'a> LayoutPass<'a> {
                 layout.min_height,
                 layout.max_height,
                 pad_y,
-                layout.overflow_y,
+                layout.overflow_y == MeasureOverflow::Unbounded,
             ),
         };
 
@@ -241,7 +248,12 @@ impl<'a> LayoutPass<'a> {
 
         let mut measured_content = Size::ZERO;
         if did_measure {
-            measured_content = self.measure_content(node_id, layout, c0)?;
+            measured_content = self.measure_content(
+                node_id,
+                layout,
+                c0,
+                Size::new(available_content_w, available_content_h),
+            )?;
         }
 
         let outer_w0 = match layout.width {
@@ -269,7 +281,12 @@ impl<'a> LayoutPass<'a> {
                     width: Constraint::Exact(content.w),
                     height: c0.height,
                 };
-                let content1 = self.measure_content(node_id, layout, c1)?;
+                let content1 = self.measure_content(
+                    node_id,
+                    layout,
+                    c1,
+                    Size::new(content.w, available_content_h),
+                )?;
 
                 if matches!(layout.height, Sizing::Measure) {
                     let outer_h1 = content1.h.saturating_add(pad_y);
@@ -297,10 +314,13 @@ impl<'a> LayoutPass<'a> {
         node_id: NodeId,
         layout: Layout,
         constraints: MeasureConstraints,
+        available: Size,
     ) -> Result<Size> {
         let raw = match self.measure_cached(node_id, constraints)? {
             Measurement::Fixed(content) => content,
-            Measurement::Wrap => self.measure_wrap_content(node_id, layout, constraints)?,
+            Measurement::Wrap => {
+                self.measure_wrap_content(node_id, layout, constraints, available)?
+            }
         };
         Ok(constraints.clamp_size(raw))
     }
@@ -311,6 +331,7 @@ impl<'a> LayoutPass<'a> {
         node_id: NodeId,
         layout: Layout,
         constraints: MeasureConstraints,
+        available: Size,
     ) -> Result<Size> {
         let children = self.visible_children(node_id)?;
         if children.is_empty() {
@@ -319,26 +340,30 @@ impl<'a> LayoutPass<'a> {
 
         // For Stack direction, content size is the max of all children
         if layout.direction == LayoutDirection::Stack {
-            return self.measure_wrap_content_stack(layout, constraints, &children);
+            return self.measure_wrap_content_stack(layout, constraints, &children, available);
         }
 
         let main = constraints.main(layout.direction);
         let cross = constraints.cross(layout.direction);
         let main_fixed = main.is_exact();
         let cross_fixed = cross.is_exact();
-        let avail_main = main.max_bound();
-        let avail_cross = cross.max_bound();
+        // Retain the viewport bound so an explicitly bounded descendant can
+        // stop inherited overflow. Unbounded descendants ignore this bound.
+        let bounded = constraints.clamp_size(available);
+        let avail_main = layout.direction.main_size(bounded);
+        let avail_cross = layout.direction.cross_size(bounded);
         let avail = layout
             .direction
             .size_from_main_cross(avail_main, avail_cross);
 
+        let budget = measured_width_budget(layout, constraints, children.len());
         let mut fixed_main_total = 0u32;
         let mut flex_children: Vec<(usize, u32)> = Vec::new();
         let mut child_sizes = vec![Size::ZERO; children.len()];
 
         for (i, child) in children.iter().enumerate() {
             let child_layout = self.node_layout_snapshot(*child)?.0;
-            let mut effective = child_layout;
+            let mut effective = bound_width(child_layout, budget);
 
             let child_main = main_sizing(child_layout, layout.direction);
             if !main_fixed && matches!(child_main, Sizing::Flex(_)) {
@@ -373,7 +398,7 @@ impl<'a> LayoutPass<'a> {
             let shares = allocate_flex_shares(remaining, &weights);
             for (idx, (child_index, _)) in flex_children.iter().enumerate() {
                 let child_layout = self.node_layout_snapshot(children[*child_index])?.0;
-                let mut effective = child_layout;
+                let mut effective = bound_width(child_layout, budget);
                 let child_cross = cross_sizing(child_layout, layout.direction);
                 if !cross_fixed && matches!(child_cross, Sizing::Flex(_)) {
                     set_cross_sizing(&mut effective, layout.direction, Sizing::Measure);
@@ -409,17 +434,17 @@ impl<'a> LayoutPass<'a> {
         layout: Layout,
         constraints: MeasureConstraints,
         children: &[NodeId],
+        available: Size,
     ) -> Result<Size> {
-        let avail_w = constraints.width.max_bound();
-        let avail_h = constraints.height.max_bound();
-        let avail = Size::new(avail_w, avail_h);
+        let avail = constraints.clamp_size(available);
+        let budget = measured_width_budget(layout, constraints, children.len());
 
         let mut max_w = 0u32;
         let mut max_h = 0u32;
 
         for child in children {
             let child_layout = self.node_layout_snapshot(*child)?.0;
-            let mut effective = child_layout;
+            let mut effective = bound_width(child_layout, budget);
 
             // Treat flex as measure when parent is not exact
             if !matches!(constraints.width, Constraint::Exact(_))
@@ -454,12 +479,15 @@ impl<'a> LayoutPass<'a> {
         let parent_overflow = Overflow::from_layout(layout);
         match layout.direction {
             LayoutDirection::Stack => {
-                // Stack: all children get full content area, positioned according to alignment
+                // Stack: all children get full content area, positioned
+                // according to alignment
                 for child in &children {
                     // First, layout the child to determine its size
-                    let child_size = self.layout_node(*child, content, parent_overflow)?;
+                    let child_size =
+                        self.layout_node(*child, content, parent_overflow, Some(content.w))?;
 
-                    // Then apply alignment to position the child within content area
+                    // Then apply alignment to position the child within content
+                    // area
                     let offset_x = align_offset(child_size.w, content.w, layout.align_horizontal);
                     let offset_y = align_offset(child_size.h, content.h, layout.align_vertical);
                     self.set_node_position(
@@ -486,6 +514,9 @@ impl<'a> LayoutPass<'a> {
         children: &[NodeId],
         parent_overflow: Overflow,
     ) -> Result<()> {
+        // Every measurement and the final allocation share one width budget,
+        // so a child's reduced share never shrinks its fraction bound again.
+        let budget = Some(width_budget(layout, content.w, children.len()));
         let mut fixed_main_total = 0u32;
         let mut flex_weights: Vec<u32> = Vec::new();
         let mut pre_sizes = vec![Size::ZERO; children.len()];
@@ -498,7 +529,7 @@ impl<'a> LayoutPass<'a> {
                 continue;
             }
 
-            let mut effective = child_layout;
+            let mut effective = bound_width(child_layout, budget);
             effective.inherit_overflow(parent_overflow.x, parent_overflow.y);
 
             let child_available = content;
@@ -534,7 +565,7 @@ impl<'a> LayoutPass<'a> {
             let child_available = layout
                 .direction
                 .size_from_main_cross(main, layout.direction.cross_size(content));
-            let actual = self.layout_node(*child, child_available, parent_overflow)?;
+            let actual = self.layout_node(*child, child_available, parent_overflow, budget)?;
             actual_sizes.push(actual);
         }
 
@@ -606,7 +637,7 @@ impl<'a> LayoutPass<'a> {
             canvas_children.push(CanvasChild::new(node.rect, child_canvas));
         }
         let ctx = CanvasContext::new(&canvas_children);
-        let canvas = self.core.with_widget_read(
+        let canvas = self.core.with_widget(
             node_id,
             WidgetOperation::layout("canvas"),
             |widget, _core| widget.canvas(view_size, &ctx),
@@ -669,7 +700,7 @@ impl<'a> LayoutPass<'a> {
         if let Some(m) = self.measure_cache.get(&key) {
             return Ok(*m);
         }
-        let measured = self.core.with_widget_read(
+        let measured = self.core.with_widget(
             node_id,
             WidgetOperation::layout("measure"),
             |widget, _core| widget.measure(constraints),
@@ -685,10 +716,10 @@ impl<'a> LayoutPass<'a> {
             .nodes
             .get_mut(node_id)
             .ok_or(Error::NodeNotFound(node_id))?;
-        node.rect = Rect::zero();
+        node.rect = Rect::ZERO;
         node.content_size = Size::default();
         node.canvas = Size::default();
-        node.scroll = Point::zero();
+        node.scroll = Point::ZERO;
         node.view = View::default();
         let children = node.children.clone();
         for child in children {
@@ -696,6 +727,51 @@ impl<'a> LayoutPass<'a> {
         }
         Ok(())
     }
+}
+
+/// Return the width a parent offers width fractions: its content width less the
+/// gaps between displayed children in a row.
+fn width_budget(layout: Layout, content_width: u32, children: usize) -> u32 {
+    if layout.direction != LayoutDirection::Row {
+        return content_width;
+    }
+    let gaps = u32::try_from(children.saturating_sub(1)).unwrap_or(u32::MAX);
+    content_width.saturating_sub(layout.gap.saturating_mul(gaps))
+}
+
+/// Return the width budget for children measured under `constraints`, or
+/// `None` when the measurement has no width bound.
+fn measured_width_budget(
+    layout: Layout,
+    constraints: MeasureConstraints,
+    children: usize,
+) -> Option<u32> {
+    match constraints.width {
+        Constraint::Exact(width) | Constraint::AtMost(width) => {
+            Some(width_budget(layout, width, children))
+        }
+        Constraint::Unbounded => None,
+    }
+}
+
+/// Resolve a width fraction against a parent's width budget into `max_width`.
+///
+/// The bound rounds down, joins an absolute maximum by taking the smaller,
+/// and yields to a minimum. Without a budget the fraction waits for a parent
+/// with a finite allocation.
+fn bound_width(mut layout: Layout, budget: Option<u32>) -> Layout {
+    if let (Some(fraction), Some(budget)) = (layout.max_width_fraction, budget) {
+        let mut bound = fraction.of(budget);
+        if let Some(max) = layout.max_width {
+            bound = bound.min(max);
+        }
+        if let Some(min) = layout.min_width {
+            bound = bound.max(min);
+        }
+        layout.max_width = Some(bound);
+    }
+    layout.max_width_fraction = None;
+    layout
 }
 
 /// Clamp an outer size against min/max constraints.
@@ -786,7 +862,7 @@ fn allocate_flex_shares(remaining: u32, weights: &[u32]) -> Vec<u32> {
         let weight = u64::from(*w);
         let prod = u64::from(remaining) * weight;
         base.push(u32::try_from(prod / total).unwrap_or(u32::MAX));
-        rem.push(u32::try_from(prod % total).unwrap_or(u32::MAX));
+        rem.push(prod % total);
     }
 
     let used: u32 = base.iter().sum();
@@ -865,15 +941,6 @@ fn cross_alignment(layout: Layout) -> Align {
     }
 }
 
-/// Clamp a widened coordinate to the signed view coordinate domain.
-fn clamp_i64_to_i32(value: i64) -> i32 {
-    i32::try_from(value).unwrap_or(if value.is_negative() {
-        i32::MIN
-    } else {
-        i32::MAX
-    })
-}
-
 /// Depth-first search for a node at a screen-space point.
 fn locate_recursive(
     core: &Core,
@@ -884,7 +951,7 @@ fn locate_recursive(
     let node = core
         .nodes
         .get(node_id)
-        .ok_or_else(|| Error::Internal("missing node".into()))?;
+        .ok_or(Error::NodeNotFound(node_id))?;
 
     if node.hidden || node.layout.display == Display::None {
         return Ok(None);
@@ -909,6 +976,9 @@ fn locate_recursive(
     Ok(Some(node_id))
 }
 
+/// Width fraction layout tests.
+#[cfg(test)]
+mod fraction_tests;
 /// Tests for the layout driver.
 #[cfg(test)]
 mod tests;

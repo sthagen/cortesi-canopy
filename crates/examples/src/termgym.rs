@@ -1,16 +1,20 @@
 use std::env;
 
 use canopy::{
-    command, derive_commands,
-    error::Error,
-    prelude::*,
-    style::{Attr, AttrSet, solarized},
+    Canopy, CanopyBuilder, Context, ContextExt, FocusScope, Loader, NodeId, NodeName, Render,
+    ViewContext, ViewContextExt, Widget, derive_commands,
+    error::{Error, Result},
+    geom::Size,
+    layout::{Constraint, Direction, Layout, MeasureConstraints, Measurement},
+    style::{Attr, AttrSet, canopy as palette},
 };
 use canopy_widgets::{
-    Border, Button, Center, Frame, List, SINGLE, SINGLE_THICK, Selectable, Terminal,
-    TerminalConfig, Text, VStack,
+    Border, Button, Center, Container, Frame, List, SINGLE, SINGLE_THICK, Selectable, Text,
+    terminal::{Terminal, TerminalConfig},
 };
 use unicode_width::UnicodeWidthStr;
+
+use crate::{fixed_row, flex_row, widget::TerminalStack};
 
 /// Height for each terminal entry row, including borders.
 const ENTRY_HEIGHT: u32 = 3;
@@ -23,36 +27,36 @@ canopy.on_start(function()
     term_gym.focus_active_terminal()
 end)
 
-canopy.bind("F6", { path = "term_gym/**/", description = "Toggle terminal list" }, function()
-    term_gym.toggle_terminal_focus()
-end)
-canopy.bind("n", { path = "term_gym/**/list/**/", description = "New terminal" }, function()
-    term_gym.new_terminal_sidebar()
-end)
-canopy.bind("Down", { path = "term_gym/**/list/**/", description = "Next terminal" }, function()
-    term_gym.next_terminal_sidebar()
-end)
-canopy.bind("j", { path = "term_gym/**/list/**/", description = "Next terminal" }, function()
-    term_gym.next_terminal_sidebar()
-end)
-canopy.bind("Up", { path = "term_gym/**/list/**/", description = "Previous terminal" }, function()
-    term_gym.prev_terminal_sidebar()
-end)
-canopy.bind("k", { path = "term_gym/**/list/**/", description = "Previous terminal" }, function()
-    term_gym.prev_terminal_sidebar()
-end)
-canopy.bind("Enter", { path = "term_gym/**/list/**/", description = "Focus active terminal" }, function()
-    term_gym.focus_active_terminal()
-end)
-canopy.bind("Right", { path = "term_gym/**/list/**/", description = "Focus active terminal" }, function()
-    term_gym.focus_active_terminal()
-end)
-canopy.bind("Delete", { path = "term_gym/**/list/**/", description = "Close terminal" }, function()
-    term_gym.delete_terminal()
-end)
-canopy.bind("d", { path = "term_gym/**/list/**/", description = "Close terminal" }, function()
-    term_gym.delete_terminal()
-end)
+canopy.bind("F6", {
+    path = "term_gym/**/",
+    phase = "before_widget",
+    description = "Toggle terminal list",
+}, command.term_gym.toggle_terminal_focus())
+canopy.keymap({
+    path = "term_gym/**/list/**/",
+    phase = "before_widget",
+    { key = "n", description = "New terminal", action = command.term_gym.new_terminal_sidebar() },
+    {
+        key = { "Down", "j" },
+        description = "Next terminal",
+        action = command.term_gym.next_terminal_sidebar(),
+    },
+    {
+        key = { "Up", "k" },
+        description = "Previous terminal",
+        action = command.term_gym.prev_terminal_sidebar(),
+    },
+    {
+        key = { "Enter", "Right" },
+        description = "Focus active terminal",
+        action = command.term_gym.focus_active_terminal(),
+    },
+    {
+        key = { "Delete", "d" },
+        description = "Close terminal",
+        action = command.term_gym.delete_terminal(),
+    },
+})
 "#;
 
 /// List item widget for the terminal sidebar.
@@ -123,22 +127,6 @@ impl Widget for TermEntry {
 
     fn name(&self) -> NodeName {
         NodeName::convert("term_entry")
-    }
-}
-
-/// Stack container for terminal widgets.
-struct TerminalStack;
-
-impl TerminalStack {
-    /// Construct a terminal stack container.
-    fn new() -> Self {
-        Self
-    }
-}
-
-impl Widget for TerminalStack {
-    fn layout(&self) -> Layout {
-        Layout::fill().direction(Direction::Stack)
     }
 }
 
@@ -219,11 +207,11 @@ impl TermGym {
 
         for (idx, terminal_id) in terminals.iter().enumerate() {
             let active = self.active;
-            c.with_layout_of(*terminal_id, &mut |node_layout| {
-                *node_layout = if idx == active {
+            c.with_layout_of(*terminal_id, &mut |layout_of| {
+                *layout_of = if idx == active {
                     Layout::fill()
                 } else {
-                    Layout::fill().none()
+                    Layout::fill().hidden()
                 };
             })?;
         }
@@ -314,13 +302,13 @@ impl TermGym {
 
     #[command]
     /// Create a new terminal instance.
-    pub fn new_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn new_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
         self.add_terminal(c)
     }
 
     #[command]
     /// Create a new terminal instance while keeping focus on the sidebar.
-    pub fn new_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn new_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
         self.add_terminal(c)?;
         self.focus_sidebar_list(c)?;
         Ok(())
@@ -328,19 +316,19 @@ impl TermGym {
 
     #[command]
     /// Switch to the next terminal while keeping focus on the sidebar.
-    pub fn next_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn next_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
         self.shift_terminal_in_sidebar(c, true)
     }
 
     #[command]
     /// Switch to the previous terminal while keeping focus on the sidebar.
-    pub fn prev_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn prev_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
         self.shift_terminal_in_sidebar(c, false)
     }
 
     #[command]
     /// Close the active terminal and keep focus on the sidebar.
-    pub fn delete_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn delete_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
         let terminals = self.terminal_ids(c)?;
         if terminals.len() <= 1 {
             return Ok(());
@@ -354,7 +342,7 @@ impl TermGym {
 
     #[command]
     /// Focus the active terminal instance.
-    pub fn focus_active_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn focus_active_terminal(&self, c: &mut dyn Context) -> Result<()> {
         let terminals = self.terminal_ids(c)?;
         if let Some(active_id) = terminals.get(self.active).copied() {
             c.set_focus(active_id)?;
@@ -364,11 +352,11 @@ impl TermGym {
 
     #[command]
     /// Toggle focus between the terminal list and the active terminal.
-    pub fn toggle_terminal_focus(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn toggle_terminal_focus(&self, c: &mut dyn Context) -> Result<()> {
         let terminals = self.terminal_ids(c)?;
         if terminals
             .iter()
-            .any(|terminal| c.node_is_on_focus_path(*terminal))
+            .any(|terminal| c.is_on_focus_path_of(*terminal))
         {
             self.focus_sidebar_list(c)
         } else {
@@ -378,7 +366,7 @@ impl TermGym {
 
     #[command]
     /// Activate a terminal from a sidebar row selection.
-    pub fn activate_terminal(&mut self, c: &mut dyn Context, index: usize) -> Result<()> {
+    pub(crate) fn activate_terminal(&mut self, c: &mut dyn Context, index: usize) -> Result<()> {
         self.set_active(c, index)?;
         self.focus_sidebar_list(c)?;
         Ok(())
@@ -401,11 +389,10 @@ impl Widget for TermGym {
         let button_id = c.create_detached(
             Button::new("+ New terminal").with_command(Self::cmd_new_terminal().call()),
         )?;
-        let sidebar_id = c.add_child(
-            VStack::new()
-                .push_fixed(button_id, ENTRY_HEIGHT)
-                .push_flex(list_id, 1),
-        )?;
+        let sidebar_id = c.add_child(Container::column())?;
+        c.set_children_of(sidebar_id.into(), vec![button_id.into(), list_id.into()])?;
+        c.set_layout_override_of(button_id.into(), fixed_row(ENTRY_HEIGHT))?;
+        c.set_layout_override_of(list_id.into(), flex_row(1))?;
 
         let term_frame_id = c.add_child(
             Frame::new()
@@ -438,41 +425,22 @@ impl Loader for TermGym {
     }
 }
 
-/// Install key bindings and styles for the terminal gym demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
+/// Install native styles during the configuration phase.
+fn setup_style(cnpy: &mut Canopy) {
     use canopy::style::StyleBuilder;
 
     let selected_attrs = AttrSet {
         bold: true,
         ..AttrSet::default()
     };
-
-    let entry_normal = StyleBuilder::new()
-        .fg(solarized::BASE0)
-        .bg(solarized::BASE03);
-
-    let entry_selected = StyleBuilder::new()
-        .fg(solarized::BASE3)
-        .bg(solarized::BLUE)
-        .attrs(selected_attrs);
-
-    let button_normal = StyleBuilder::new()
-        .fg(solarized::BASE3)
-        .bg(solarized::BASE02);
-
+    let button_normal = StyleBuilder::new().fg(palette::TEXT).bg(palette::ELEMENT);
     let button_selected = StyleBuilder::new()
-        .fg(solarized::BASE3)
-        .bg(solarized::BLUE)
+        .fg(palette::BG)
+        .bg(palette::ACCENT)
         .attrs(selected_attrs);
 
-    cnpy.style_mut()
-        .rules()
-        .prefix("termgym/entry")
-        .style_all(&["border", "fill", "text"], entry_normal)
-        .style_all(
-            &["selected/border", "selected/fill", "selected/text"],
-            entry_selected,
-        )
+    let rules = crate::selectable_entry_styles(cnpy.style_mut().rules(), "termgym/entry");
+    rules
         .prefix("termgym/button")
         .style_all(&["border", "fill", "text"], button_normal)
         .style_all(
@@ -480,18 +448,26 @@ pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
             button_selected,
         )
         .prefix("termgym/frame")
-        .fg("", solarized::BASE01)
+        .fg("", palette::BORDER)
         .style(
             "focused",
-            StyleBuilder::new().fg(solarized::YELLOW).attr(Attr::Bold),
+            StyleBuilder::new().fg(palette::YELLOW).attr(Attr::Bold),
         )
-        .fg("active", solarized::ORANGE)
+        .fg("active", palette::ORANGE)
         .style(
             "title",
-            StyleBuilder::new().fg(solarized::BASE3).attr(Attr::Bold),
+            StyleBuilder::new().fg(palette::TEXT).attr(Attr::Bold),
         )
         .apply();
+}
 
-    cnpy.eval_script(DEFAULT_BINDINGS)?;
-    Ok(())
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder
+        .configure(|cnpy| {
+            setup_style(cnpy);
+            Ok(())
+        })
+        .bindings("termgym", DEFAULT_BINDINGS)
 }

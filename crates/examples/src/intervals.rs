@@ -1,13 +1,17 @@
 use std::time::Duration;
 
 use canopy::{
-    command, derive_commands,
-    layout::Edges,
-    prelude::*,
-    style::{AttrSet, solarized},
+    Canopy, CanopyBuilder, Context, ContextExt, Loader, NodeName, Render, ViewContext,
+    ViewContextExt, Widget, derive_commands,
+    error::Result,
+    geom::Size,
+    layout::{Edges, Layout, MeasureConstraints, Measurement},
+    style::canopy as palette,
 };
-use canopy_widgets::{Border, Center, Frame, List, SINGLE, Selectable, Text, VStack};
+use canopy_widgets::{Border, Center, Container, Frame, List, SINGLE, Selectable, Text};
 use unicode_width::UnicodeWidthStr;
+
+use crate::{fixed_row, flex_row};
 
 /// Padding inside each counter entry box.
 const ENTRY_PADDING: u32 = 2;
@@ -16,49 +20,35 @@ const ENTRY_HEIGHT: u32 = 1 + ENTRY_PADDING * 2;
 
 /// Default bindings for the intervals demo.
 const DEFAULT_BINDINGS: &str = r#"
-canopy.bind("a", { path = "intervals", description = "Add item" }, function()
-    intervals.add_item()
-end)
-canopy.bind("g", { path = "intervals", description = "First item" }, function()
-    list.select_first()
-end)
-canopy.bind("j", { path = "intervals", description = "Next item" }, function()
-    list.select_by(1)
-end)
-canopy.bind("Down", { path = "intervals", description = "Next item" }, function()
-    list.select_by(1)
-end)
-canopy.bind_mouse("ScrollDown", { path = "intervals", description = "Next item" }, function()
-    list.select_by(1)
-end)
-canopy.bind("k", { path = "intervals", description = "Previous item" }, function()
-    list.select_by(-1)
-end)
-canopy.bind("Up", { path = "intervals", description = "Previous item" }, function()
-    list.select_by(-1)
-end)
-canopy.bind_mouse("ScrollUp", { path = "intervals", description = "Previous item" }, function()
-    list.select_by(-1)
-end)
-canopy.bind("d", { path = "intervals", description = "Delete item" }, function()
-    list.delete_selected()
-end)
-canopy.bind("PageDown", { path = "intervals", description = "Page down" }, function()
-    list.page(1)
-end)
-canopy.bind("Space", { path = "intervals", description = "Page down" }, function()
-    list.page(1)
-end)
-canopy.bind("PageUp", { path = "intervals", description = "Page up" }, function()
-    list.page(-1)
-end)
-canopy.bind("q", { path = "intervals", description = "Quit" }, function()
-    root.quit()
-end)
+canopy.keymap({
+    path = "intervals",
+    { key = "a", description = "Add item", action = command.intervals.add_item() },
+    { key = "g", description = "First item", action = command.list.select_first() },
+    { key = { "j", "Down" }, description = "Next item", action = command.list.select_by(1) },
+    {
+        mouse = "ScrollDown",
+        description = "Next item",
+        action = function()
+            list.select_by(1)
+        end,
+    },
+    { key = { "k", "Up" }, description = "Previous item", action = command.list.select_by(-1) },
+    {
+        mouse = "ScrollUp",
+        description = "Previous item",
+        action = function()
+            list.select_by(-1)
+        end,
+    },
+    { key = "d", description = "Delete item", action = command.list.delete_selected() },
+    { key = { "PageDown", "Space" }, description = "Page down", action = command.list.page(1) },
+    { key = "PageUp", description = "Page up", action = command.list.page(-1) },
+    { key = "q", description = "Quit", action = command.root.quit() },
+})
 "#;
 
 /// Counter widget that increments on a timer.
-pub struct CounterItem {
+pub(crate) struct CounterItem {
     /// Current counter value.
     value: u64,
     /// Selection state.
@@ -129,7 +119,7 @@ impl CounterItem {
     fn sync_label(&self, ctx: &mut dyn Context) -> Result<()> {
         let label = self.label();
         let _ = ctx.try_with_unique_descendant::<Text, _>(|text, _ctx| {
-            text.set_raw(label.clone());
+            text.set_text(label.clone());
             Ok(())
         })?;
         self.update_box_layout(ctx)?;
@@ -173,7 +163,7 @@ impl Widget for CounterItem {
 }
 
 /// Status bar widget for the intervals demo.
-pub struct StatusBar;
+pub(crate) struct StatusBar;
 
 impl Widget for StatusBar {
     fn render(&mut self, r: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
@@ -213,7 +203,7 @@ impl Intervals {
 
     #[command]
     /// Append a new list item.
-    pub fn add_item(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn add_item(&self, c: &mut dyn Context) -> Result<()> {
         self.with_list(c, |list, ctx| {
             list.append(ctx, CounterItem::new())?;
             Ok(())
@@ -227,15 +217,13 @@ impl Widget for Intervals {
     }
 
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
-        let frame_id = c.create_detached(Frame::new())?;
+        let root = c.node_id();
+        let column = c.add_child_to(root, Container::column())?;
+        let frame_id = c.add_child_to(column, Frame::new())?;
         c.add_child_to(frame_id, List::<CounterItem>::new())?;
-        let status_id = c.create_detached(StatusBar)?;
-        c.add_child(
-            VStack::new()
-                .push_flex(frame_id, 1)
-                .push_fixed(status_id, 1),
-        )?;
-        Ok(())
+        let status_id = c.add_child_to(column, StatusBar)?;
+        c.set_layout_override_of(frame_id.into(), flex_row(1))?;
+        c.set_layout_override_of(status_id.into(), fixed_row(1))
     }
 
     fn render(&mut self, r: &mut Render, _ctx: &dyn ViewContext) -> Result<()> {
@@ -257,7 +245,7 @@ impl Widget for Intervals {
             .ok()?;
 
         for item_id in item_ids {
-            c.with_widget(item_id, |item: &mut CounterItem, ctx| item.tick(ctx))
+            c.with_widget_mut(item_id, |item: &mut CounterItem, ctx| item.tick(ctx))
                 .ok();
         }
 
@@ -273,41 +261,26 @@ impl Loader for Intervals {
     }
 }
 
-/// Install key bindings for the intervals demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
+/// Install native styles during the configuration phase.
+fn setup_style(cnpy: &mut Canopy) {
     use canopy::style::StyleBuilder;
 
-    let selected_attrs = AttrSet {
-        bold: true,
-        ..AttrSet::default()
-    };
-
-    let normal = StyleBuilder::new()
-        .fg(solarized::BASE0)
-        .bg(solarized::BASE03);
-
-    let selected = StyleBuilder::new()
-        .fg(solarized::BASE3)
-        .bg(solarized::BLUE)
-        .attrs(selected_attrs);
-
-    cnpy.style_mut()
-        .rules()
-        .prefix("intervals/entry")
-        .style_all(&["border", "fill", "text"], normal)
-        .style_all(
-            &["selected/border", "selected/fill", "selected/text"],
-            selected,
-        )
+    crate::selectable_entry_styles(cnpy.style_mut().rules(), "intervals/entry")
         .no_prefix()
         .style(
             "statusbar/text",
-            StyleBuilder::new()
-                .fg(solarized::BASE02)
-                .bg(solarized::BASE1),
+            StyleBuilder::new().fg(palette::SUBTEXT).bg(palette::PANEL),
         )
         .apply();
+}
 
-    cnpy.eval_script(DEFAULT_BINDINGS)?;
-    Ok(())
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder
+        .configure(|cnpy| {
+            setup_style(cnpy);
+            Ok(())
+        })
+        .bindings("intervals", DEFAULT_BINDINGS)
 }

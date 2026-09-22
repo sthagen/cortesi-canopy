@@ -10,7 +10,7 @@ doctest = false
 [dependencies]
 canopy = { path = "../canopy" }
 canopy-widgets = { path = "../canopy-widgets" }
-rand = "0.10.1"
+rand.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

@@ -3,7 +3,7 @@ use crate::{
     core::text,
     error::Result,
     geom,
-    style::{Effect, ResolvedStyle, Style, StyleManager, StyleMap},
+    style::{ResolvedStyle, Style, StyleManager, StyleMap, effects::Effect},
 };
 
 /// The trait implemented by renderers.
@@ -163,19 +163,19 @@ impl<'a> Render<'a> {
         self.apply_effects(base)
     }
 
-    /// Resolve a style by name at a point within bounds.
-    pub fn resolve_style_name_at(
-        &self,
-        name: &str,
-        bounds: geom::Rect,
-        point: geom::Point,
-    ) -> ResolvedStyle {
-        self.resolve_style(name).resolve_at(bounds, point)
-    }
-
     /// Push a style layer.
     pub fn push_layer(&mut self, name: &str) {
         self.style.push_layer(name);
+    }
+
+    /// Apply a named style to the painted grapheme at a point, preserving its
+    /// text.
+    pub fn restyle(&mut self, style: &str, point: geom::Point) {
+        if self.clip.contains_point(point) {
+            let style = self.resolve_style(style).resolve_at(self.clip, point);
+            self.buf
+                .restyle_grapheme(self.translate_point(point), style);
+        }
     }
 
     /// Fill a rectangle with a specified character. Writes out of bounds will

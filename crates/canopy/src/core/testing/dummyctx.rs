@@ -1,28 +1,25 @@
 use std::{any::TypeId, result::Result as StdResult};
 
-use slotmap::Key;
-
 use crate::{
-    ChangeOutcome, Context, FocusScope, ViewContext,
-    commands::{ArgValue, CommandError, CommandInvocation, CommandScopeFrame, ListRowContext},
-    core::{
-        NodeId,
-        help::BindingSnapshot,
-        inputmap::{ExclusiveFrameToken, FrameworkBindingGroup},
-        style::Effect,
-        view::View,
+    ChangeOutcome, Context, FocusDirection, FocusScope, ViewContext,
+    commands::{
+        ArgValue, CommandError, CommandInvocation, CommandScopeFrame, CommandStatus, CommandTarget,
+        ListRowContext,
     },
-    error::Result,
+    core::{
+        NodeId, context::sealed, help::BindingSnapshot, id::testing_node_id,
+        style::effects::Effect, view::View,
+    },
+    error::{Error, Result},
     event::{Event, mouse::MouseEvent},
-    geom::{Direction, Point},
-    layout::Layout,
+    geom::{Point, Rect},
+    layout::{Layout, LayoutOverride},
     path::Path,
     style::StyleMap,
     widget::Widget,
 };
 
 /// Dummy context for tests.
-#[derive(Default)]
 pub struct DummyContext {
     /// Current node identifier.
     node_id: NodeId,
@@ -30,7 +27,27 @@ pub struct DummyContext {
     root_id: NodeId,
 }
 
+impl Default for DummyContext {
+    fn default() -> Self {
+        Self {
+            node_id: testing_node_id(),
+            root_id: testing_node_id(),
+        }
+    }
+}
+
 impl ViewContext for DummyContext {
+    fn has_mouse_capture(&self) -> bool {
+        false
+    }
+
+    fn find_identity(&self, _scope: NodeId, _key: &str) -> Result<Option<NodeId>> {
+        Ok(None)
+    }
+    fn semantic_identity(&self, _node: NodeId) -> Option<crate::SemanticIdentity> {
+        None
+    }
+
     fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -39,15 +56,29 @@ impl ViewContext for DummyContext {
         self.root_id
     }
 
-    fn node_view(&self, _node: NodeId) -> Option<View> {
+    fn view_of(&self, _node: NodeId) -> Option<View> {
         None
     }
 
-    fn node_layout(&self, _node: NodeId) -> Option<Layout> {
+    fn layout_of(&self, _node: NodeId) -> Option<Layout> {
         None
     }
 
-    fn node_type_id(&self, _node: NodeId) -> Option<TypeId> {
+    fn with_widget_dyn(
+        &self,
+        node: NodeId,
+        _callback: &mut dyn FnMut(&dyn Widget) -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::NodeNotFound(node))
+    }
+    fn command_status(
+        &self,
+        _target: CommandTarget,
+        _invocation: &CommandInvocation,
+    ) -> Result<CommandStatus> {
+        Ok(CommandStatus::Enabled)
+    }
+    fn type_id_of(&self, _node: NodeId) -> Option<TypeId> {
         None
     }
 
@@ -55,7 +86,7 @@ impl ViewContext for DummyContext {
         Vec::new()
     }
 
-    fn node_is_focused(&self, _node: NodeId) -> bool {
+    fn is_focused_of(&self, _node: NodeId) -> bool {
         false
     }
 
@@ -63,7 +94,7 @@ impl ViewContext for DummyContext {
         None
     }
 
-    fn node_is_on_focus_path(&self, _node: NodeId) -> bool {
+    fn is_on_focus_path_of(&self, _node: NodeId) -> bool {
         false
     }
 
@@ -79,11 +110,11 @@ impl ViewContext for DummyContext {
         None
     }
 
-    fn node_is_attached(&self, _node: NodeId) -> bool {
+    fn is_attached_of(&self, _node: NodeId) -> bool {
         false
     }
 
-    fn node_path(&self, _root: NodeId, _node: NodeId) -> Path {
+    fn path_of(&self, _root: NodeId, _node: NodeId) -> Path {
         Path::empty()
     }
 
@@ -91,17 +122,37 @@ impl ViewContext for DummyContext {
         Ok(None)
     }
 
-    fn child_keyed_in(&self, _parent: NodeId, _key: &str) -> Option<NodeId> {
+    fn child_slot_of(&self, _parent: NodeId, _key: &str) -> Option<NodeId> {
         None
     }
 }
 
-impl Context for DummyContext {
-    fn set_focus(&mut self, _node: NodeId) -> Result<ChangeOutcome> {
-        Ok(ChangeOutcome::Unchanged)
+impl sealed::ViewContext for DummyContext {}
+
+impl sealed::Context for DummyContext {
+    fn as_context(&mut self) -> &mut dyn Context {
+        self
     }
 
-    fn focus_dir(&mut self, _scope: FocusScope, _dir: Direction) -> Result<ChangeOutcome> {
+    fn attach_composed(
+        &mut self,
+        _parent: NodeId,
+        _roots: &[(NodeId, Option<&str>)],
+        _slots: &[(NodeId, NodeId, String)],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Context for DummyContext {
+    fn set_semantic_key(&mut self, _node: NodeId, _scope: NodeId, _key: &str) -> Result<()> {
+        Ok(())
+    }
+    fn clear_semantic_key(&mut self, _node: NodeId) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_focus(&mut self, _node: NodeId) -> Result<ChangeOutcome> {
         Ok(ChangeOutcome::Unchanged)
     }
 
@@ -109,11 +160,11 @@ impl Context for DummyContext {
         Ok(ChangeOutcome::Unchanged)
     }
 
-    fn focus_next(&mut self, _scope: FocusScope) -> Result<ChangeOutcome> {
-        Ok(ChangeOutcome::Unchanged)
-    }
-
-    fn focus_prev(&mut self, _scope: FocusScope) -> Result<ChangeOutcome> {
+    fn focus_move(
+        &mut self,
+        _scope: FocusScope,
+        _direction: FocusDirection,
+    ) -> Result<ChangeOutcome> {
         Ok(ChangeOutcome::Unchanged)
     }
 
@@ -129,57 +180,64 @@ impl Context for DummyContext {
         Ok(None)
     }
 
-    fn restore_mouse_capture(&mut self, _node: NodeId) -> Result<ChangeOutcome> {
-        Ok(ChangeOutcome::Unchanged)
-    }
-
     fn available_bindings(&self, _node: Option<NodeId>) -> Result<BindingSnapshot> {
         Ok(BindingSnapshot {
             focus: self.root_id,
             focus_path: Path::empty(),
             active_modes: Vec::new(),
+            transient_mode: None,
             exclusive_group: None,
             bindings: Vec::new(),
+            mouse_bindings: Vec::new(),
         })
     }
 
-    fn push_exclusive_bindings(
-        &mut self,
-        _group: FrameworkBindingGroup,
-    ) -> Result<ExclusiveFrameToken> {
-        Ok(ExclusiveFrameToken::for_test(0))
+    fn scroll_to(&mut self, _x: u32, _y: u32) -> ChangeOutcome {
+        ChangeOutcome::Unchanged
     }
 
-    fn pop_exclusive_bindings(&mut self, _token: ExclusiveFrameToken) -> Result<()> {
-        Ok(())
+    fn scroll_by(&mut self, _x: i32, _y: i32) -> ChangeOutcome {
+        ChangeOutcome::Unchanged
     }
 
-    fn scroll_to(&mut self, _x: u32, _y: u32) -> bool {
-        false
+    fn scroll_to_of(&mut self, _node: NodeId, _x: u32, _y: u32) -> Result<ChangeOutcome> {
+        Ok(ChangeOutcome::Unchanged)
     }
 
-    fn scroll_by(&mut self, _x: i32, _y: i32) -> bool {
-        false
+    fn reveal_area(&mut self, _area: Rect, _align: crate::RevealAlign) -> ChangeOutcome {
+        ChangeOutcome::Unchanged
+    }
+
+    fn reveal_anchor(&mut self, _align: crate::RevealAlign) -> ChangeOutcome {
+        ChangeOutcome::Unchanged
+    }
+
+    fn reveal_node(&mut self, _node: NodeId, _align: crate::RevealAlign) -> Result<ChangeOutcome> {
+        Ok(ChangeOutcome::Unchanged)
     }
 
     fn invalidate_layout(&mut self) {}
+
+    fn set_layout_override_of(&mut self, _node: NodeId, _overrides: LayoutOverride) -> Result<()> {
+        Ok(())
+    }
 
     fn with_layout_of(&mut self, _node: NodeId, _f: &mut dyn FnMut(&mut Layout)) -> Result<()> {
         Ok(())
     }
 
     fn create_detached_boxed(&mut self, _widget: Box<dyn Widget>) -> Result<NodeId> {
-        Ok(NodeId::null())
+        Ok(testing_node_id())
     }
 
-    fn apply_tree_edit(
+    fn edit_structure(
         &mut self,
         edit: &mut dyn FnMut(&mut dyn Context) -> Result<()>,
     ) -> Result<()> {
         edit(self)
     }
 
-    fn with_widget_mut(
+    fn with_widget_dyn_mut(
         &mut self,
         _node: NodeId,
         _f: &mut dyn FnMut(&mut dyn Widget, &mut dyn Context) -> Result<()>,
@@ -187,12 +245,16 @@ impl Context for DummyContext {
         Ok(())
     }
 
-    fn dispatch_command(&mut self, _cmd: &CommandInvocation) -> StdResult<ArgValue, CommandError> {
+    fn dispatch(
+        &mut self,
+        _target: CommandTarget,
+        _cmd: &CommandInvocation,
+    ) -> StdResult<ArgValue, CommandError> {
         Ok(ArgValue::Null)
     }
-
-    fn dispatch_command_scoped(
+    fn dispatch_scoped(
         &mut self,
+        _target: CommandTarget,
         _frame: CommandScopeFrame,
         _cmd: &CommandInvocation,
     ) -> StdResult<ArgValue, CommandError> {
@@ -212,27 +274,35 @@ impl Context for DummyContext {
     }
 
     fn add_child_to_boxed(&mut self, _parent: NodeId, _widget: Box<dyn Widget>) -> Result<NodeId> {
-        Ok(NodeId::null())
+        Ok(testing_node_id())
     }
 
-    fn add_child_to_keyed_boxed(
+    fn add_child_to_slot_boxed(
         &mut self,
         _parent: NodeId,
         _key: &str,
         _widget: Box<dyn Widget>,
     ) -> Result<NodeId> {
-        Ok(NodeId::null())
+        Ok(testing_node_id())
     }
 
     fn attach(&mut self, _parent: NodeId, _child: NodeId) -> Result<()> {
         Ok(())
     }
 
-    fn attach_keyed(&mut self, _parent: NodeId, _key: &str, _child: NodeId) -> Result<()> {
+    fn attach_slot(&mut self, _parent: NodeId, _key: &str, _child: NodeId) -> Result<()> {
         Ok(())
     }
 
     fn detach(&mut self, _child: NodeId) -> Result<()> {
+        Ok(())
+    }
+
+    fn wake_handle(&self, _lifetime: crate::WorkLifetime) -> Result<crate::NodeWakeHandle> {
+        Err(Error::NodeNotFound(self.node_id))
+    }
+
+    fn remove_after_dispatch(&mut self, _node: NodeId) -> Result<()> {
         Ok(())
     }
 

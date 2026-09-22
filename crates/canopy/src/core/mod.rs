@@ -25,6 +25,8 @@ pub mod path;
 pub mod render;
 /// Scripting support.
 pub mod script;
+/// Immutable frame observations.
+pub mod snapshot;
 /// Shared node name types.
 pub mod state;
 /// Styling and color helpers.
@@ -53,6 +55,8 @@ pub mod poll;
 pub mod termbuf;
 /// Text utilities.
 pub mod text;
+/// Lifetime-bound worker notifications.
+pub mod wake;
 /// Widget slot borrowing and extraction guards.
 mod widget_access;
 /// World state and layout integration.
@@ -60,16 +64,26 @@ pub mod world;
 
 // Public exports from internal modules
 pub use canopy::{
-    AutomationCallback, AutomationHandle, Canopy, Loader, RoutePhase, RouteTraceEntry,
-    ScriptJournalEntry,
+    AutomationCallback, AutomationHandle, Canopy, CanopyBuilder, EvalId, EvalOutcome, EvalRequest,
+    EvalTicket, FrameId, Loader, RoutePhase, RouteTraceEntry, ScriptJournalEntry, ScriptOrigin,
+    ScriptTrust, TurnOutcome, Work,
 };
-pub use change::ChangeOutcome;
-pub use children::KeyedChildren;
-pub use context::{ChildKey, Context, FocusScope, ViewContext};
+pub use change::{ChangeOutcome, ChangeSet, Invalidation};
+pub use children::{ChildBuilder, ChildConfig, KeyedChildren};
+pub use context::{
+    ChildSlot, Context, ContextExt, FocusDirection, FocusScope, RevealAlign, ViewContext,
+    ViewContextExt,
+};
 pub use fixture::{Fixture, FixtureInfo};
 pub use id::{NodeId, TypedId};
 pub use inputmap::{
-    BindingId, BindingOwner, BindingPhase, BindingScope, BindingTarget, ExclusiveFrameToken,
-    FrameworkBindingGroup, InputSpec,
+    BindingId, BindingOptions, BindingOwner, BindingPhase, BindingScope, FrameworkBindingGroup,
+    InputSpec,
 };
-pub use world::Core;
+pub use node::SemanticIdentity;
+pub use snapshot::{FrameSnapshot, NodeSnapshot, WidgetSemantics};
+pub use wake::{NodeWakeHandle, WakeOutcome, WorkLifetime};
+pub use world::{
+    Core,
+    interaction::{InteractionToken, ModalBindings, ModalOptions},
+};

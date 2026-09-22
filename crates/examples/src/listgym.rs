@@ -1,12 +1,15 @@
 use canopy::{
-    command, derive_commands,
-    error::Error,
-    layout::{CanvasContext, MeasureConstraints, Measurement, Size},
-    prelude::*,
-    style::solarized,
+    Canopy, CanopyBuilder, Context, ContextExt, Loader, NodeId, NodeName, Render, ViewContext,
+    ViewContextExt, Widget, derive_commands,
+    error::{Error, Result},
+    geom::Size,
+    layout::{CanvasContext, MeasureConstraints, Measurement},
+    style::canopy as palette,
 };
-use canopy_widgets::{CanvasWidth, Frame, List, Panes, Selectable, Text, VStack};
+use canopy_widgets::{CanvasWidth, Columns, Container, List, Selectable, Text};
 use rand::RngExt;
+
+use crate::{fixed_row, flex_row};
 
 /// Sample text content for list items.
 const TEXT: &str = "What a struggle must have gone on during long centuries between the several kinds of trees, each annually scattering its seeds by the thousand; what war between insect and insect — between insects, snails, and other animals with birds and beasts of prey — all striving to increase, all feeding on each other, or on the trees, their seeds and seedlings, or on the other plants which first clothed the ground and thus checked the growth of the trees.";
@@ -18,91 +21,43 @@ const COLORS: &[&str] = &["red", "blue"];
 const DEFAULT_BINDINGS: &str = r#"
 root.default_bindings()
 
-canopy.bind("p", { path = "list_gym", description = "Log demo message" }, function()
-    canopy.log("list gym")
-end)
-canopy.bind("a", { path = "list_gym", description = "Add item" }, function()
-    list_gym.add_item()
-end)
-canopy.bind("A", { path = "list_gym", description = "Append item" }, function()
-    list_gym.append_item()
-end)
-canopy.bind("C", { path = "list_gym", description = "Clear list" }, function()
-    list_gym.clear()
-end)
-canopy.bind("q", { path = "list_gym", description = "Quit" }, function()
-    root.quit()
-end)
-canopy.bind("g", { path = "list_gym", description = "First item" }, function()
-    list.select_first()
-end)
-canopy.bind("G", { path = "list_gym", description = "Last item" }, function()
-    list.select_last()
-end)
-canopy.bind("d", { path = "list_gym", description = "Delete item" }, function()
-    list.delete_selected()
-end)
-canopy.bind("j", { path = "list_gym", description = "Next item" }, function()
-    list.select_by(1)
-end)
-canopy.bind("k", { path = "list_gym", description = "Previous item" }, function()
-    list.select_by(-1)
-end)
-canopy.bind_mouse("ScrollDown", { path = "list_gym", description = "Next item" }, function()
-    list.select_by(1)
-end)
-canopy.bind_mouse("ScrollUp", { path = "list_gym", description = "Previous item" }, function()
-    list.select_by(-1)
-end)
-canopy.bind("Down", { path = "list_gym", description = "Next item" }, function()
-    list.select_by(1)
-end)
-canopy.bind("Up", { path = "list_gym", description = "Previous item" }, function()
-    list.select_by(-1)
-end)
-canopy.bind("J", { path = "list_gym", description = "Scroll down" }, function()
-    list.scroll("Down")
-end)
-canopy.bind("K", { path = "list_gym", description = "Scroll up" }, function()
-    list.scroll("Up")
-end)
-canopy.bind("h", { path = "list_gym", description = "Scroll left" }, function()
-    list.scroll("Left")
-end)
-canopy.bind("l", { path = "list_gym", description = "Scroll right" }, function()
-    list.scroll("Right")
-end)
-canopy.bind("Left", { path = "list_gym", description = "Scroll left" }, function()
-    list.scroll("Left")
-end)
-canopy.bind("Right", { path = "list_gym", description = "Scroll right" }, function()
-    list.scroll("Right")
-end)
-canopy.bind("s", { path = "list_gym", description = "Add column" }, function()
-    list_gym.add_column()
-end)
-canopy.bind("x", { path = "list_gym", description = "Delete column" }, function()
-    list_gym.delete_column()
-end)
-canopy.bind("Tab", { path = "list_gym", description = "Next column" }, function()
-    panes.focus_column(1)
-end)
-canopy.bind("BackTab", { path = "list_gym", description = "Previous column" }, function()
-    panes.focus_column(-1)
-end)
-canopy.bind("PageDown", { path = "list_gym", description = "Page down" }, function()
-    list.page(1)
-end)
-canopy.bind("Space", { path = "list_gym", description = "Page down" }, function()
-    list.page(1)
-end)
-canopy.bind("PageUp", { path = "list_gym", description = "Page up" }, function()
-    list.page(-1)
-end)
+canopy.keymap({
+    path = "list_gym",
+    {
+        key = "p",
+        description = "Log demo message",
+        action = function()
+            canopy.log("list gym")
+        end,
+    },
+    { key = "a", description = "Add item", action = command.list_gym.add_item() },
+    { key = "A", description = "Append item", action = command.list_gym.append_item() },
+    { key = "C", description = "Clear list", action = command.list_gym.clear() },
+    { key = "q", description = "Quit", action = command.root.quit() },
+    { key = "g", description = "First item", action = command.list.select_first() },
+    { key = "G", description = "Last item", action = command.list.select_last() },
+    { key = "d", description = "Delete item", action = command.list.delete_selected() },
+    { key = { "j", "Down" }, description = "Next item", action = command.list.select_by(1) },
+    { key = { "k", "Up" }, description = "Previous item", action = command.list.select_by(-1) },
+    { key = "J", description = "Scroll down", action = command.list.scroll("Down") },
+    { key = "K", description = "Scroll up", action = command.list.scroll("Up") },
+    { key = { "h", "Left" }, description = "Scroll left", action = command.list.scroll("Left") },
+    {
+        key = { "l", "Right" },
+        description = "Scroll right",
+        action = command.list.scroll("Right"),
+    },
+    { key = "s", description = "Add column", action = command.list_gym.add_column() },
+    { key = "x", description = "Delete column", action = command.list_gym.delete_column() },
+    { key = "Tab", description = "Next column", action = command.columns.focus_column(1) },
+    { key = "BackTab", description = "Previous column", action = command.columns.focus_column(-1) },
+    { key = { "PageDown", "Space" }, description = "Page down", action = command.list.page(1) },
+    { key = "PageUp", description = "Page up", action = command.list.page(-1) },
+})
 "#;
 
 /// Focusable list entry that renders text content.
-pub struct ListEntry {
+pub(crate) struct ListEntry {
     /// Text content for the entry.
     text: Text,
 }
@@ -156,8 +111,23 @@ fn list_item(index: usize) -> ListEntry {
     ListEntry::new(text)
 }
 
+/// Return the columns node, once mounted.
+fn columns_id(ctx: &dyn ViewContext) -> Result<NodeId> {
+    ctx.first_in_tree::<Columns>()
+        .map(Into::into)
+        .ok_or_else(|| Error::Invalid("columns not initialized".into()))
+}
+
+/// Return the column that holds focus, if any.
+fn focused_column(ctx: &dyn ViewContext, columns: NodeId) -> Option<(usize, NodeId)> {
+    ctx.children_of(columns)
+        .into_iter()
+        .enumerate()
+        .find(|(_, pane)| ctx.is_on_focus_path_of(*pane))
+}
+
 /// Status bar widget for the list gym demo.
-pub struct StatusBar;
+pub(crate) struct StatusBar;
 
 impl StatusBar {
     /// Construct a status bar.
@@ -165,27 +135,15 @@ impl StatusBar {
         Self
     }
 
-    /// Locate the panes node in the tree.
-    fn panes_id(ctx: &dyn ViewContext) -> Option<NodeId> {
-        ctx.first_in_tree::<Panes>().map(Into::into)
-    }
-
     /// Build the status text based on the focused column.
     fn label(&self, ctx: &dyn ViewContext) -> String {
-        let Some(panes_id) = Self::panes_id(ctx) else {
+        let Ok(columns) = columns_id(ctx) else {
             return "listgym".to_string();
         };
-        let columns = ctx.children_of(panes_id);
-        let total = columns.len();
-        let focused = columns
-            .iter()
-            .position(|node| ctx.node_is_on_focus_path(*node));
-
-        match (focused, total) {
-            (Some(idx), total) if total > 0 => {
-                format!("listgym  col {}/{}", idx + 1, total)
-            }
-            _ => "listgym".to_string(),
+        let total = ctx.children_of(columns).len();
+        match focused_column(ctx, columns) {
+            Some((index, _)) => format!("listgym  col {}/{}", index + 1, total),
+            None => "listgym".to_string(),
         }
     }
 }
@@ -221,21 +179,20 @@ impl ListGym {
         Self
     }
 
-    /// Create a framed list column and return the frame node id.
-    fn create_column(c: &mut dyn Context) -> Result<TypedId<Frame>> {
-        let frame_id = c.create_detached(Frame::new())?;
-        let list_id = c.add_child_to(
-            frame_id,
-            List::<ListEntry>::new().with_selection_indicator("list/selected", "█ ", true),
-        )?;
-        // Add initial items
-        c.with_widget(list_id, |list: &mut List<ListEntry>, ctx| {
+    /// Create a detached list column and return its node id.
+    fn create_column(c: &mut dyn Context) -> Result<NodeId> {
+        let list_id = c.create_detached(List::<ListEntry>::new().with_selection_indicator(
+            "list/selected",
+            "█ ",
+            true,
+        ))?;
+        c.with_widget_mut(list_id, |list: &mut List<ListEntry>, ctx| {
             for i in 0..10 {
                 list.append(ctx, list_item(i))?;
             }
             Ok(())
         })?;
-        Ok(frame_id)
+        Ok(list_id.into())
     }
 
     /// Execute a closure with mutable access to the list widget.
@@ -243,20 +200,15 @@ impl ListGym {
     where
         F: FnMut(&mut List<ListEntry>, &mut dyn Context) -> Result<R>,
     {
-        let list_id = self.list_id(c)?;
-        c.with_widget(list_id, |list: &mut List<ListEntry>, ctx| f(list, ctx))
-    }
-
-    /// Find the list to target for list commands.
-    fn list_id(&self, c: &dyn Context) -> Result<TypedId<List<ListEntry>>> {
-        (c as &dyn ViewContext)
+        let list_id = (c as &dyn ViewContext)
             .focused_or_first_descendant::<List<ListEntry>>()
-            .ok_or_else(|| Error::Invalid("list not initialized".into()))
+            .ok_or_else(|| Error::Invalid("list not initialized".into()))?;
+        c.with_widget_mut(list_id, |list: &mut List<ListEntry>, ctx| f(list, ctx))
     }
 
     #[command]
     /// Add an item after the current focus.
-    pub fn add_item(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn add_item(&self, c: &mut dyn Context) -> Result<()> {
         self.with_list(c, |list, ctx| {
             let index = list.selected_index().unwrap_or(0) + 1;
             list.insert(ctx, index, list_item(index))?;
@@ -266,7 +218,7 @@ impl ListGym {
 
     #[command]
     /// Add an item at the end of the list.
-    pub fn append_item(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn append_item(&self, c: &mut dyn Context) -> Result<()> {
         self.with_list(c, |list, ctx| {
             let index = list.len();
             list.append(ctx, list_item(index))?;
@@ -276,7 +228,7 @@ impl ListGym {
 
     #[command]
     /// Clear all items from the list.
-    pub fn clear(&mut self, c: &mut dyn Context) -> Result<()> {
+    pub(crate) fn clear(&self, c: &mut dyn Context) -> Result<()> {
         self.with_list(c, |list, ctx| {
             list.clear(ctx)?;
             Ok(())
@@ -284,16 +236,32 @@ impl ListGym {
     }
 
     #[command]
-    /// Add a new column containing a list.
-    pub fn add_column(&mut self, c: &mut dyn Context) -> Result<()> {
-        let frame_id = Self::create_column(c)?;
-        c.with_unique_descendant::<Panes, _>(|panes, ctx| panes.insert_col(ctx, frame_id))
+    /// Add a column after the focused one and focus its list.
+    pub(crate) fn add_column(&self, c: &mut dyn Context) -> Result<()> {
+        let columns = columns_id(c)?;
+        let list = Self::create_column(c)?;
+        let mut panes = c.children_of(columns);
+        let index = focused_column(c, columns).map_or(panes.len(), |(index, _)| index + 1);
+        panes.insert(index, list);
+        c.set_children_of(columns, panes)?;
+        let target = c
+            .focusable_leaves(list)
+            .first()
+            .copied()
+            .or_else(|| c.first_leaf(list));
+        if let Some(target) = target {
+            c.set_focus(target)?;
+        }
+        Ok(())
     }
 
     #[command]
-    /// Delete the focused column.
-    pub fn delete_column(&mut self, c: &mut dyn Context) -> Result<()> {
-        c.with_unique_descendant::<Panes, _>(|panes, ctx| panes.delete_focus(ctx))?;
+    /// Delete the focused column. Focus recovers to a neighbor.
+    pub(crate) fn delete_column(&self, c: &mut dyn Context) -> Result<()> {
+        let columns = columns_id(c)?;
+        if let Some((_, pane)) = focused_column(c, columns) {
+            c.remove_subtree(pane)?;
+        }
         Ok(())
     }
 }
@@ -304,41 +272,44 @@ impl Widget for ListGym {
     }
 
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
-        let panes_id = c.create_detached(Panes::new())?;
-        let status_id = c.create_detached(StatusBar::new())?;
-        c.add_child(
-            VStack::new()
-                .push_flex(panes_id, 1)
-                .push_fixed(status_id, 1),
-        )?;
-
-        let frame_id = Self::create_column(c)?;
-        c.with_widget(panes_id, |panes: &mut Panes, ctx| {
-            panes.insert_col(ctx, frame_id)
-        })?;
-        Ok(())
+        let root = c.node_id();
+        let layout = c.add_child_to(root, Container::column())?;
+        let columns: NodeId = c.add_child_to(layout, Columns::new())?.into();
+        let status: NodeId = c.add_child_to(layout, StatusBar::new())?.into();
+        c.set_layout_override_of(columns, flex_row(1))?;
+        c.set_layout_override_of(status, fixed_row(1))?;
+        let list = Self::create_column(c)?;
+        c.set_children_of(columns, vec![list])
     }
 }
 
 impl Loader for ListGym {
     fn load(c: &mut Canopy) -> Result<()> {
         c.add_commands::<List<ListEntry>>()?;
-        c.add_commands::<Panes>()?;
+        c.add_commands::<Columns>()?;
         c.add_commands::<Self>()?;
         Ok(())
     }
 }
 
-/// Install key bindings for the list gym demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
+/// Install native styles during the configuration phase.
+fn setup_style(cnpy: &mut Canopy) {
     cnpy.style_mut()
         .rules()
-        .fg("red/text", solarized::RED)
-        .fg("blue/text", solarized::BLUE)
-        .fg("statusbar/text", solarized::BLUE)
-        .fg("list/selected", solarized::BLUE)
+        .fg("red/text", palette::RED)
+        .fg("blue/text", palette::BLUE)
+        .fg("statusbar/text", palette::ACCENT)
+        .fg("list/selected", palette::ACCENT)
         .apply();
+}
 
-    cnpy.eval_script(DEFAULT_BINDINGS)?;
-    Ok(())
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder
+        .configure(|cnpy| {
+            setup_style(cnpy);
+            Ok(())
+        })
+        .bindings("listgym", DEFAULT_BINDINGS)
 }

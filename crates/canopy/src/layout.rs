@@ -4,7 +4,7 @@ use std::result::Result;
 
 use thiserror::Error;
 
-use crate::geom::{Rect, Size as GeomSize};
+use crate::geom::{Rect, Size};
 
 /// Stack direction for children.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,6 +49,28 @@ pub enum Sizing {
     Flex(u32),
 }
 
+/// Per-axis policy for measurement beyond the available viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MeasureOverflow {
+    /// Use the enclosing layout's policy, bounded at the root.
+    #[default]
+    Inherit,
+    /// Measure within the available space, even under an unbounded parent.
+    Bounded,
+    /// Allow measurement beyond the available space.
+    Unbounded,
+}
+
+impl MeasureOverflow {
+    /// Resolve this policy against an enclosing policy.
+    fn resolve(self, parent: Self) -> Self {
+        match self {
+            Self::Inherit => parent,
+            explicit => explicit,
+        }
+    }
+}
+
 /// Invalid layout configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum LayoutValidationError {
@@ -74,6 +96,45 @@ pub enum LayoutValidationError {
         /// Padding axis name.
         axis: &'static str,
     },
+    /// A fraction bound lies outside `(0, 1]`.
+    #[error("{axis} fraction {numerator}/{denominator} must lie in (0, 1]")]
+    InvalidFraction {
+        /// Layout axis name.
+        axis: &'static str,
+        /// Fraction numerator.
+        numerator: u32,
+        /// Fraction denominator.
+        denominator: u32,
+    },
+}
+
+/// A proportion of a parent's width, such as one third.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fraction {
+    /// Parts taken.
+    numerator: u32,
+    /// Parts in the whole.
+    denominator: u32,
+}
+
+impl Fraction {
+    /// Construct `numerator / denominator`.
+    ///
+    /// [`Layout::validate`] rejects a fraction outside `(0, 1]`.
+    pub const fn new(numerator: u32, denominator: u32) -> Self {
+        Self {
+            numerator,
+            denominator,
+        }
+    }
+
+    /// Return this fraction of `whole`, rounded down.
+    pub fn of(self, whole: u32) -> u32 {
+        let parts = u64::from(whole) * u64::from(self.numerator);
+        parts
+            .checked_div(u64::from(self.denominator))
+            .map_or(0, |part| u32::try_from(part).unwrap_or(u32::MAX))
+    }
 }
 
 /// Edge insets for padding.
@@ -131,9 +192,6 @@ impl Edges {
     }
 }
 
-/// Size with width and height.
-pub type Size = GeomSize;
-
 impl Direction {
     /// Size along the main axis.
     pub fn main_size(&self, size: Size) -> u32 {
@@ -178,6 +236,12 @@ pub struct Layout {
     pub min_width: Option<u32>,
     /// Maximum outer width constraint (cells).
     pub max_width: Option<u32>,
+    /// Maximum outer width as a fraction of the parent's width budget.
+    ///
+    /// The budget is the parent's content width less the gaps between its
+    /// displayed children in a row, or the screen width at the root. The bound
+    /// joins `max_width` by taking the smaller, and `min_width` still wins.
+    pub max_width_fraction: Option<Fraction>,
 
     /// Minimum outer height constraint (cells).
     pub min_height: Option<u32>,
@@ -185,9 +249,9 @@ pub struct Layout {
     pub max_height: Option<u32>,
 
     /// Allow horizontal overflow during measurement.
-    pub overflow_x: bool,
+    pub overflow_x: MeasureOverflow,
     /// Allow vertical overflow during measurement.
-    pub overflow_y: bool,
+    pub overflow_y: MeasureOverflow,
 
     /// Structural padding inside the widget (cells).
     pub padding: Edges,
@@ -208,6 +272,199 @@ pub struct Layout {
     pub align_vertical: Align,
 }
 
+/// Persistent parent constraints applied after the widget's base layout.
+///
+/// `None` inherits a field. For optional bounds, `Some(None)` clears the bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutOverride {
+    /// Override for [`Layout::display`].
+    pub display: Option<Display>,
+    /// Override for [`Layout::direction`].
+    pub direction: Option<Direction>,
+    /// Override for [`Layout::width`].
+    pub width: Option<Sizing>,
+    /// Override for [`Layout::height`].
+    pub height: Option<Sizing>,
+    /// Override for [`Layout::min_width`].
+    pub min_width: Option<Option<u32>>,
+    /// Override for [`Layout::max_width`].
+    pub max_width: Option<Option<u32>>,
+    /// Override for [`Layout::max_width_fraction`].
+    pub max_width_fraction: Option<Option<Fraction>>,
+    /// Override for [`Layout::min_height`].
+    pub min_height: Option<Option<u32>>,
+    /// Override for [`Layout::max_height`].
+    pub max_height: Option<Option<u32>>,
+    /// Override for [`Layout::overflow_x`].
+    pub overflow_x: Option<MeasureOverflow>,
+    /// Override for [`Layout::overflow_y`].
+    pub overflow_y: Option<MeasureOverflow>,
+    /// Override for [`Layout::padding`].
+    pub padding: Option<Edges>,
+    /// Override for [`Layout::gap`].
+    pub gap: Option<u32>,
+    /// Override for [`Layout::align_horizontal`].
+    pub align_horizontal: Option<Align>,
+    /// Override for [`Layout::align_vertical`].
+    pub align_vertical: Option<Align>,
+}
+
+impl LayoutOverride {
+    /// Inherit every widget field.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override every field of a complete layout.
+    pub fn full(layout: Layout) -> Self {
+        Self {
+            display: Some(layout.display),
+            direction: Some(layout.direction),
+            width: Some(layout.width),
+            height: Some(layout.height),
+            min_width: Some(layout.min_width),
+            max_width: Some(layout.max_width),
+            max_width_fraction: Some(layout.max_width_fraction),
+            min_height: Some(layout.min_height),
+            max_height: Some(layout.max_height),
+            overflow_x: Some(layout.overflow_x),
+            overflow_y: Some(layout.overflow_y),
+            padding: Some(layout.padding),
+            gap: Some(layout.gap),
+            align_horizontal: Some(layout.align_horizontal),
+            align_vertical: Some(layout.align_vertical),
+        }
+    }
+
+    /// Apply constraints and validate both the widget and resulting layout.
+    pub fn apply(self, base: Layout) -> Result<Layout, LayoutValidationError> {
+        base.validate()?;
+        let mut layout = base;
+        if let Some(value) = self.display {
+            layout.display = value;
+        }
+        if let Some(value) = self.direction {
+            layout.direction = value;
+        }
+        if let Some(value) = self.width {
+            layout.width = value;
+        }
+        if let Some(value) = self.height {
+            layout.height = value;
+        }
+        if let Some(value) = self.min_width {
+            layout.min_width = value;
+        }
+        if let Some(value) = self.max_width {
+            layout.max_width = value;
+        }
+        if let Some(value) = self.max_width_fraction {
+            layout.max_width_fraction = value;
+        }
+        if let Some(value) = self.min_height {
+            layout.min_height = value;
+        }
+        if let Some(value) = self.max_height {
+            layout.max_height = value;
+        }
+        if let Some(value) = self.overflow_x {
+            layout.overflow_x = value;
+        }
+        if let Some(value) = self.overflow_y {
+            layout.overflow_y = value;
+        }
+        if let Some(value) = self.padding {
+            layout.padding = value;
+        }
+        if let Some(value) = self.gap {
+            layout.gap = value;
+        }
+        if let Some(value) = self.align_horizontal {
+            layout.align_horizontal = value;
+        }
+        if let Some(value) = self.align_vertical {
+            layout.align_vertical = value;
+        }
+        layout.validate()?;
+        Ok(layout)
+    }
+
+    /// Persist only fields changed by a layout callback.
+    pub(crate) fn record_changes(&mut self, before: Layout, after: Layout) {
+        if before.display != after.display {
+            self.display = Some(after.display);
+        }
+        if before.direction != after.direction {
+            self.direction = Some(after.direction);
+        }
+        if before.width != after.width {
+            self.width = Some(after.width);
+        }
+        if before.height != after.height {
+            self.height = Some(after.height);
+        }
+        if before.min_width != after.min_width {
+            self.min_width = Some(after.min_width);
+        }
+        if before.max_width != after.max_width {
+            self.max_width = Some(after.max_width);
+        }
+        if before.max_width_fraction != after.max_width_fraction {
+            self.max_width_fraction = Some(after.max_width_fraction);
+        }
+        if before.min_height != after.min_height {
+            self.min_height = Some(after.min_height);
+        }
+        if before.max_height != after.max_height {
+            self.max_height = Some(after.max_height);
+        }
+        if before.overflow_x != after.overflow_x {
+            self.overflow_x = Some(after.overflow_x);
+        }
+        if before.overflow_y != after.overflow_y {
+            self.overflow_y = Some(after.overflow_y);
+        }
+        if before.padding != after.padding {
+            self.padding = Some(after.padding);
+        }
+        if before.gap != after.gap {
+            self.gap = Some(after.gap);
+        }
+        if before.align_horizontal != after.align_horizontal {
+            self.align_horizontal = Some(after.align_horizontal);
+        }
+        if before.align_vertical != after.align_vertical {
+            self.align_vertical = Some(after.align_vertical);
+        }
+    }
+    /// Set width to flex with the provided weight.
+    ///
+    /// A zero weight is rejected when the override is applied.
+    pub fn flex_horizontal(mut self, weight: u32) -> Self {
+        self.width = Some(Sizing::Flex(weight));
+        self
+    }
+    /// Set height to flex with the provided weight.
+    ///
+    /// A zero weight is rejected when the override is applied.
+    pub fn flex_vertical(mut self, weight: u32) -> Self {
+        self.height = Some(Sizing::Flex(weight));
+        self
+    }
+    /// Set both outer width bounds.
+    pub fn fixed_width(mut self, value: u32) -> Self {
+        self.min_width = Some(Some(value));
+        self.max_width = Some(Some(value));
+        self
+    }
+    /// Set both outer height bounds.
+    pub fn fixed_height(mut self, value: u32) -> Self {
+        self.min_height = Some(Some(value));
+        self.max_height = Some(Some(value));
+        self
+    }
+}
+
 impl Default for Layout {
     fn default() -> Self {
         Self::column()
@@ -224,10 +481,11 @@ impl Layout {
             height: Sizing::Measure,
             min_width: None,
             max_width: None,
+            max_width_fraction: None,
             min_height: None,
             max_height: None,
-            overflow_x: false,
-            overflow_y: false,
+            overflow_x: MeasureOverflow::Inherit,
+            overflow_y: MeasureOverflow::Inherit,
             padding: Edges::all(0),
             gap: 0,
             align_horizontal: Align::Start,
@@ -253,7 +511,7 @@ impl Layout {
     }
 
     /// Remove this node from layout and rendering.
-    pub fn none(mut self) -> Self {
+    pub fn hidden(mut self) -> Self {
         self.display = Display::None;
         self
     }
@@ -286,6 +544,12 @@ impl Layout {
         self
     }
 
+    /// Bound the outer width by a fraction of the parent's width budget.
+    pub fn max_width_fraction(mut self, fraction: Fraction) -> Self {
+        self.max_width_fraction = Some(fraction);
+        self
+    }
+
     /// Set the minimum outer height.
     pub fn min_height(mut self, n: u32) -> Self {
         self.min_height = Some(n);
@@ -298,25 +562,28 @@ impl Layout {
         self
     }
 
-    /// Allow horizontal overflow during measurement.
-    pub fn overflow_x(mut self) -> Self {
-        self.overflow_x = true;
+    /// Set the horizontal measurement overflow policy.
+    pub fn overflow_x(mut self, policy: MeasureOverflow) -> Self {
+        self.overflow_x = policy;
         self
     }
 
-    /// Allow vertical overflow during measurement.
-    pub fn overflow_y(mut self) -> Self {
-        self.overflow_y = true;
+    /// Set the vertical measurement overflow policy.
+    pub fn overflow_y(mut self, policy: MeasureOverflow) -> Self {
+        self.overflow_y = policy;
         self
     }
 
-    /// Inherit overflow permission from an enclosing layout.
-    ///
-    /// Overflow only widens: a layout that already allows overflow on an axis
-    /// keeps it.
-    pub(crate) fn inherit_overflow(&mut self, x: bool, y: bool) {
-        self.overflow_x |= x;
-        self.overflow_y |= y;
+    /// Set whether this node participates in layout and rendering.
+    pub fn display(mut self, display: Display) -> Self {
+        self.display = display;
+        self
+    }
+
+    /// Resolve inherited policies without replacing explicit child policies.
+    pub(crate) fn inherit_overflow(&mut self, x: MeasureOverflow, y: MeasureOverflow) {
+        self.overflow_x = self.overflow_x.resolve(x);
+        self.overflow_y = self.overflow_y.resolve(y);
     }
 
     /// Convenience: fixed outer width without a `Fixed` enum.
@@ -385,7 +652,28 @@ impl Layout {
         validate_sizing("height", self.height)?;
         validate_padding("horizontal", self.padding.left, self.padding.right)?;
         validate_padding("vertical", self.padding.top, self.padding.bottom)?;
+        validate_fraction("width", self.max_width_fraction)?;
         Ok(())
+    }
+}
+
+/// Validate that a fraction bound lies in `(0, 1]`.
+fn validate_fraction(
+    axis: &'static str,
+    fraction: Option<Fraction>,
+) -> Result<(), LayoutValidationError> {
+    match fraction {
+        Some(Fraction {
+            numerator,
+            denominator,
+        }) if numerator == 0 || numerator > denominator => {
+            Err(LayoutValidationError::InvalidFraction {
+                axis,
+                numerator,
+                denominator,
+            })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -447,14 +735,6 @@ impl Constraint {
     /// Return true if this constraint is exact.
     pub fn is_exact(self) -> bool {
         matches!(self, Self::Exact(_))
-    }
-
-    /// Return the maximum bound implied by the constraint.
-    pub fn max_bound(self) -> u32 {
-        match self {
-            Self::Unbounded => u32::MAX,
-            Self::AtMost(n) | Self::Exact(n) => n,
-        }
     }
 }
 
@@ -624,6 +904,75 @@ mod tests {
         let layout = Layout::fill().width(Sizing::Measure);
         assert_eq!(layout.width, Sizing::Measure);
         assert_eq!(layout.height, Sizing::Flex(1));
+    }
+
+    #[test]
+    fn override_helpers_set_only_their_fields_and_reject_zero_weights() {
+        let base = Layout::column().padding(Edges::all(1)).gap(2);
+        let layout = LayoutOverride::new()
+            .flex_horizontal(2)
+            .flex_vertical(3)
+            .fixed_height(4)
+            .apply(base)
+            .expect("valid override");
+        assert_eq!(layout.width, Sizing::Flex(2));
+        assert_eq!(layout.height, Sizing::Flex(3));
+        assert_eq!((layout.min_height, layout.max_height), (Some(4), Some(4)));
+        assert_eq!((layout.padding, layout.gap), (base.padding, base.gap));
+        assert!(matches!(
+            LayoutOverride::new().flex_vertical(0).apply(base),
+            Err(LayoutValidationError::ZeroFlexWeight { axis: "height" })
+        ));
+    }
+
+    #[test]
+    fn width_fractions_must_lie_in_the_unit_interval() {
+        for (numerator, denominator, valid) in [
+            (0, 3, false),
+            (4, 3, false),
+            (1, 0, false),
+            (3, 3, true),
+            (1, 3, true),
+        ] {
+            let layout = Layout::column().max_width_fraction(Fraction::new(numerator, denominator));
+            assert_eq!(
+                layout.validate().is_ok(),
+                valid,
+                "{numerator}/{denominator}"
+            );
+        }
+        assert_eq!(Fraction::new(1, 3).of(u32::MAX), u32::MAX / 3);
+        assert_eq!(Fraction::new(1, 3).of(2), 0);
+    }
+
+    #[test]
+    fn a_width_fraction_override_inherits_replaces_or_clears() {
+        let (third, half) = (Fraction::new(1, 3), Fraction::new(1, 2));
+        let base = Layout::column().max_width_fraction(third);
+        let apply = |overrides: LayoutOverride| {
+            overrides
+                .apply(base)
+                .expect("valid override")
+                .max_width_fraction
+        };
+        assert_eq!(apply(LayoutOverride::new()), Some(third));
+        assert_eq!(
+            apply(LayoutOverride {
+                max_width_fraction: Some(Some(half)),
+                ..LayoutOverride::new()
+            }),
+            Some(half)
+        );
+        assert_eq!(
+            apply(LayoutOverride {
+                max_width_fraction: Some(None),
+                ..LayoutOverride::new()
+            }),
+            None
+        );
+        let mut recorded = LayoutOverride::new();
+        recorded.record_changes(base, Layout::column());
+        assert_eq!(recorded.max_width_fraction, Some(None));
     }
 
     #[test]

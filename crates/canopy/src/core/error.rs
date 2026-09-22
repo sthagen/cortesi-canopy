@@ -1,5 +1,7 @@
 use std::{error::Error as StdError, fmt, io, result::Result as StdResult, sync::mpsc};
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{commands::CommandError, core::id::NodeId, geom, layout::LayoutValidationError};
@@ -77,77 +79,79 @@ impl fmt::Display for NodeOperationKind {
     }
 }
 
-/// Stable category for a structured script or command failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScriptErrorKind {
-    /// Cooperative execution timeout.
-    Timeout,
-    /// Node lookup failed.
-    NodeNotFound,
-    /// A node exists but is detached.
-    NodeDetached,
-    /// A value or widget type did not match.
-    TypeMismatch,
-    /// A requested value was not found.
-    NotFound,
-    /// Invalid input or operation.
-    Invalid,
-    /// Unclassified Canopy failure.
-    Canopy,
-    /// Unknown command identifier.
-    UnknownCommand,
-    /// Conflicting command definition.
-    ConflictingCommand,
-    /// Invalid command definition.
-    InvalidCommand,
-    /// No command target was found.
-    NoTarget,
-    /// A command node handle is stale.
-    InvalidNode,
-    /// Positional argument count mismatch.
-    ArityMismatch,
-    /// Required named argument is missing.
-    MissingNamedArgument,
-    /// An unknown named argument was supplied.
-    UnknownNamedArgument,
-    /// Argument conversion failed.
-    Conversion,
-    /// An injected value is missing.
-    MissingInjected,
-    /// The routed target has the wrong widget type.
-    TargetTypeMismatch,
-    /// Command implementation returned an error.
-    CommandExecution,
-    /// Another top-level script evaluation is active.
-    ScriptBusy,
+/// Define the structured script error categories and their protocol labels.
+macro_rules! script_error_kinds {
+    ($( $(#[$meta:meta])* $variant:ident => $label:literal ),* $(,)?) => {
+        /// Stable category for a structured script or command failure.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        pub enum ScriptErrorKind {
+            $(
+                $(#[$meta])*
+                #[serde(rename = $label)]
+                $variant,
+            )*
+        }
+
+        impl ScriptErrorKind {
+            /// Return the stable protocol label for this category.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $label, )*
+                }
+            }
+        }
+    };
 }
 
-impl ScriptErrorKind {
-    /// Return the stable protocol label for this category.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Timeout => "timeout",
-            Self::NodeNotFound => "node_not_found",
-            Self::NodeDetached => "node_detached",
-            Self::TypeMismatch => "type_mismatch",
-            Self::NotFound => "not_found",
-            Self::Invalid => "invalid",
-            Self::Canopy => "canopy_error",
-            Self::UnknownCommand => "unknown_command",
-            Self::ConflictingCommand => "conflicting_command",
-            Self::InvalidCommand => "invalid_command",
-            Self::NoTarget => "no_target",
-            Self::InvalidNode => "node_invalid",
-            Self::ArityMismatch => "arity_mismatch",
-            Self::MissingNamedArgument => "missing_named_arg",
-            Self::UnknownNamedArgument => "unknown_named_arg",
-            Self::Conversion => "conversion",
-            Self::MissingInjected => "missing_injected",
-            Self::TargetTypeMismatch => "target_type_mismatch",
-            Self::CommandExecution => "command_exec",
-            Self::ScriptBusy => "script_busy",
-        }
-    }
+script_error_kinds! {
+    /// Cooperative execution timeout.
+    Timeout => "timeout",
+    /// Node lookup failed.
+    NodeNotFound => "node_not_found",
+    /// A node exists but is detached.
+    NodeDetached => "node_detached",
+    /// A value or widget type did not match.
+    TypeMismatch => "type_mismatch",
+    /// A requested value was not found.
+    NotFound => "not_found",
+    /// Invalid input or operation.
+    Invalid => "invalid",
+    /// Operation requires an unwound widget callback boundary.
+    InvalidPhase => "invalid_phase",
+    /// Unclassified Canopy failure.
+    Canopy => "canopy_error",
+    /// Unknown command identifier.
+    UnknownCommand => "unknown_command",
+    /// Conflicting command definition.
+    ConflictingCommand => "conflicting_command",
+    /// Invalid command definition.
+    InvalidCommand => "invalid_command",
+    /// No command target was found.
+    NoTarget => "no_target",
+    /// An exact node does not own the command.
+    WrongOwner => "wrong_owner",
+    /// The command is currently disabled.
+    DisabledCommand => "command_disabled",
+    /// A command node handle is stale.
+    InvalidNode => "node_invalid",
+    /// Positional argument count mismatch.
+    ArityMismatch => "arity_mismatch",
+    /// Required named argument is missing.
+    MissingNamedArgument => "missing_named_arg",
+    /// An unknown named argument was supplied.
+    UnknownNamedArgument => "unknown_named_arg",
+    /// Argument conversion failed.
+    Conversion => "conversion",
+    /// An injected value is missing.
+    MissingInjected => "missing_injected",
+    /// The routed target has the wrong widget type.
+    TargetTypeMismatch => "target_type_mismatch",
+    /// Command implementation returned an error.
+    CommandExecution => "command_exec",
+    /// Another top-level script evaluation is active.
+    ScriptBusy => "script_busy",
+    /// Script evaluation was explicitly cancelled.
+    ScriptCancelled => "script_cancelled",
 }
 
 impl fmt::Display for ScriptErrorKind {
@@ -159,6 +163,9 @@ impl fmt::Display for ScriptErrorKind {
 /// Core error type.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Evaluation explicitly cancelled by its caller.
+    #[error("script evaluation cancelled")]
+    ScriptCancelled,
     /// A render target exceeds its configured width limit.
     #[error("render target width {requested} exceeds limit {limit}")]
     RenderWidthLimit {
@@ -283,6 +290,12 @@ pub enum Error {
     /// Invalid structural operation.
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
+    /// Operation attempted before a mutable widget callback returned.
+    #[error("{operation} is not allowed during a widget mutation callback")]
+    InvalidPhase {
+        /// Operation requiring an unwound callback boundary.
+        operation: &'static str,
+    },
     /// Structural mutation attempted while a failed edit is unwinding.
     #[error("tree edit {operation} is not allowed during rollback")]
     TreeEditDuringRollback {
@@ -295,11 +308,7 @@ pub enum Error {
 
     #[error("parse error: {0}")]
     /// Parsing failure.
-    Parse(#[source] ParseError),
-
-    #[error("script run error: {0}")]
-    /// Script execution failure.
-    Script(String),
+    Parse(#[from] ParseError),
 
     /// Script execution failure with stable host category fields.
     #[error("script run error: {message}")]
@@ -327,6 +336,31 @@ pub enum Error {
     /// Node exists but is not attached to the root tree.
     #[error("node is detached: {0:?}")]
     NodeDetached(NodeId),
+}
+
+impl Error {
+    /// Construct a structured script failure.
+    pub(crate) fn script_structured(kind: ScriptErrorKind, message: impl Into<String>) -> Self {
+        Self::ScriptStructured {
+            kind,
+            command: None,
+            owner: None,
+            message: message.into(),
+        }
+    }
+
+    /// Attach an owner name to a structured script failure.
+    pub(crate) fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        if let Self::ScriptStructured { owner: slot, .. } = &mut self {
+            *slot = Some(owner.into());
+        }
+        self
+    }
+
+    /// Construct an unclassified structured script failure.
+    pub(crate) fn script(message: impl Into<String>) -> Self {
+        Self::script_structured(ScriptErrorKind::Canopy, message)
+    }
 }
 
 impl From<mpsc::RecvError> for Error {

@@ -1,3 +1,5 @@
+/// Canopy theme, the default.
+pub mod canopy;
 /// Color helpers.
 mod color;
 /// Dracula theme.
@@ -14,10 +16,67 @@ pub mod solarized;
 use std::collections::HashMap;
 
 pub use color::{Color, hex_byte};
-pub use effects::{Effect, StyleEffect};
-pub use palette::{Palette, theme};
+pub(crate) use palette::{Palette, theme};
 
 use crate::geom;
+
+/// Stable paint roles used by stock widgets, independent of child node names.
+pub mod roles {
+    /// Button component layer.
+    pub const BUTTON: &str = "button";
+    /// Button label paint path beneath its component and state layers.
+    pub const BUTTON_LABEL: &str = "text";
+    /// Button border paint path beneath its component and state layers.
+    pub const BUTTON_BORDER: &str = "border";
+    /// Button accelerator cell path, for the one label character a key names.
+    pub const BUTTON_KEY: &str = "key";
+    /// Input component layer.
+    pub const INPUT: &str = "input";
+    /// Input row background, including the space after its value.
+    pub const INPUT_BACKGROUND: &str = "background";
+    /// Optional visible input prompt.
+    pub const INPUT_PROMPT: &str = "prompt";
+    /// Input text paint path.
+    pub const INPUT_TEXT: &str = "text";
+    /// Input cursor cell path, falling back to the text role.
+    pub const INPUT_CURSOR: &str = "text/cursor";
+
+    /// Paint a retained selection according to which control takes the keys.
+    /// Pass actual focus, or the composite widget's active part. Inactive
+    /// selections remain visible without claiming keyboard focus.
+    pub const fn selection(active: bool) -> &'static str {
+        if active {
+            "selection"
+        } else {
+            "selection/dimmed"
+        }
+    }
+}
+
+/// Independent widget states mapped onto the existing style layer stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetState {
+    /// The widget or its descendant holds focus.
+    Focused,
+    /// The widget is selected independently of focus.
+    Selected,
+    /// The configured action is disabled.
+    Disabled,
+    /// The widget is pressed or explicitly active.
+    Pressed,
+}
+
+impl WidgetState {
+    /// Return the existing string layer for this state.
+    pub const fn layer(self) -> &'static str {
+        match self {
+            Self::Focused => "focused",
+            Self::Selected => "selected",
+            Self::Disabled => "disabled",
+            Self::Pressed => "active",
+        }
+    }
+}
 
 /// A text attribute.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -487,9 +546,22 @@ impl StyleMap {
         }
     }
 
+    /// Iterate over every rule as its canonical path and partial style.
+    ///
+    /// Paths omit the leading `/`, so the root rule's path is empty. The order
+    /// is unspecified.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &PartialStyle)> {
+        self.styles
+            .iter()
+            .map(|(path, style)| (path.as_str(), style))
+    }
+
     /// Insert a partial style at a path.
     fn insert_style(&mut self, path: &str, style: PartialStyle) {
-        self.styles.insert(canonical_path(path), style);
+        self.styles
+            .entry(canonical_path(path))
+            .and_modify(|existing| *existing = style.join(existing))
+            .or_insert(style);
     }
 }
 
@@ -729,7 +801,58 @@ impl StyleManager {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, fs};
+
     use super::*;
+
+    #[test]
+    fn stock_roles_preserve_fallback_across_decorative_levels() {
+        let mut map = StyleMap::new();
+        map.rules()
+            .fg("button/active/text", Color::Red)
+            .fg("button/active/border", Color::Blue)
+            .fg("input/text", Color::Green)
+            .apply();
+        let mut manager = StyleManager::new();
+        manager.push_layer(roles::BUTTON);
+        manager.push_layer(WidgetState::Pressed.layer());
+        let label = manager.get(&map, roles::BUTTON_LABEL);
+        let border = manager.get(&map, roles::BUTTON_BORDER);
+        manager.push();
+        manager.push();
+        assert_eq!(manager.get(&map, roles::BUTTON_LABEL), label);
+        assert_eq!(manager.get(&map, roles::BUTTON_BORDER), border);
+        let mut input = StyleManager::new();
+        input.push_layer(roles::INPUT);
+        input.push_layer(WidgetState::Focused.layer());
+        assert_eq!(
+            input.get(&map, roles::INPUT_CURSOR),
+            input.get(&map, roles::INPUT_TEXT)
+        );
+    }
+
+    #[test]
+    fn disabled_selected_and_focused_layers_remain_distinct() {
+        let mut map = StyleMap::new();
+        map.rules()
+            .fg("button/text", Color::White)
+            .fg("button/focused/text", Color::Blue)
+            .fg("button/focused/selected/text", Color::Green)
+            .fg("button/focused/selected/disabled/text", Color::Red)
+            .apply();
+        let mut manager = StyleManager::new();
+        manager.push_layer(roles::BUTTON);
+        let ordinary = manager.get(&map, roles::BUTTON_LABEL);
+        manager.push_layer(WidgetState::Focused.layer());
+        let focused = manager.get(&map, roles::BUTTON_LABEL);
+        manager.push_layer(WidgetState::Selected.layer());
+        let selected = manager.get(&map, roles::BUTTON_LABEL);
+        manager.push_layer(WidgetState::Disabled.layer());
+        let disabled = manager.get(&map, roles::BUTTON_LABEL);
+        assert_ne!(ordinary, focused);
+        assert_ne!(focused, selected);
+        assert_ne!(selected, disabled);
+    }
 
     #[test]
     fn style_builder_defines_a_reusable_rule() {
@@ -794,6 +917,7 @@ mod tests {
     /// Render every built-in theme in a stable order.
     fn dump_all_themes() -> String {
         [
+            ("canopy_dark", super::canopy::canopy_dark()),
             ("solarized_dark", solarized::solarized_dark()),
             ("solarized_light", solarized::solarized_light()),
             ("dracula", dracula::dracula()),
@@ -804,9 +928,18 @@ mod tests {
         .collect()
     }
 
+    /// Compare every built-in theme with its capture.
+    ///
+    /// Set `UPDATE_GOLDEN` to rewrite the capture from the themes instead of
+    /// editing it, so a palette change and its capture cannot disagree.
     #[test]
     fn built_in_themes_match_the_golden_rule_sets() {
-        assert_eq!(dump_all_themes(), include_str!("themes.golden"));
+        let dumped = dump_all_themes();
+        if env::var_os("UPDATE_GOLDEN").is_some() {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/core/style/themes.golden");
+            fs::write(path, &dumped).expect("theme capture is writable");
+        }
+        assert_eq!(dumped, include_str!("themes.golden"));
     }
 
     fn solid_style(fg: Color, bg: Color) -> Style {
@@ -1118,5 +1251,35 @@ mod tests {
 
         assert_eq!(resolved.fg, fg_spec.color_at(rect, point));
         assert_eq!(resolved.bg, bg_spec.color_at(rect, point));
+    }
+    #[test]
+    fn committed_style_rules_merge_canonical_components() {
+        let mut map = StyleMap::new();
+        map.rules().fg("/", Color::Red).apply();
+        let manager = StyleManager::new();
+        let root = manager.get(&map, "").resolve_solid().unwrap();
+        assert_eq!(root.fg, Color::Red);
+        assert_eq!(root.bg, Color::Black);
+        assert_eq!(root.attrs, AttrSet::default());
+
+        map.rules()
+            .fg("/item", Color::Blue)
+            .attr("/item", Attr::Bold)
+            .apply();
+        map.rules().bg("item/", Color::Green).apply();
+        let item = manager.get(&map, "item").resolve_solid().unwrap();
+        assert_eq!(item.fg, Color::Blue);
+        assert_eq!(item.bg, Color::Green);
+        assert_eq!(item.attrs, AttrSet::new(Attr::Bold));
+
+        map.rules()
+            .fg("//item/", Color::Yellow)
+            .bg("item", Color::Red)
+            .style("/item//", StyleBuilder::new().attrs(AttrSet::default()))
+            .apply();
+        let item = manager.get(&map, "item").resolve_solid().unwrap();
+        assert_eq!(item.fg, Color::Yellow);
+        assert_eq!(item.bg, Color::Red);
+        assert_eq!(item.attrs, AttrSet::default());
     }
 }

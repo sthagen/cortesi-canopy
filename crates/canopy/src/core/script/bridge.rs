@@ -1,6 +1,6 @@
 //! Guards and the bridge between a running script scope and the live `Canopy`.
 
-use std::{mem, result::Result as StdResult};
+use std::{fmt, mem, result::Result as StdResult};
 
 use ruau::vm::{
     HostType, HostTypeBuilder, MarshaledPair, RuntimeError, Scope, ScopedValue, ScriptErrorField,
@@ -8,8 +8,8 @@ use ruau::vm::{
 };
 
 use super::{
-    ArgValue, Canopy, ClosureRegistry, Core, LuauFunctionId, LuauState, NodeId, NonNull, Rc,
-    RefCell, Result, ScriptCache, commands, error,
+    Canopy, ClosureRegistry, Core, LuauFunctionId, LuauState, NodeId, NonNull, Rc, RefCell, Result,
+    ScriptCache, commands, error,
 };
 
 thread_local! {
@@ -109,9 +109,10 @@ pub(super) fn with_reentrant_canopy<R>(
 ) -> Option<Result<R>> {
     REENTRANT_CANOPY.with(|stack| {
         let canopy = stack.borrow().last().copied()?;
-        // SAFETY: `ReentrantCanopyGuard` is installed only while the script-originated
-        // routing call owns the live `&mut Canopy` on this thread, and is popped before
-        // that borrow returns to Ruau.
+        // SAFETY: `ReentrantCanopyGuard` is installed only while the
+        // script-originated routing call owns the live `&mut Canopy` on
+        // this thread, and is popped before that borrow returns to
+        // Ruau.
         Some(f(unsafe { &mut *canopy.as_ptr() }))
     })
 }
@@ -123,7 +124,7 @@ fn with_canopy<R>(scope: &Scope<'_>, f: impl FnOnce(&mut Canopy) -> Result<R>) -
         return f(&mut canopy);
     }
     with_reentrant_canopy(f)
-        .unwrap_or_else(|| Err(error::Error::Script("no active canopy context".into())))
+        .unwrap_or_else(|| Err(error::Error::script("no active canopy context")))
 }
 
 /// Push the active script anchor.
@@ -161,7 +162,7 @@ pub(super) fn with_current_canopy<R>(
             .script_context_stack
             .last()
             .copied()
-            .ok_or_else(|| error::Error::Script("no active script context".into()))?;
+            .ok_or_else(|| error::Error::script("no active script context"))?;
         f(canopy, node_id)
     })
 }
@@ -172,21 +173,96 @@ pub(super) fn node_handle_type() -> HostType {
         .class(&commands::declaration::Class::new("NodeId"))
         .eq_by(|left, right| left == right)
         .marshal(node_handle_marshal)
-        .tostring(|node_id| node_token(*node_id))
+        .tostring(|node_id| commands::node_token(*node_id))
         .build()
 }
 
-/// Return the external automation token for a node id.
-fn node_token(node_id: NodeId) -> String {
-    format!("{node_id:?}")
+/// Script-held command value: a command with checked arguments that a binding
+/// runs later.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ScriptCommandCall(pub(super) commands::CommandAction);
+
+impl fmt::Display for ScriptCommandCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}(", self.0.invocation.id.0)?;
+        match &self.0.invocation.args {
+            commands::CommandArgs::Positional(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    formatter.write_str(&arg_value_text(value))?;
+                }
+            }
+            commands::CommandArgs::Named(fields) => {
+                formatter.write_str(&arg_value_text(&commands::ArgValue::Map(fields.clone())))?;
+            }
+        }
+        formatter.write_str(")")
+    }
+}
+
+/// Render one command argument as Luau-like source text.
+fn arg_value_text(value: &commands::ArgValue) -> String {
+    match value {
+        commands::ArgValue::Null => "nil".to_string(),
+        commands::ArgValue::Bool(value) => value.to_string(),
+        commands::ArgValue::Int(value) => value.to_string(),
+        commands::ArgValue::UInt(value) => value.to_string(),
+        commands::ArgValue::Float(value) => value.to_string(),
+        commands::ArgValue::String(value) => format!("{value:?}"),
+        commands::ArgValue::Node(node) => commands::node_token(*node),
+        commands::ArgValue::Array(values) => format!(
+            "{{ {} }}",
+            values
+                .iter()
+                .map(arg_value_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        commands::ArgValue::Map(fields) => format!(
+            "{{ {} }}",
+            fields
+                .iter()
+                .map(|(key, value)| format!("{key} = {}", arg_value_text(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Build the host userdata descriptor for `CommandCall` values.
+pub(super) fn command_call_type() -> HostType {
+    HostTypeBuilder::<ScriptCommandCall>::new("CommandCall")
+        .class(&commands::declaration::Class::new("CommandCall"))
+        .eq_by(|left, right| left == right)
+        .marshal(|call| ValueSnapshot::String(call.to_string().into_bytes()))
+        .tostring(ToString::to_string)
+        .build()
+}
+
+/// Convert a script value into a command call, or report the value's type.
+pub(super) fn command_call_from_value<'s>(
+    scope: &Scope<'s>,
+    value: &ScopedValue<'s>,
+) -> StdResult<Option<ScriptCommandCall>, RuntimeError> {
+    match value {
+        ScopedValue::Userdata(userdata) => match userdata.borrow::<ScriptCommandCall>(scope) {
+            Ok(call) => Ok(Some(call.clone())),
+            Err(_) => Ok(None),
+        },
+        _ => Ok(None),
+    }
 }
 
 /// Marshal a node handle to the external automation token record.
 pub(super) fn node_handle_marshal(node_id: &NodeId) -> ValueSnapshot {
-    ValueSnapshot::Table(vec![
-        marshaled_string_pair("type", "NodeId"),
-        marshaled_string_pair("token", node_token(*node_id)),
-    ])
+    ValueSnapshot::Table(
+        commands::node_token_fields(*node_id)
+            .into_iter()
+            .map(|(key, value)| marshaled_string_pair(key, value))
+            .collect(),
+    )
 }
 
 /// Build a string-keyed marshaled table pair.
@@ -195,11 +271,6 @@ fn marshaled_string_pair(key: &str, value: impl Into<String>) -> MarshaledPair {
         key: ValueSnapshot::String(key.as_bytes().to_vec()),
         value: ValueSnapshot::String(value.into().into_bytes()),
     }
-}
-
-/// Convert a node identifier into its scripting representation.
-pub(super) fn node_id_to_arg(node_id: NodeId) -> ArgValue {
-    ArgValue::Node(node_id)
 }
 
 /// Convert a script node handle back into a node identifier.

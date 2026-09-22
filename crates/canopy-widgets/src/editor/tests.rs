@@ -1,26 +1,37 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use canopy::{
-    Canopy, Context, FocusScope, Loader, Widget, buf, command, derive_commands,
+    Canopy, Context, ContextExt, FocusDirection, FocusScope, Loader, NodeName, ScrollAxis,
+    ScrollMark, Widget, buf, derive_commands,
     error::Result,
     event::{key, mouse},
-    geom::Point,
-    layout::Layout,
-    state::NodeName,
+    geom::{Point, PointI32, Size},
+    layout::{Edges, Layout},
     style::{AttrSet, Color, Paint, PartialStyle, Style, StyleManager},
     testing::harness::Harness,
 };
 
-use super::{Selection, TextPosition, TextRange};
-use crate::editor::{
-    EditMode, Editor, EditorConfig, LineNumbers, WrapMode,
-    highlight::{HighlightSpan, Highlighter},
+use super::{
+    search::{PromptState, SearchDirection, find_matches},
+    vi::ViMode,
+};
+use crate::{
+    THIN,
+    editor::{
+        EditMode, Editor, EditorConfig, LineNumbers, WrapMode,
+        highlight::{HighlightSpan, Highlighter},
+    },
+    text_buffer::{Selection, TextPosition, TextRange},
 };
 
-canopy::key!(EditorSlot: Editor);
+canopy::slot!(EditorSlot: Editor);
 
 /// Host widget that mounts an editor as its only child.
 struct EditorHost {
@@ -58,7 +69,7 @@ impl EditorHost {
 impl Widget for EditorHost {
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
         let editor = Editor::with_config(self.text.clone(), self.config.clone());
-        let editor_id = c.add_keyed::<EditorSlot>(editor)?;
+        let editor_id = c.add_slot::<EditorSlot>(editor)?;
         c.set_layout(Layout::fill())?;
         c.set_layout_of(editor_id, Layout::fill())?;
         Ok(())
@@ -97,7 +108,7 @@ fn build_harness(text: &str, config: EditorConfig, width: u32, height: u32) -> H
 fn with_editor<R>(harness: &mut Harness, f: impl FnOnce(&mut Editor) -> R) -> R {
     harness
         .with_root_context(|_root: &mut EditorHost, ctx| {
-            ctx.with_child::<EditorSlot, _>(|editor, _| Ok(f(editor)))
+            ctx.with_typed_slot::<EditorSlot, _>(|editor, _| Ok(f(editor)))
         })
         .expect("editor missing")
 }
@@ -129,7 +140,7 @@ fn editor_cursor_location(harness: &mut Harness) -> Point {
 fn editor_view_scroll(harness: &mut Harness) -> Point {
     harness
         .with_root_context(|_root: &mut EditorHost, ctx| {
-            ctx.with_child::<EditorSlot, _>(|_editor, ctx| Ok(ctx.view().tl))
+            ctx.with_typed_slot::<EditorSlot, _>(|_editor, ctx| Ok(ctx.view().scroll))
         })
         .expect("editor missing")
 }
@@ -137,7 +148,7 @@ fn editor_view_scroll(harness: &mut Harness) -> Point {
 fn scroll_editor_to(harness: &mut Harness, x: u32, y: u32) {
     harness
         .with_root_context(|_root: &mut EditorHost, ctx| {
-            ctx.with_child::<EditorSlot, _>(|_editor, ctx| {
+            ctx.with_typed_slot::<EditorSlot, _>(|_editor, ctx| {
                 ctx.scroll_to(x, y);
                 Ok(())
             })
@@ -150,7 +161,7 @@ fn mouse_event(action: mouse::Action, x: u32, y: u32) -> mouse::MouseEvent {
         action,
         button: mouse::Button::Left,
         modifiers: key::Empty,
-        location: Point { x, y },
+        location: PointI32::try_from(Point { x, y }).expect("test points fit"),
     }
 }
 
@@ -160,6 +171,73 @@ fn render_with_line_numbers() {
     let mut harness = build_harness("hi\nok", config, 6, 2);
     harness.render().unwrap();
     harness.tbuf().assert_matches(buf!["1 hi  " "2 ok  "]);
+}
+
+/// Text that every read-only check must leave untouched.
+const READ_ONLY_TEXT: &str = "alpha\nbeta\ngamma";
+
+/// Drive `keys` against an editor and return its contents and revision.
+fn drive(mode: EditMode, read_only: bool, keys: &[key::KeyCode]) -> (String, u64) {
+    let config = EditorConfig::new()
+        .with_mode(mode)
+        .with_read_only(read_only);
+    let mut harness = build_harness(READ_ONLY_TEXT, config, 20, 6);
+    for code in keys {
+        harness.key(*code).expect("key dispatch");
+    }
+    with_editor(&mut harness, |editor| {
+        (editor.buffer().text(), editor.buffer().revision())
+    })
+}
+
+#[test]
+fn read_only_text_mode_ignores_every_edit_key() {
+    let mut keys = vec![
+        key::KeyCode::Enter,
+        key::KeyCode::Backspace,
+        key::KeyCode::Delete,
+        key::KeyCode::Tab,
+    ];
+    keys.extend("xyz".chars().map(key::KeyCode::Char));
+    let (text, revision) = drive(EditMode::Text, true, &keys);
+    assert_eq!(text, READ_ONLY_TEXT);
+    assert_eq!(revision, 0, "a read-only buffer records no edit");
+
+    let (edited, _) = drive(EditMode::Text, false, &keys);
+    assert_ne!(
+        edited, READ_ONLY_TEXT,
+        "the same keys edit a writable buffer, so the check above means something"
+    );
+}
+
+#[test]
+fn read_only_vi_mode_ignores_every_edit_command() {
+    // Deletes, changes, puts, opens, joins, indents, insert entry, and undo.
+    let sequence = "xXddDCccSsppPoOJ>><<rzi!\u{1b}aA!u";
+    let mut keys: Vec<key::KeyCode> = sequence.chars().map(key::KeyCode::Char).collect();
+    keys.push(key::KeyCode::Esc);
+    keys.push(key::KeyCode::Backspace);
+    keys.push(key::KeyCode::Delete);
+
+    let (text, revision) = drive(EditMode::Vi, true, &keys);
+    assert_eq!(text, READ_ONLY_TEXT);
+    assert_eq!(revision, 0, "a read-only buffer records no edit");
+
+    let (edited, _) = drive(EditMode::Vi, false, &keys);
+    assert_ne!(
+        edited, READ_ONLY_TEXT,
+        "the same keys edit a writable buffer, so the check above means something"
+    );
+}
+
+#[test]
+fn read_only_editor_can_decline_focus() {
+    let config = EditorConfig::new()
+        .with_read_only(true)
+        .with_focusable(false);
+    let harness = build_harness(READ_ONLY_TEXT, config, 20, 6);
+    let focused = harness.canopy.with_root_view(|view| view.focused_node());
+    assert!(focused.is_none(), "an unfocusable editor is skipped");
 }
 
 #[test]
@@ -300,6 +378,233 @@ fn search_replace_all() {
     assert_eq!(editor_text(&mut harness), "baz bar baz");
 }
 
+fn prepare_replace(harness: &mut Harness, query: &str, replacement: &str) {
+    with_editor(harness, |editor| {
+        editor.prompt = Some(PromptState::ReplaceConfirm {
+            query: query.to_string(),
+            replacement: replacement.to_string(),
+            matches: find_matches(&editor.buffer, query),
+            index: 0,
+            replace_all: false,
+        });
+    });
+}
+
+#[test]
+fn replace_all_consumes_original_occurrences_once() {
+    for (text, query, replacement, expected) in [
+        ("a", "a", "aa", "aa"),
+        ("aaaa", "aa", "a", "aa"),
+        ("aaa", "a", "", ""),
+        ("aa", "a", "a", "aa"),
+        ("éééé", "éé", "é", "éé"),
+        ("aa", "a", "x\ny", "x\nyx\ny"),
+        ("abc", "missing", "x", "abc"),
+        ("abc", "", "x", "abc"),
+    ] {
+        let config = EditorConfig::new().with_mode(EditMode::Vi);
+        let mut harness = build_harness(text, config, 20, 4);
+        prepare_replace(&mut harness, query, replacement);
+        harness.key('a').unwrap();
+        assert_eq!(editor_text(&mut harness), expected, "{text:?} / {query:?}");
+        assert!(with_editor(&mut harness, |editor| editor.prompt.is_none()));
+    }
+}
+
+#[test]
+fn replace_confirmation_preserves_skips_and_forward_order() {
+    let config = EditorConfig::new().with_mode(EditMode::Vi);
+    let mut harness = build_harness("a a a", config, 20, 2);
+    prepare_replace(&mut harness, "a", "aa");
+    harness.keys(['n', 'y']).unwrap();
+    assert_eq!(editor_text(&mut harness), "a aa a");
+    assert!(with_editor(&mut harness, |editor| editor.prompt.is_some()));
+    harness.key('y').unwrap();
+    assert_eq!(editor_text(&mut harness), "a aa aa");
+    assert!(with_editor(&mut harness, |editor| editor.prompt.is_none()));
+
+    with_editor(&mut harness, |editor| editor.set_text("a a a"));
+    prepare_replace(&mut harness, "a", "");
+    harness.keys(['n', 'a']).unwrap();
+    assert_eq!(editor_text(&mut harness), "a  ");
+    assert!(with_editor(&mut harness, |editor| editor.prompt.is_none()));
+}
+
+#[test]
+fn replace_confirmation_preserves_read_only_contents_and_selection() {
+    for response in ['y', 'a'] {
+        let config = EditorConfig::new()
+            .with_mode(EditMode::Vi)
+            .with_read_only(true);
+        let mut harness = build_harness("aaa", config, 10, 2);
+        prepare_replace(&mut harness, "a", "aa");
+        let selection = editor_selection(&mut harness);
+        harness.key(response).unwrap();
+        assert_eq!(editor_text(&mut harness), "aaa");
+        assert_eq!(editor_selection(&mut harness), selection);
+        assert!(with_editor(&mut harness, |editor| editor.prompt.is_none()));
+    }
+}
+
+#[test]
+fn replacement_keeps_single_line_normalization() {
+    let config = EditorConfig::new()
+        .with_mode(EditMode::Vi)
+        .with_multiline(false);
+    let mut harness = build_harness("aa", config, 20, 1);
+    prepare_replace(&mut harness, "a", "x\ny");
+    harness.key('a').unwrap();
+    assert_eq!(editor_text(&mut harness), "x yx y");
+}
+
+#[test]
+fn read_only_history_commands_preserve_text_selection_and_history() {
+    for command_path in [false, true] {
+        for redo in [false, true] {
+            let config = EditorConfig::new().with_mode(EditMode::Vi);
+            let mut harness = build_harness("abc", config, 10, 2);
+            with_editor(&mut harness, |editor| {
+                editor.buffer.insert_text("X");
+                if redo {
+                    assert!(editor.buffer.undo());
+                }
+                editor.set_config(editor.config().clone().with_read_only(true));
+            });
+            let text = editor_text(&mut harness);
+            let selection = editor_selection(&mut harness);
+            for read_only in [true, false] {
+                with_editor(&mut harness, |editor| {
+                    editor.set_config(editor.config().clone().with_read_only(read_only));
+                });
+                if command_path {
+                    harness
+                        .canopy
+                        .eval_script(if redo {
+                            "editor.redo()"
+                        } else {
+                            "editor.undo()"
+                        })
+                        .unwrap();
+                } else if redo {
+                    harness.key(key::Ctrl + 'r').unwrap();
+                } else {
+                    harness.key('u').unwrap();
+                }
+                if read_only {
+                    assert_eq!(editor_text(&mut harness), text);
+                    assert_eq!(editor_selection(&mut harness), selection);
+                } else {
+                    assert_eq!(editor_text(&mut harness), if redo { "Xabc" } else { "abc" });
+                    assert_eq!(
+                        editor_cursor(&mut harness),
+                        TextPosition::new(0, usize::from(redo))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn visual_change_enters_insert_and_undoes_as_one_edit() {
+    for (text, keys, expected) in [
+        ("abc", vec!['v', 'l'], "Xbc"),
+        ("one\ntwo", vec!['V'], "Xtwo"),
+    ] {
+        let config = EditorConfig::new().with_mode(EditMode::Vi);
+        let mut harness = build_harness(text, config, 20, 3);
+        harness.keys(keys).unwrap();
+        harness.key('c').unwrap();
+        assert_eq!(
+            with_editor(&mut harness, |editor| editor.vi.mode()),
+            ViMode::Insert
+        );
+        harness.type_text("X").unwrap();
+        harness.key(key::KeyCode::Esc).unwrap();
+        assert_eq!(editor_text(&mut harness), expected);
+        assert_eq!(
+            with_editor(&mut harness, |editor| editor.vi.mode()),
+            ViMode::Normal
+        );
+        harness.key('u').unwrap();
+        assert_eq!(editor_text(&mut harness), text);
+    }
+}
+
+#[test]
+fn open_below_enters_the_new_line() {
+    for (text, expected) in [
+        ("one\ntwo", "one\nX\ntwo"),
+        ("one", "one\nX"),
+        ("one\n", "one\nX\n"),
+    ] {
+        let config = EditorConfig::new().with_mode(EditMode::Vi);
+        let mut harness = build_harness(text, config, 20, 4);
+        harness.key('o').unwrap();
+        assert_eq!(editor_cursor(&mut harness), TextPosition::new(1, 0));
+        harness.type_text("X").unwrap();
+        harness.key(key::KeyCode::Esc).unwrap();
+        assert_eq!(editor_text(&mut harness), expected);
+        harness.key('u').unwrap();
+        assert_eq!(editor_text(&mut harness), text);
+    }
+}
+
+#[test]
+fn repeat_empty_open_below_enters_another_new_line() {
+    let config = EditorConfig::new().with_mode(EditMode::Vi);
+    let mut harness = build_harness("one\ntwo", config, 20, 5);
+    harness.key('o').unwrap();
+    harness.key(key::KeyCode::Esc).unwrap();
+    harness.key('.').unwrap();
+    assert_eq!(editor_cursor(&mut harness), TextPosition::new(2, 0));
+    harness.type_text("X").unwrap();
+    harness.key(key::KeyCode::Esc).unwrap();
+    assert_eq!(editor_text(&mut harness), "one\n\nX\ntwo");
+    harness.key('u').unwrap();
+    assert_eq!(editor_text(&mut harness), "one\n\ntwo");
+}
+
+#[test]
+fn linewise_put_preserves_line_boundaries_and_history() {
+    for (text, yank, line, before, expected) in [
+        ("one", "one", 0, false, "one\none"),
+        ("one", "one", 0, true, "one\none"),
+        ("one", "two\n", 0, false, "one\ntwo\n"),
+        ("one\nthree", "two", 0, false, "one\ntwo\nthree"),
+        ("one\nthree", "two\n", 1, true, "one\ntwo\nthree"),
+        ("one\n", "two", 1, false, "one\ntwo"),
+        ("one\n", "two\n", 1, false, "one\ntwo\n"),
+        ("one\n", "two", 1, true, "one\ntwo\n"),
+    ] {
+        let config = EditorConfig::new().with_mode(EditMode::Vi);
+        let mut harness = build_harness(text, config, 20, 5);
+        with_editor(&mut harness, |editor| {
+            editor.yank = yank.to_string();
+            editor.yank_linewise = true;
+            editor.buffer.set_cursor(TextPosition::new(line, 0));
+        });
+        let before_selection = editor_selection(&mut harness);
+        harness.key(if before { 'P' } else { 'p' }).unwrap();
+        assert_eq!(editor_text(&mut harness), expected);
+        let after_selection = editor_selection(&mut harness);
+        harness.key('u').unwrap();
+        assert_eq!(editor_text(&mut harness), text);
+        assert_eq!(editor_selection(&mut harness), before_selection);
+        harness.key(key::Ctrl + 'r').unwrap();
+        assert_eq!(editor_text(&mut harness), expected);
+        assert_eq!(editor_selection(&mut harness), after_selection);
+    }
+}
+
+#[test]
+fn final_line_yank_put_keeps_a_separate_line() {
+    let config = EditorConfig::new().with_mode(EditMode::Vi);
+    let mut harness = build_harness("one", config, 10, 3);
+    harness.keys(['y', 'y', 'p']).unwrap();
+    assert_eq!(editor_text(&mut harness), "one\none");
+}
+
 #[test]
 fn mouse_double_click_selects_word() {
     let config = EditorConfig::new().with_mode(EditMode::Text);
@@ -325,6 +630,118 @@ fn mouse_click_moves_cursor() {
         .mouse(mouse_event(mouse::Action::Down, 2, 0))
         .unwrap();
     assert_eq!(editor_cursor(&mut harness), TextPosition::new(0, 2));
+}
+
+#[test]
+fn nested_padding_scroll_and_captured_pointer_agree_on_wide_grapheme() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let text = ["ab界cdefghijklmnopqrstuvwxyz"; 10].join("\n");
+    let mut harness = build_harness(&text, config, 18, 8);
+    harness
+        .with_root_context(|_root: &mut EditorHost, ctx| {
+            ctx.set_layout(Layout::fill().padding(Edges::all(1)))?;
+            ctx.with_typed_slot::<EditorSlot, _>(|_editor, ctx| {
+                ctx.set_layout(Layout::fill().padding(Edges::all(1)))
+            })
+        })
+        .unwrap();
+    harness.render().unwrap();
+    scroll_editor_to(&mut harness, 1, 2);
+    harness.render().unwrap();
+    assert_eq!(editor_view_scroll(&mut harness), Point { x: 1, y: 2 });
+    assert_eq!(harness.buf().get(Point { x: 2, y: 2 }).unwrap().ch, 'b');
+    assert_eq!(harness.buf().get(Point { x: 3, y: 2 }).unwrap().ch, '界');
+    assert!(
+        harness
+            .buf()
+            .get(Point { x: 4, y: 2 })
+            .unwrap()
+            .continuation
+    );
+    assert_eq!(harness.buf().get(Point { x: 5, y: 2 }).unwrap().ch, 'c');
+
+    // Screen x=3 is content x=2, the first cell of the wide grapheme.
+    harness
+        .mouse(mouse_event(mouse::Action::Down, 3, 2))
+        .unwrap();
+    assert_eq!(editor_cursor(&mut harness), TextPosition::new(2, 2));
+    harness
+        .with_root_context(|_root: &mut EditorHost, ctx| {
+            ctx.with_typed_slot::<EditorSlot, _>(|_editor, ctx| ctx.capture_mouse())
+        })
+        .unwrap();
+    // Captured input still uses viewport-local coordinates at the trailing
+    // cell.
+    harness
+        .mouse(mouse_event(mouse::Action::Drag, 4, 2))
+        .unwrap();
+    assert_eq!(editor_cursor(&mut harness), TextPosition::new(2, 2));
+    // A captured drag two cells left of the content keeps its signed offset,
+    // so it reaches past the scrolled-out column to the start of the line.
+    harness
+        .mouse(mouse_event(mouse::Action::Drag, 0, 2))
+        .unwrap();
+    assert_eq!(editor_cursor(&mut harness), TextPosition::new(2, 0));
+    harness.mouse(mouse_event(mouse::Action::Up, 0, 2)).unwrap();
+    harness
+        .with_root_context(|_root: &mut EditorHost, ctx| {
+            ctx.with_typed_slot::<EditorSlot, _>(|_editor, ctx| ctx.release_mouse())
+        })
+        .unwrap();
+}
+
+#[test]
+fn padded_editor_mouse_uses_content_coordinates_with_gutter_and_scroll() {
+    for (numbers, scroll_x, scroll_y) in [
+        (LineNumbers::None, 0, 0),
+        (LineNumbers::Absolute, 0, 2),
+        (LineNumbers::None, 3, 2),
+    ] {
+        let config = EditorConfig::new()
+            .with_wrap(WrapMode::None)
+            .with_line_numbers(numbers);
+        let text = ["abcdefghijklmnopqrstuvwxyz"; 10].join("\n");
+        let mut harness = build_harness(&text, config, 18, 6);
+        harness
+            .with_root_context(|_root: &mut EditorHost, ctx| {
+                ctx.with_typed_slot::<EditorSlot, _>(|_editor, ctx| {
+                    ctx.set_layout(Layout::fill().padding(Edges::all(1)))
+                })
+            })
+            .unwrap();
+        harness.render().unwrap();
+        scroll_editor_to(&mut harness, scroll_x, scroll_y);
+        harness.render().unwrap();
+        let gutter = with_editor(&mut harness, |editor| editor.gutter_width());
+        let first_x = 1 + gutter;
+        harness
+            .mouse(mouse_event(mouse::Action::Down, first_x, 1))
+            .unwrap();
+        assert_eq!(
+            editor_cursor(&mut harness),
+            TextPosition::new(scroll_y as usize, scroll_x as usize)
+        );
+        harness
+            .mouse(mouse_event(mouse::Action::Up, first_x, 1))
+            .unwrap();
+        harness
+            .mouse(mouse_event(mouse::Action::Down, first_x + 3, 1))
+            .unwrap();
+        assert_eq!(
+            editor_cursor(&mut harness),
+            TextPosition::new(scroll_y as usize, scroll_x as usize + 3)
+        );
+        harness
+            .mouse(mouse_event(mouse::Action::Drag, first_x + 5, 1))
+            .unwrap();
+        assert_eq!(
+            editor_selection(&mut harness).range(),
+            TextRange::new(
+                TextPosition::new(scroll_y as usize, scroll_x as usize + 3),
+                TextPosition::new(scroll_y as usize, scroll_x as usize + 5),
+            )
+        );
+    }
 }
 
 #[test]
@@ -379,7 +796,7 @@ fn mouse_wheel_scrolls_editor() {
             action: mouse::Action::ScrollDown,
             button: mouse::Button::None,
             modifiers: key::Empty,
-            location: Point { x: 1, y: 1 },
+            location: PointI32 { x: 1, y: 1 },
         })
         .unwrap();
     let after = editor_view_scroll(&mut harness);
@@ -390,7 +807,7 @@ fn mouse_wheel_scrolls_editor() {
             action: mouse::Action::ScrollUp,
             button: mouse::Button::None,
             modifiers: key::Empty,
-            location: Point { x: 1, y: 1 },
+            location: PointI32 { x: 1, y: 1 },
         })
         .unwrap();
     let end = editor_view_scroll(&mut harness);
@@ -469,9 +886,11 @@ fn binding_precedence_blocks_text_entry() {
         .canopy
         .eval_script(
             r#"
-canopy.bind("x", { path = "editor", description = "Cursor left" }, function()
-    editor.cursor("Left")
-end)
+canopy.bind("x", {
+    path = "editor",
+    phase = "before_widget",
+    description = "Cursor left",
+}, command.editor.move_cursor("Left"))
 "#,
         )
         .unwrap();
@@ -491,6 +910,7 @@ fn highlight_spans_apply_styles() {
         attrs: AttrSet::default(),
     };
     with_editor(&mut harness, |editor| {
+        editor.buffer.set_cursor(TextPosition::new(0, 2));
         editor.set_highlighter(Some(Box::new(TestHighlighter {
             style: style.clone(),
         })));
@@ -498,6 +918,345 @@ fn highlight_spans_apply_styles() {
     harness.render().unwrap();
     let partial = PartialStyle::fg(Color::Red);
     assert!(harness.tbuf().contains_text_style("hi", &partial));
+}
+
+/// Run a search command on the harness editor and return its match count,
+/// current position, and top display row.
+fn run_search(
+    harness: &mut Harness,
+    operation: impl FnOnce(&mut Editor, &mut dyn Context),
+) -> (usize, usize, u32) {
+    let (matches, position) = harness
+        .with_root_context(|_root: &mut EditorHost, ctx| {
+            ctx.with_typed_slot::<EditorSlot, _>(|editor, ctx| {
+                operation(editor, ctx);
+                Ok((editor.search_matches(), editor.search_position()))
+            })
+        })
+        .expect("editor missing");
+    // The reveal runs once layout settles.
+    harness.render().expect("Failed to render");
+    (matches, position, editor_view_scroll(harness).y)
+}
+
+/// Run an editor operation, then lay out and render the result.
+fn edit_in_one_turn(harness: &mut Harness, operation: impl FnOnce(&mut Editor, &mut dyn Context)) {
+    harness
+        .with_root_context(|_root: &mut EditorHost, ctx| {
+            ctx.with_typed_slot::<EditorSlot, _>(|editor, ctx| {
+                operation(editor, ctx);
+                Ok(())
+            })
+        })
+        .expect("editor missing");
+    harness.render().expect("Failed to render");
+}
+
+#[test]
+fn a_resize_in_the_same_turn_reveals_the_cursor_in_the_final_view() {
+    let text = (0..20)
+        .map(|idx| format!("line{idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut harness = build_harness(&text, config, 10, 8);
+    harness
+        .canopy
+        .set_root_size(Size::new(10, 3))
+        .expect("resize");
+    edit_in_one_turn(&mut harness, |editor, ctx| {
+        for _ in 0..6 {
+            editor.move_cursor(ctx, FocusDirection::Down);
+        }
+    });
+    // Row 6 lies below the eight-row view the moves saw, and below the
+    // three-row view that layout settles.
+    assert_eq!(editor_view_scroll(&mut harness).y, 4);
+    assert_eq!(editor_cursor_location(&mut harness), Point { x: 0, y: 2 });
+}
+
+#[test]
+fn a_cursor_reveal_uses_the_final_soft_wrapping() {
+    let text = "a".repeat(35);
+    let config = EditorConfig::new().with_wrap(WrapMode::Soft);
+    let mut harness = build_harness(&text, config, 20, 2);
+    harness
+        .canopy
+        .set_root_size(Size::new(10, 2))
+        .expect("resize");
+    edit_in_one_turn(&mut harness, |editor, ctx| {
+        editor.buffer.set_cursor(TextPosition::new(0, 35));
+        editor.ensure_cursor_visible(ctx);
+    });
+    // At ten columns the line takes four rows, and the cursor ends the last.
+    assert_eq!(editor_view_scroll(&mut harness), Point { x: 0, y: 2 });
+    assert_eq!(editor_cursor_location(&mut harness), Point { x: 5, y: 1 });
+}
+
+#[test]
+fn a_cursor_reveal_counts_a_gutter_added_later_in_the_turn() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut harness = build_harness("one\n123456789\nthree", config.clone(), 10, 3);
+    edit_in_one_turn(&mut harness, |editor, ctx| {
+        editor.buffer.set_cursor(TextPosition::new(1, 9));
+        editor.ensure_cursor_visible(ctx);
+        editor.set_config(config.with_line_numbers(LineNumbers::Absolute));
+    });
+    // The two-column gutter pushes the caret to column 11.
+    assert_eq!(editor_view_scroll(&mut harness), Point { x: 2, y: 0 });
+    assert_eq!(editor_cursor_location(&mut harness), Point { x: 9, y: 1 });
+}
+
+#[test]
+fn the_unwrapped_canvas_holds_the_caret_after_the_longest_line() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut harness = build_harness("abcdefghijkl", config, 10, 1);
+    edit_in_one_turn(&mut harness, |editor, ctx| {
+        editor.buffer.set_cursor(TextPosition::new(0, 12));
+        editor.ensure_cursor_visible(ctx);
+    });
+    assert_eq!(editor_view_scroll(&mut harness), Point { x: 3, y: 0 });
+    assert_eq!(editor_cursor_location(&mut harness), Point { x: 9, y: 0 });
+}
+
+#[test]
+fn a_new_final_line_scrolls_into_view() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut harness = build_harness("one\ntwo\nthree", config, 10, 3);
+    with_editor(&mut harness, |editor| {
+        editor.buffer.set_cursor(TextPosition::new(2, 5));
+    });
+    harness.key(key::KeyCode::Enter).unwrap();
+    assert_eq!(editor_cursor(&mut harness), TextPosition::new(3, 0));
+    assert_eq!(editor_view_scroll(&mut harness), Point { x: 0, y: 1 });
+    assert_eq!(editor_cursor_location(&mut harness), Point { x: 0, y: 2 });
+}
+
+#[test]
+fn search_command_uses_smart_case_and_scrolls_to_matches() {
+    let text = (1..=40)
+        .map(|n| match n {
+            25 => "target in lower case".to_string(),
+            n if n % 10 == 0 => format!("Target {n}"),
+            n => format!("line {n}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = EditorConfig::new()
+        .with_read_only(true)
+        .with_focusable(false)
+        .with_wrap(WrapMode::None);
+    let mut harness = build_harness(&text, config, 24, 5);
+
+    let (matches, position, top) = run_search(&mut harness, |editor, ctx| {
+        editor.search(ctx, "target".into());
+    });
+    assert_eq!(matches, 5, "a lowercase query ignores case");
+    assert_eq!(position, 1);
+    assert!(
+        top > 0,
+        "the view scrolls to the first match, got row {top}"
+    );
+
+    let (_, position, _) = run_search(&mut harness, |editor, ctx| editor.search_next(ctx, 2));
+    assert_eq!(position, 3);
+    let (_, position, top) = run_search(&mut harness, |editor, ctx| editor.search_next(ctx, -3));
+    assert_eq!(position, 5, "moving back wraps to the last match");
+    assert!(top >= 35, "the view follows the match, got row {top}");
+
+    let (matches, position, _) = run_search(&mut harness, |editor, ctx| {
+        editor.search(ctx, "Target".into());
+    });
+    assert_eq!(matches, 4, "an uppercase letter makes the query match case");
+    assert_eq!(
+        position, 4,
+        "the first match on screen or below becomes current"
+    );
+
+    let (matches, position, _) = run_search(&mut harness, |editor, ctx| editor.clear_search(ctx));
+    assert_eq!((matches, position), (0, 0));
+}
+
+#[test]
+fn revealed_search_match_sits_three_rows_below_the_top() {
+    let text = (1..=40)
+        .map(|n| {
+            if n == 25 {
+                "target here".to_string()
+            } else {
+                format!("line {n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = EditorConfig::new()
+        .with_read_only(true)
+        .with_focusable(false)
+        .with_wrap(WrapMode::None);
+    let mut harness = build_harness(&text, config, 24, 8);
+
+    let (matches, position, top) = run_search(&mut harness, |editor, ctx| {
+        editor.search(ctx, "target".into());
+    });
+    assert_eq!((matches, position), (1, 1));
+    assert_eq!(top, 21, "row 24 sits three below the top");
+
+    let (matches, position, top) = run_search(&mut harness, |editor, ctx| {
+        editor.highlight_matches(
+            ctx,
+            vec![TextRange::new(
+                TextPosition::new(1, 0),
+                TextPosition::new(1, 6),
+            )],
+        );
+    });
+    assert_eq!((matches, position), (1, 1));
+    assert_eq!(top, 0, "matches near the start clamp to the top");
+
+    let (matches, position, top) = run_search(&mut harness, |editor, ctx| {
+        editor.highlight_matches(
+            ctx,
+            vec![TextRange::new(
+                TextPosition::new(39, 0),
+                TextPosition::new(39, 6),
+            )],
+        );
+    });
+    assert_eq!((matches, position), (1, 1));
+    assert_eq!(top, 32, "matches near the end clamp to the edge");
+}
+
+#[test]
+fn search_current_other_matches_and_syntax_keep_separate_styles() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut harness = build_harness("hi a a", config, 10, 1);
+    with_editor(&mut harness, |editor| {
+        editor.set_highlighter(Some(Box::new(TestHighlighter {
+            style: Style {
+                fg: Paint::solid(Color::Red),
+                bg: Paint::solid(Color::Black),
+                attrs: AttrSet::default(),
+            },
+        })));
+        editor
+            .search
+            .set_query(&editor.buffer, "a", SearchDirection::Forward);
+        editor.buffer.set_cursor(TextPosition::new(0, 6));
+    });
+    harness.render().unwrap();
+    let styles = StyleManager::default();
+    let current = styles.get(harness.canopy.style(), "editor/search/current");
+    let other = styles.get(harness.canopy.style(), "editor/search/match");
+    let selected = styles.get(harness.canopy.style(), "editor/selection");
+    let buffer = harness.buf();
+    assert_eq!(
+        buffer.get(Point { x: 0, y: 0 }).unwrap().style.fg,
+        Color::Red
+    );
+    assert_eq!(
+        buffer.get(Point { x: 1, y: 0 }).unwrap().style.fg,
+        Color::Red
+    );
+    assert_eq!(
+        buffer.get(Point { x: 3, y: 0 }).unwrap().style.bg,
+        current.bg.solid_color().unwrap()
+    );
+    assert_eq!(
+        buffer.get(Point { x: 5, y: 0 }).unwrap().style.bg,
+        other.bg.solid_color().unwrap()
+    );
+    assert_ne!(current.bg, other.bg);
+
+    with_editor(&mut harness, |editor| {
+        editor.buffer.set_selection(Selection::new(
+            TextPosition::new(0, 0),
+            TextPosition::new(0, 6),
+        ));
+    });
+    harness.render().unwrap();
+    for x in [0, 1, 3, 5] {
+        let style = harness.buf().get(Point { x, y: 0 }).unwrap().style;
+        assert_eq!(style.fg, selected.fg.solid_color().unwrap());
+        assert_eq!(style.bg, selected.bg.solid_color().unwrap());
+    }
+}
+
+#[test]
+fn scroll_marks_report_one_row_per_match_line() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut editor = Editor::with_config("aa aa\nbb", config);
+    editor
+        .search
+        .set_query(&editor.buffer, "aa", SearchDirection::Forward);
+    let content = Size::new(80, 24);
+    // Both matches share line zero, so they collapse into one mark.
+    assert_eq!(
+        editor.scroll_marks(ScrollAxis::Vertical, content),
+        [ScrollMark {
+            start: 0,
+            end: 1,
+            style: "editor/search/mark",
+            glyph: THIN.track_vertical,
+        }]
+    );
+    assert!(
+        editor
+            .scroll_marks(ScrollAxis::Horizontal, content)
+            .is_empty()
+    );
+}
+
+#[test]
+fn scroll_marks_follow_soft_wrapped_rows_on_both_layout_paths() {
+    let config = EditorConfig::new().with_wrap(WrapMode::Soft);
+    // At width ten the 25-character first line wraps across rows 0-2, and
+    // the second line sits on row 3.
+    let mut editor = Editor::with_config("aaaaaaaaaaaaaaaaaaaaaaaaa\nbb", config);
+    editor
+        .search
+        .set_query(&editor.buffer, "a", SearchDirection::Forward);
+    let content = Size::new(10, 24);
+    let fallback = editor.scroll_marks(ScrollAxis::Vertical, content);
+    assert_eq!(
+        fallback
+            .iter()
+            .map(|mark| (mark.start, mark.end))
+            .collect::<Vec<_>>(),
+        [(0, 1), (1, 2), (2, 3)]
+    );
+    // Syncing the cache the way a render would must not move the marks.
+    editor
+        .layout
+        .sync(&mut editor.buffer, 10, WrapMode::Soft, 4);
+    assert_eq!(editor.scroll_marks(ScrollAxis::Vertical, content), fallback);
+    editor
+        .search
+        .set_query(&editor.buffer, "b", SearchDirection::Forward);
+    assert_eq!(
+        editor
+            .scroll_marks(ScrollAxis::Vertical, content)
+            .iter()
+            .map(|mark| (mark.start, mark.end))
+            .collect::<Vec<_>>(),
+        [(3, 4)]
+    );
+}
+
+#[test]
+fn scroll_marks_skip_matches_past_the_buffer() {
+    let config = EditorConfig::new().with_wrap(WrapMode::None);
+    let mut editor = Editor::with_config("aa", config);
+    editor.search.set_matches(
+        &editor.buffer,
+        vec![
+            TextRange::new(TextPosition::new(0, 0), TextPosition::new(0, 2)),
+            TextRange::new(TextPosition::new(9, 0), TextPosition::new(9, 2)),
+        ],
+        TextPosition::new(0, 0),
+    );
+    let marks = editor.scroll_marks(ScrollAxis::Vertical, Size::new(80, 24));
+    assert_eq!(marks.len(), 1);
+    assert_eq!((marks[0].start, marks[0].end), (0, 1));
 }
 
 #[test]
@@ -550,6 +1309,79 @@ fn highlight_spans_cached_by_revision() {
 }
 
 #[test]
+fn highlight_preparation_batches_updates_until_render() {
+    let config = EditorConfig::new().with_mode(EditMode::Text);
+    let mut harness = build_harness("original", config, 20, 2);
+    let prepared = Rc::new(RefCell::new(Vec::new()));
+    with_editor(&mut harness, |editor| {
+        editor.set_highlighter(Some(Box::new(RecordingHighlighter {
+            prepared: prepared.clone(),
+        })));
+        editor.set_text("intermediate");
+        editor.set_text("final");
+    });
+    assert!(prepared.borrow().is_empty());
+    harness.render().unwrap();
+    assert_eq!(*prepared.borrow(), ["final"]);
+    harness.render().unwrap();
+    assert_eq!(*prepared.borrow(), ["final"]);
+
+    harness.key('!').unwrap();
+    assert_eq!(*prepared.borrow(), ["final", "!final"]);
+    // Replacing an edited buffer resets its revision to zero.
+    with_editor(&mut harness, |editor| editor.set_text("replacement"));
+    assert_eq!(prepared.borrow().len(), 2);
+    harness.render().unwrap();
+    assert_eq!(*prepared.borrow(), ["final", "!final", "replacement"]);
+    harness.render().unwrap();
+    assert_eq!(prepared.borrow().len(), 3);
+}
+
+#[test]
+fn replacing_highlighter_prepares_unchanged_buffer() {
+    let mut harness = build_harness("unchanged", EditorConfig::new(), 20, 2);
+    let first = Rc::new(RefCell::new(Vec::new()));
+    let second = Rc::new(RefCell::new(Vec::new()));
+    for prepared in [&first, &second] {
+        with_editor(&mut harness, |editor| {
+            editor.set_highlighter(Some(Box::new(RecordingHighlighter {
+                prepared: prepared.clone(),
+            })));
+        });
+        assert!(prepared.borrow().is_empty());
+        harness.render().unwrap();
+        assert_eq!(*prepared.borrow(), ["unchanged"]);
+    }
+    with_editor(&mut harness, |editor| {
+        editor.set_highlighter(None);
+        editor.set_text("plain");
+    });
+    harness.render().unwrap();
+    assert_eq!(*first.borrow(), ["unchanged"]);
+    assert_eq!(*second.borrow(), ["unchanged"]);
+}
+
+/// Record preparation and verify that line callbacks see the current source.
+struct RecordingHighlighter {
+    prepared: Rc<RefCell<Vec<String>>>,
+}
+
+impl Highlighter for RecordingHighlighter {
+    fn prepare(&self, text: &str) {
+        self.prepared.borrow_mut().push(text.to_owned());
+    }
+
+    fn highlight_line(&self, line: usize, text: &str) -> Vec<HighlightSpan> {
+        let prepared = self.prepared.borrow();
+        let source = prepared
+            .last()
+            .expect("prepare must precede line callbacks");
+        assert_eq!(source.lines().nth(line), Some(text));
+        Vec::new()
+    }
+}
+
+#[test]
 fn root_binding_does_not_override_text_entry() {
     let config = EditorConfig::new().with_mode(EditMode::Text);
     let mut harness = build_harness("", config, 6, 1);
@@ -557,15 +1389,40 @@ fn root_binding_does_not_override_text_entry() {
         .canopy
         .eval_script(
             r#"
-canopy.bind("q", { path = "editor_host", description = "Record binding" }, function()
-    editor_host.record_binding()
-end)
+canopy.bind("q", {
+    path = "editor_host",
+    phase = "after_widget",
+    description = "Record binding",
+}, command.editor_host.record_binding())
 "#,
         )
         .unwrap();
     harness.key('q').unwrap();
     assert_eq!(editor_text(&mut harness), "q");
     assert_eq!(host_binding_hits(&mut harness), 0);
+}
+
+#[test]
+fn read_only_editor_leaves_edit_keys_to_bindings() {
+    let config = EditorConfig::new()
+        .with_mode(EditMode::Text)
+        .with_read_only(true);
+    let mut harness = build_harness("text", config, 6, 1);
+    harness
+        .canopy
+        .eval_script(
+            r#"
+canopy.bind("q", {
+    path = "editor_host",
+    phase = "after_widget",
+    description = "Record binding",
+}, command.editor_host.record_binding())
+"#,
+        )
+        .unwrap();
+    harness.key('q').unwrap();
+    assert_eq!(editor_text(&mut harness), "text");
+    assert_eq!(host_binding_hits(&mut harness), 1);
 }
 
 #[derive(Clone)]

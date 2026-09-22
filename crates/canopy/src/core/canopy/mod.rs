@@ -4,12 +4,12 @@
 )]
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    fs,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt, fs,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, mpsc},
     thread::{self, ThreadId},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -19,10 +19,23 @@ use serde::{Deserialize, Serialize};
 use super::{
     inputmap,
     poll::Poller,
+    snapshot::FrameSnapshot,
     termbuf::{RenderLimits, TermBuf},
 };
 
+mod builder;
+pub use builder::{CanopyBuilder, ScriptTrust};
 mod rendering;
+#[cfg(test)]
+mod rendering_tests;
+#[cfg(test)]
+mod snapshot_tests;
+mod turn;
+#[cfg(test)]
+mod turn_cleanup_tests;
+#[cfg(any(test, feature = "testing"))]
+mod turn_testing;
+pub use turn::{EvalId, EvalOutcome, EvalRequest, EvalTicket, FrameId, TurnOutcome, Work};
 mod routing;
 #[cfg(test)]
 mod tests;
@@ -37,9 +50,21 @@ use crate::{
     event::Event,
     geom::Size,
     script,
-    style::{StyleMap, solarized},
+    style::{StyleMap, canopy::canopy_dark},
     widget::Widget,
 };
+
+/// Input and wake notifications carried by an application adapter channel.
+#[derive(Debug, Clone)]
+pub enum AdapterEvent {
+    /// Route widget-facing input.
+    Input(Event),
+    /// Service queued runtime work.
+    Wake,
+}
+
+/// Hook run against the root context after the input mode stack changes.
+type ModeHook = fn(&mut dyn crate::Context) -> Result<()>;
 
 /// Application runtime state and renderer coordination.
 pub struct Canopy {
@@ -85,22 +110,32 @@ pub struct Canopy {
     default_bindings: HashMap<String, DefaultBindingsScript>,
     /// Registered named fixtures keyed by fixture name.
     fixtures: HashMap<String, Fixture>,
+    /// Hooks run before a frame after the input mode stack changes.
+    mode_hooks: BTreeMap<&'static str, ModeHook>,
+    /// Mode stack generation the mode hooks last saw.
+    synced_mode_generation: u64,
     /// Trace for the most recent key or mouse routing pass.
     route_trace: Vec<RouteTraceEntry>,
 
     /// Cached terminal buffer.
     termbuf: Option<TermBuf>,
+    /// Last successfully prepared immutable observation.
+    snapshot: Option<Arc<FrameSnapshot>>,
+    /// Last successfully emitted terminal frame, invalidated by output failure.
+    emitted_buf: Option<TermBuf>,
+    /// Adapter-independent runtime progress.
+    driver: turn::Driver,
     /// Whether a render is pending after the most recent event.
     render_pending: bool,
 
     /// Event sender channel.
-    event_tx: UnboundedSender<Event>,
+    event_tx: UnboundedSender<AdapterEvent>,
     /// Event receiver channel.
-    pub(crate) event_rx: Option<UnboundedReceiver<Event>>,
+    pub(crate) event_rx: Option<UnboundedReceiver<AdapterEvent>>,
     /// Cross-thread automation callback sender.
-    automation_tx: mpsc::SyncSender<AutomationCallback>,
+    automation_tx: mpsc::SyncSender<turn::AutomationMessage>,
     /// Cross-thread automation callback receiver.
-    automation_rx: mpsc::Receiver<AutomationCallback>,
+    automation_rx: mpsc::Receiver<turn::AutomationMessage>,
     /// Thread that exclusively owns this application instance.
     ui_thread: ThreadId,
 
@@ -119,6 +154,8 @@ pub enum RoutePhase {
     WidgetEvent,
     /// A binding matched after the widget ignored the event.
     PostEventBinding,
+    /// The runtime applied the input's default action to a node.
+    DefaultAction,
     /// Routing moved from a node to its parent.
     Bubble,
     /// A resolved binding is being executed.
@@ -137,6 +174,7 @@ impl RoutePhase {
             Self::PreEventBinding => "pre-event-binding",
             Self::WidgetEvent => "widget-event",
             Self::PostEventBinding => "post-event-binding",
+            Self::DefaultAction => "default-action",
             Self::Bubble => "bubble",
             Self::BindingExecution => "binding-execution",
             Self::Handled => "handled",
@@ -170,9 +208,9 @@ const AUTOMATION_SERVICE_BUDGET: usize = 64;
 #[derive(Clone)]
 pub struct AutomationHandle {
     /// Sender for queued UI-thread callbacks.
-    callback_tx: mpsc::SyncSender<AutomationCallback>,
+    callback_tx: mpsc::SyncSender<turn::AutomationMessage>,
     /// Sender for wake events so the runloop notices queued work.
-    wake_tx: UnboundedSender<Event>,
+    wake_tx: UnboundedSender<AdapterEvent>,
     /// Thread that owns the associated Canopy instance.
     ui_thread: ThreadId,
 }
@@ -180,8 +218,13 @@ pub struct AutomationHandle {
 impl AutomationHandle {
     /// Queue a callback to run on the UI thread.
     pub fn submit(&self, callback: AutomationCallback) -> Result<()> {
+        self.submit_message(turn::AutomationMessage::Callback(callback))
+    }
+
+    /// Enqueue a typed driver message and wake its adapter.
+    fn submit_message(&self, message: turn::AutomationMessage) -> Result<()> {
         self.callback_tx
-            .try_send(callback)
+            .try_send(message)
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
                     error::Error::RunLoop("automation callback queue is full".into())
@@ -191,7 +234,7 @@ impl AutomationHandle {
                 }
             })?;
         self.wake_tx
-            .unbounded_send(Event::Wake)
+            .unbounded_send(AdapterEvent::Wake)
             .map_err(|_| error::Error::RunLoop("event loop wake channel closed".into()))?;
         Ok(())
     }
@@ -283,13 +326,68 @@ pub struct DefaultBindingsRun {
     baseline: ScriptJournalBaseline,
 }
 
+/// Typed source of one script-journal entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ScriptOrigin {
+    /// Top-level application evaluation.
+    Eval,
+    /// Builder configuration loaded from a path.
+    Config(String),
+    /// Application or mounted startup source.
+    Startup(String),
+    /// Builder-owned binding source.
+    Bindings(String),
+    /// Widget default-binding source.
+    DefaultBindings(String),
+    /// Origin retained from a journal written by another producer.
+    Other(String),
+}
+
+impl fmt::Display for ScriptOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Eval => formatter.write_str("eval"),
+            Self::Config(value) => write!(formatter, "config:{value}"),
+            Self::Startup(value) => write!(formatter, "startup:{value}"),
+            Self::Bindings(value) => write!(formatter, "bindings:{value}"),
+            Self::DefaultBindings(value) => write!(formatter, "default-bindings:{value}"),
+            Self::Other(value) => formatter.write_str(value),
+        }
+    }
+}
+
+impl From<ScriptOrigin> for String {
+    fn from(origin: ScriptOrigin) -> Self {
+        origin.to_string()
+    }
+}
+
+impl From<String> for ScriptOrigin {
+    fn from(origin: String) -> Self {
+        if origin == "eval" {
+            Self::Eval
+        } else if let Some(value) = origin.strip_prefix("config:") {
+            Self::Config(value.to_owned())
+        } else if let Some(value) = origin.strip_prefix("startup:") {
+            Self::Startup(value.to_owned())
+        } else if let Some(value) = origin.strip_prefix("bindings:") {
+            Self::Bindings(value.to_owned())
+        } else if let Some(value) = origin.strip_prefix("default-bindings:") {
+            Self::DefaultBindings(value.to_owned())
+        } else {
+            Self::Other(origin)
+        }
+    }
+}
+
 /// Replayable record of one script evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptJournalEntry {
     /// Monotonic journal id.
     pub id: u64,
-    /// Script origin such as `eval`, `config:<path>`, or `startup:app`.
-    pub origin: String,
+    /// Typed origin serialized as the established journal string.
+    pub origin: ScriptOrigin,
     /// Evaluated source text.
     pub source: String,
     /// Whether the evaluation completed successfully.
@@ -305,13 +403,14 @@ pub struct ScriptJournalEntry {
 }
 
 impl Canopy {
-    /// Construct a new Canopy instance.
-    pub fn new() -> Self {
+    /// Construct an empty Canopy instance for the consuming builder.
+    fn empty() -> Self {
         let (tx, rx) = unbounded();
         let (automation_tx, automation_rx) = mpsc::sync_channel(AUTOMATION_QUEUE_CAPACITY);
         let core = Core::new();
         Self {
-            poller: Poller::new(tx.clone()),
+            poller: Poller::new(),
+            driver: turn::Driver::new(tx.clone()),
             event_tx: tx,
             event_rx: Some(rx),
             automation_tx,
@@ -320,7 +419,7 @@ impl Canopy {
             route_trace: Vec::new(),
             script_host: script::LuauHost::new(),
             script_api_text: None,
-            script_module_roots: script::ScriptModuleRoots::new(),
+            script_module_roots: script::ScriptModuleRoots::default(),
             script_module_source: None,
             script_native_modules: Vec::new(),
             startup_scripts: Vec::new(),
@@ -333,13 +432,28 @@ impl Canopy {
             script_journal_limit: DEFAULT_SCRIPT_JOURNAL_LIMIT,
             default_bindings: HashMap::new(),
             fixtures: HashMap::new(),
-            style: solarized::solarized_dark(),
+            mode_hooks: BTreeMap::new(),
+            synced_mode_generation: 0,
+            style: canopy_dark(),
             root_size: None,
             render_limits: RenderLimits::default(),
             termbuf: None,
+            snapshot: None,
+            emitted_buf: None,
             render_pending: true,
             core,
         }
+    }
+
+    /// Construct an unbuilt Canopy instance for low-level tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new() -> Self {
+        Self::empty()
+    }
+
+    /// Return whether the application API has been finalized by its builder.
+    pub fn is_api_finalized(&self) -> bool {
+        self.script_host.is_finalized()
     }
 
     /// Return a handle for submitting automation work to this app's UI thread.
@@ -400,30 +514,34 @@ impl Canopy {
         self.termbuf.as_ref()
     }
 
-    /// Evaluate a Luau source string in the current app context.
-    pub fn eval_script(&mut self, source: &str) -> Result<()> {
-        self.eval_root(source, None).map(|_| ())
+    /// Read the last publication without running widget hooks or refreshing
+    /// state.
+    pub fn snapshot(&self) -> Option<Arc<FrameSnapshot>> {
+        self.snapshot.clone()
     }
 
-    /// Evaluate a Luau source string and return its value.
-    pub fn eval_script_value(&mut self, source: &str) -> Result<commands::ArgValue> {
-        self.eval_root(source, None)
+    /// Prepare pending changes after widget mutation callbacks have returned.
+    ///
+    /// This is the synchronous boundary for native callers that need snapshots
+    /// or geometry before the next driver turn. `turn(Work::Prepare)` also
+    /// services queued automation and advances the driver lifecycle.
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        if self.core.callback_depth != 0 {
+            return Err(error::Error::InvalidPhase { operation: "flush" });
+        }
+        self.prepare_frame(false).map(|_| ())
     }
 
-    /// Evaluate a Luau source string with a cooperative timeout.
-    pub fn eval_script_value_with_timeout(
-        &mut self,
-        source: &str,
-        timeout: Duration,
-    ) -> Result<commands::ArgValue> {
-        self.eval_root(source, Some(timeout))
-    }
-
-    /// Evaluate one source against the root node under a journal entry.
-    fn eval_root(&mut self, source: &str, timeout: Option<Duration>) -> Result<commands::ArgValue> {
-        self.eval_journaled("eval", source, move |canopy, script_id, host| {
-            host.execute(canopy, canopy.core.root_id(), script_id, timeout)
-        })
+    /// Evaluate a Luau source string at the root and return its value.
+    ///
+    /// The synchronous caller restrictions of [`Self::eval`] apply.
+    pub fn eval_script(&mut self, source: &str) -> Result<commands::ArgValue> {
+        let outcome = self.eval(EvalRequest {
+            source: source.to_owned(),
+            timeout: None,
+            anchor: self.root_id(),
+        })?;
+        outcome.into_result()
     }
 
     /// Finalize the script API surface if an evaluation needs it.
@@ -431,43 +549,33 @@ impl Canopy {
         if self.script_host.is_finalized() {
             return Ok(());
         }
-        self.finalize_api()
+        self.finalize_api_inner()
     }
 
-    /// Compile and run one source under a journal entry.
-    ///
-    /// `run` receives the compiled script and a clone of the script host, so
-    /// the caller chooses the execution mode without repeating the journal,
-    /// finalize, and compile prologue.
-    fn eval_journaled(
-        &mut self,
-        origin: impl Into<String>,
-        source: &str,
-        run: impl FnOnce(&mut Self, script::ScriptId, script::LuauHost) -> Result<commands::ArgValue>,
-    ) -> Result<commands::ArgValue> {
-        let baseline = self.begin_script_journal();
-        let result = (|| {
-            self.ensure_finalized()?;
-            let script_id = self.script_host.compile(source)?;
-            let host = self.script_host.clone();
-            run(self, script_id, host)
-        })();
-        self.record_script_journal(origin, source, baseline, &result);
-        result
-    }
-
-    /// Configure the `@user` persistent script root.
-    pub fn set_user_script_root(&mut self, root: impl Into<PathBuf>) -> Result<()> {
+    /// Configure the `@user` persistent script root for the builder.
+    fn set_user_script_root_inner(&mut self, root: impl Into<PathBuf>) -> Result<()> {
         self.ensure_api_unfinalized("script module roots")?;
         self.script_module_roots.set_user_root(root);
         Ok(())
     }
 
-    /// Configure the `@project` persistent script root.
-    pub fn set_project_script_root(&mut self, root: impl Into<PathBuf>) -> Result<()> {
+    /// Configure the `@project` persistent script root for the builder.
+    fn set_project_script_root_inner(&mut self, root: impl Into<PathBuf>) -> Result<()> {
         self.ensure_api_unfinalized("script module roots")?;
         self.script_module_roots.set_project_root(root);
         Ok(())
+    }
+
+    /// Configure the `@user` persistent script root in a low-level test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_user_script_root(&mut self, root: impl Into<PathBuf>) -> Result<()> {
+        self.set_user_script_root_inner(root)
+    }
+
+    /// Configure the `@project` persistent script root in a low-level test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_project_script_root(&mut self, root: impl Into<PathBuf>) -> Result<()> {
+        self.set_project_script_root_inner(root)
     }
 
     /// Invalidate cached exports from persistent script modules.
@@ -476,19 +584,32 @@ impl Canopy {
     /// `None` to invalidate every root. Returns the new source epoch, or
     /// `None` when no module source is configured or the named root is
     /// unknown.
-    pub fn invalidate_script_modules(&mut self, root: Option<&str>) -> Option<u64> {
-        let source = self.script_module_source.as_ref()?;
+    #[cfg(any(test, feature = "testing"))]
+    pub fn invalidate_script_modules(&mut self, root: Option<&str>) -> Result<Option<u64>> {
+        if self.script_host.is_eval_active() {
+            return Err(error::Error::script_structured(
+                error::ScriptErrorKind::ScriptBusy,
+                "cannot reload modules while evaluation is active",
+            ));
+        }
+        let Some(source) = self.script_module_source.as_ref() else {
+            return Ok(None);
+        };
         let epoch = match root {
-            Some(root) => source.invalidate(root).ok()?,
+            Some(root) => match source.invalidate(root) {
+                Ok(epoch) => epoch,
+                Err(_) => return Ok(None),
+            },
             None => source.invalidate_all(),
         };
         self.clear_script_callbacks();
-        Some(epoch)
+        Ok(Some(epoch))
     }
 
     /// Register an audited Ruau native module on the same surface as Canopy
     /// commands.
-    pub fn register_script_module(&mut self, module: Arc<dyn NativeModule>) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn register_script_module(&mut self, module: Arc<dyn NativeModule>) -> Result<()> {
         self.ensure_api_unfinalized("script native module registration")?;
         self.script_native_modules.push(module);
         Ok(())
@@ -524,13 +645,15 @@ impl Canopy {
     }
 
     /// Require every startup script root to define a typed global.
+    #[cfg(any(test, feature = "testing"))]
     pub fn require_startup_global(&mut self, name: &str, type_text: &str) -> Result<()> {
         self.ensure_api_unfinalized("startup global requirement")?;
         self.script_host.require_startup_global(name, type_text)
     }
 
-    /// Run app, user, and project startup scripts once.
-    pub fn run_startup_scripts(&mut self) -> Result<usize> {
+    /// Run app, user, and project startup scripts during preparation.
+    fn run_startup_scripts_inner(&mut self) -> Result<usize> {
+        self.driver.startup_attempted = true;
         self.ensure_finalized()?;
         let host = self.script_host.clone();
         let mut ran = 0;
@@ -548,7 +671,7 @@ impl Canopy {
             })
             .collect::<Vec<_>>();
         for (index, name, source, script_id) in startup_scripts {
-            self.run_startup_attempt(format!("startup:{name}"), &source, script_id)?;
+            self.run_startup_attempt(ScriptOrigin::Startup(name), &source, script_id)?;
             self.startup_scripts[index].ran = true;
             ran += 1;
         }
@@ -582,17 +705,27 @@ impl Canopy {
                     script_id
                 }
             };
-            self.run_startup_attempt(format!("startup:{module_id}"), &source, script_id)?;
+            self.run_startup_attempt(
+                ScriptOrigin::Startup(module_id.to_string()),
+                &source,
+                script_id,
+            )?;
             self.completed_startup_modules.insert(module.path);
             ran += 1;
         }
         Ok(ran)
     }
 
+    /// Run startup scripts directly in a low-level test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_startup_scripts(&mut self) -> Result<usize> {
+        self.run_startup_scripts_inner()
+    }
+
     /// Execute one startup script with callback and binding rollback.
     fn run_startup_attempt(
         &mut self,
-        origin: String,
+        origin: ScriptOrigin,
         source: &str,
         script_id: script::ScriptId,
     ) -> Result<()> {
@@ -692,7 +825,7 @@ impl Canopy {
             return Err(error::Error::Invalid("fixture name cannot be empty".into()));
         }
         if let Some(existing) = self.fixtures.get(&fixture.name) {
-            if existing.description == fixture.description {
+            if Arc::ptr_eq(&existing.setup, &fixture.setup) {
                 return Ok(());
             }
             return Err(error::Error::Invalid(format!(
@@ -745,8 +878,23 @@ impl Canopy {
         if !self.core.nodes.contains_key(node) {
             return Err(error::Error::NodeNotFound(node));
         }
-        let mut context = crate::core::context::CoreContext::new(&mut self.core, node);
-        f(&mut context)
+        self.with_dispatch_boundary(|canopy| {
+            canopy.core.invalidate(crate::Invalidation::Layout);
+            let mut context = crate::core::context::CoreContext::new(&mut canopy.core, node);
+            f(&mut context)
+        })
+    }
+
+    /// Run work inside a completion boundary so queued teardown drains only
+    /// after the outermost callback returns.
+    pub(crate) fn with_dispatch_boundary<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let checkpoint = self.core.begin_dispatch();
+        let result = f(self);
+        let completion = self.core.finish_dispatch(checkpoint, result.is_ok());
+        result.and_then(|value| completion.map(|()| value))
     }
 
     /// Run a closure against an immutable view of the root context.
@@ -767,13 +915,13 @@ impl Canopy {
 
     /// Drain and return log lines recorded by the most recent script
     /// evaluation.
-    pub fn take_script_logs(&self) -> Vec<String> {
+    pub fn take_script_logs(&mut self) -> Vec<String> {
         self.script_host.take_logs()
     }
 
     /// Drain and return assertion outcomes from the most recent script
     /// evaluation.
-    pub fn take_script_assertions(&self) -> Vec<script::ScriptAssertion> {
+    pub fn take_script_assertions(&mut self) -> Vec<script::ScriptAssertion> {
         self.script_host.take_assertions()
     }
 
@@ -790,13 +938,14 @@ impl Canopy {
     ///
     /// When the journal exceeds the limit the oldest entries are evicted. A
     /// limit of zero disables retention entirely.
+    #[cfg(any(test, feature = "testing"))]
     pub fn set_script_journal_limit(&mut self, limit: usize) {
         self.script_journal_limit = limit;
         self.enforce_script_journal_limit();
     }
 
-    /// Evaluate a Luau config file from disk.
-    pub fn run_config(&mut self, path: &FsPath) -> Result<()> {
+    /// Evaluate a Luau config file during builder setup.
+    fn run_config_inner(&mut self, path: &FsPath) -> Result<()> {
         let baseline = self.begin_script_journal();
         let source = fs::read_to_string(path)
             .map_err(|err| error::Error::Invalid(format!("config read failed: {err}")))?;
@@ -823,7 +972,7 @@ impl Canopy {
                 .map(|_| ())
         })();
         self.record_script_journal(
-            format!("config:{}", path.display()),
+            ScriptOrigin::Config(path.display().to_string()),
             &source,
             baseline,
             &result,
@@ -831,28 +980,53 @@ impl Canopy {
         result
     }
 
+    /// Evaluate a Luau config file directly in a low-level test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_config(&mut self, path: &FsPath) -> Result<()> {
+        self.run_config_inner(path)
+    }
+
     /// Install an idempotent framework-owned command binding.
     pub fn bind_framework(
         &mut self,
         group: inputmap::FrameworkBindingGroup,
-        input: inputmap::InputSpec,
-        path: &str,
-        description: &str,
-        command: commands::CommandInvocation,
+        input: impl Into<inputmap::InputSpec>,
+        options: inputmap::BindingOptions,
+        command: commands::CommandCall,
     ) -> Result<inputmap::BindingId> {
         self.core
             .input_map
-            .bind_framework(group, input, path, description, command)
+            .bind_framework(group, input, options, command.action())
+    }
+
+    /// Install or replace an application command binding.
+    ///
+    /// An omitted command target resolves from the node where the binding wins.
+    pub fn bind_command(
+        &mut self,
+        input: impl Into<inputmap::InputSpec>,
+        options: inputmap::BindingOptions,
+        command: commands::CommandCall,
+    ) -> Result<inputmap::BindingId> {
+        let (id, removed) = self.core.input_map.replace_application_action(
+            input.into(),
+            options,
+            inputmap::BindingTarget::Command(command.action()),
+        )?;
+        self.release_removed_bindings(removed);
+        Ok(id)
     }
 
     /// Remove an application binding by ID.
     ///
     /// A framework-owned ID returns an error.
-    pub fn unbind(&mut self, id: inputmap::BindingId) -> Result<bool> {
+    pub(crate) fn unbind(&mut self, id: inputmap::BindingId) -> Result<bool> {
         let Some(target) = self.core.input_map.unbind(id)? else {
             return Ok(false);
         };
-        self.release_binding_target(target);
+        if let inputmap::BindingTarget::Script(target) = target {
+            self.release_binding_target(target);
+        }
         Ok(true)
     }
 
@@ -867,13 +1041,13 @@ impl Canopy {
     }
 
     /// Remove all bindings from all modes.
-    pub fn clear_bindings(&mut self) -> usize {
+    pub(crate) fn clear_bindings(&mut self) -> usize {
         let removed = self.core.input_map.clear_application();
         self.release_removed_bindings(removed)
     }
 
-    /// Remove all callbacks whose VM ownership is tied to the current source
-    /// epoch.
+    /// Remove application bindings and callbacks from the current source epoch.
+    #[cfg(any(test, feature = "testing"))]
     fn clear_script_callbacks(&mut self) {
         let removed = self.core.input_map.clear_application();
         self.release_removed_bindings(removed);
@@ -888,13 +1062,49 @@ impl Canopy {
     }
 
     /// Set the active input mode.
-    pub fn set_input_mode(&mut self, mode: &str) -> Result<()> {
-        self.core.input_map.set_mode(mode)
+    pub fn set_input_mode(&mut self, mode: &str) {
+        self.core.input_map.set_mode(mode);
     }
 
     /// Push an input mode above the current mode.
-    pub fn push_input_mode(&mut self, mode: &str) -> Result<()> {
-        self.core.input_map.push_mode(mode)
+    pub fn push_input_mode(&mut self, mode: &str) {
+        self.core.input_map.push_mode(mode);
+    }
+
+    /// Push an input mode that takes only the next key.
+    ///
+    /// The next key pops the mode. When the mode binds that key, the binding
+    /// runs after the pop and before any widget sees the key. Any other key
+    /// only pops the mode.
+    pub fn push_transient_input_mode(&mut self, mode: &str) {
+        self.core.input_map.push_transient_mode(mode);
+    }
+
+    /// Register a hook that runs against the root context before the next
+    /// frame whenever the input mode stack has changed.
+    ///
+    /// Registering a name again replaces its hook. Hooks run in name order.
+    pub fn register_mode_hook(&mut self, name: &'static str, hook: ModeHook) {
+        self.mode_hooks.insert(name, hook);
+    }
+
+    /// Return whether the mode stack changed since the mode hooks last ran.
+    pub(super) fn mode_hooks_pending(&self) -> bool {
+        !self.mode_hooks.is_empty()
+            && self.synced_mode_generation != self.core.input_map.mode_generation()
+    }
+
+    /// Run the mode hooks once for the current mode stack.
+    pub(super) fn run_mode_hooks(&mut self) -> Result<()> {
+        if !self.mode_hooks_pending() {
+            return Ok(());
+        }
+        self.synced_mode_generation = self.core.input_map.mode_generation();
+        let hooks = self.mode_hooks.values().copied().collect::<Vec<_>>();
+        for hook in hooks {
+            self.with_root_context(hook)?;
+        }
+        Ok(())
     }
 
     /// Pop the top input mode and return the new active mode.
@@ -916,8 +1126,8 @@ impl Canopy {
         Ok(())
     }
 
-    /// Finalize the script API surface for this app.
-    pub fn finalize_api(&mut self) -> Result<()> {
+    /// Finalize the script API surface for the consuming builder.
+    fn finalize_api_inner(&mut self) -> Result<()> {
         if self.script_host.is_finalized() {
             return Ok(());
         }
@@ -973,6 +1183,12 @@ impl Canopy {
         Ok(())
     }
 
+    /// Finalize the script API surface for a low-level test application.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn finalize_api(&mut self) -> Result<()> {
+        self.finalize_api_inner()
+    }
+
     /// Return the rendered Luau definition file for a ready app.
     pub fn script_api(&self) -> Result<&str> {
         self.script_api_text.as_deref().ok_or_else(|| {
@@ -1011,7 +1227,7 @@ impl Canopy {
         result: &Result<()>,
     ) {
         self.record_script_journal(
-            format!("default-bindings:{owner}"),
+            ScriptOrigin::DefaultBindings(owner.to_owned()),
             &run.source,
             run.baseline,
             result,
@@ -1122,7 +1338,7 @@ impl Canopy {
             (0, 0)
         };
         ScriptJournalBaseline {
-            started: Instant::now(),
+            started: self.now(),
             logs,
             assertions,
         }
@@ -1131,12 +1347,17 @@ impl Canopy {
     /// Append a script evaluation to the in-memory journal.
     fn record_script_journal<T>(
         &mut self,
-        origin: impl Into<String>,
+        origin: ScriptOrigin,
         source: &str,
         baseline: ScriptJournalBaseline,
         result: &Result<T>,
     ) {
-        let duration_ms = u64::try_from(baseline.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = u64::try_from(
+            self.now()
+                .saturating_duration_since(baseline.started)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         let mut logs = self.script_host.logs();
         let logs = logs.split_off(baseline.logs.min(logs.len()));
         let mut assertions = self.script_host.assertions();
@@ -1145,7 +1366,7 @@ impl Canopy {
         self.script_journal_next_id += 1;
         self.script_journal.push(ScriptJournalEntry {
             id,
-            origin: origin.into(),
+            origin,
             source: source.to_string(),
             ok: result.is_ok(),
             error: result.as_ref().err().map(ToString::to_string),
@@ -1172,13 +1393,9 @@ impl Canopy {
     /// Compile any registered default binding scripts after finalization.
     fn compile_registered_default_bindings(&mut self) -> Result<()> {
         let host = self.script_host.clone();
-        let mut owners = self.default_bindings.keys().cloned().collect::<Vec<_>>();
-        owners.sort();
-        for owner in owners {
-            let script = self
-                .default_bindings
-                .get_mut(&owner)
-                .ok_or_else(|| error::Error::Internal("default binding disappeared".into()))?;
+        let mut scripts = self.default_bindings.iter_mut().collect::<Vec<_>>();
+        scripts.sort_by_key(|(a, _)| a.as_str());
+        for (_, script) in scripts {
             if script.script_id.is_none() {
                 script.script_id = Some(host.compile(&script.source)?);
             }
@@ -1226,29 +1443,12 @@ impl Canopy {
         Ok(ran)
     }
 
-    /// Return command availability from the current focus position.
-    ///
-    /// This computes which commands would resolve to a target if dispatched
-    /// from the current focus. For each command:
-    /// - Free commands always have `resolution = Some(Free)`
-    /// - Node-routed commands have `resolution = Some(Subtree{..})` or
-    ///   `Some(Ancestor{..})` if a matching node exists, `None` otherwise
-    pub fn command_availability_from_focus(&self) -> Vec<commands::CommandAvailability<'_>> {
-        let start = self.core.focus.unwrap_or(self.core.root);
-        self.command_availability_from_node(start)
-    }
-
-    /// Return command availability from a specific node.
-    ///
-    /// Computes which commands would dispatch to a target, using the same
-    /// resolution logic as `commands::dispatch`:
-    /// 1. First search the subtree rooted at `start` in pre-order
-    /// 2. Then walk ancestors
-    pub fn command_availability_from_node(
+    /// Return command availability using an explicit target policy.
+    pub fn command_availability(
         &self,
-        start: NodeId,
-    ) -> Vec<commands::CommandAvailability<'_>> {
-        commands::CommandResolver::new(&self.core, start).availability()
+        target: commands::CommandTarget,
+    ) -> Result<Vec<commands::CommandAvailability<'_>>> {
+        commands::CommandResolver::for_target(&self.core, target).availability()
     }
 
     /// Return the effective key bindings for a node or the current focus.
@@ -1260,7 +1460,7 @@ impl Canopy {
     }
 
     /// Build a diagnostic dump with tree, focus, and binding details.
-    pub fn diagnostic_dump(&self, target: NodeId) -> String {
+    pub(crate) fn diagnostic_dump(&self, target: NodeId) -> String {
         let mut out = String::new();
         let input_mode = self.core.input_map.current_mode();
         let target = if self.core.nodes.contains_key(target) {
@@ -1269,7 +1469,7 @@ impl Canopy {
             self.core.root
         };
         let focus_path = self.core.focus_path(self.core.root);
-        let target_path = self.core.node_path(self.core.root, target);
+        let target_path = self.core.path_of(self.core.root, target);
 
         out.push_str("Canopy diagnostics\n");
         out.push_str(&format!("focus: {:?}\n", self.core.focus));

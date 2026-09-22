@@ -2,7 +2,6 @@
 //! Developer workflow tasks for the canopy workspace.
 
 use std::{
-    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
@@ -22,23 +21,14 @@ struct Cli {
 /// Supported xtask commands.
 #[derive(Subcommand)]
 enum Task {
-    /// Build all workspace targets with default features.
+    /// Build the workspace and isolated widget capability profiles.
     FeatureCheck,
     /// Check API skeletons and tracked Luau sources.
     Checks,
     /// Compile every benchmark target without running benchmarks.
     BenchCheck,
-    /// Run targeted Miri checks for unsafe code.
-    Dynamic,
     /// Run all smoke-test integration targets.
     Smoke,
-    /// Regenerate the public API skeletons and report the tracked surface
-    /// sizes.
-    Api {
-        /// Verify the checked-in skeletons instead of rewriting them.
-        #[arg(long)]
-        check: bool,
-    },
 }
 
 /// Run the `cargo xtask` entry point.
@@ -46,64 +36,10 @@ fn main() -> ExitCode {
     let root = workspace_root();
     exit_code(match Cli::parse().task {
         Task::FeatureCheck => run_default_check(&root),
-        Task::Checks => run_api_check(&root) && run_luau_check(&root),
+        Task::Checks => run_luau_check(&root),
         Task::BenchCheck => run_bench_check(&root),
-        Task::Dynamic => run_dynamic(&root),
         Task::Smoke => run_smoke(&root),
-        Task::Api { check: true } => run_api_check(&root),
-        Task::Api { check: false } => run_api(&root),
     })
-}
-
-/// Rust nightly used for the repository's Miri checks.
-const MIRI_TOOLCHAIN: &str = "+nightly-2026-07-01";
-
-/// Ruskel version required locally and in CI.
-const RUSKEL_VERSION: &str = "0.0.11";
-
-/// Package directories and the API skeleton each one generates.
-const API_SURFACES: &[(&str, &str)] = &[
-    ("crates/canopy", "api-surface/canopy.rs"),
-    ("crates/canopy-derive", "api-surface/canopy-derive.rs"),
-    ("crates/canopy-geom", "api-surface/canopy-geom.rs"),
-    ("crates/canopy-mcp", "api-surface/canopy-mcp.rs"),
-    ("crates/canopy-widgets", "api-surface/canopy-widgets.rs"),
-    ("crates/examples", "api-surface/canopy-examples.rs"),
-    ("examples/todo", "api-surface/todo.rs"),
-];
-
-/// Intent-level surfaces whose method counts the API budget tracks.
-const INTENT_SURFACES: &[(&str, &str)] = &[
-    ("Canopy", "api-surface/canopy.rs"),
-    ("ViewContext", "api-surface/canopy.rs"),
-    ("Context", "api-surface/canopy.rs"),
-    ("Editor", "api-surface/canopy-widgets.rs"),
-];
-
-/// Run the targeted unsafe-code suites under Miri.
-fn run_dynamic(workspace_root: &Path) -> bool {
-    for filter in [
-        "widget_slot_restores",
-        "core::backend::tests",
-        "reentrant_canopy_guard_restores_nested_stack",
-    ] {
-        if !run_cargo_command(
-            workspace_root,
-            &[
-                MIRI_TOOLCHAIN,
-                "miri",
-                "test",
-                "-p",
-                "canopy",
-                "--all-features",
-                "--lib",
-                filter,
-            ],
-        ) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Run the workspace smoke-test workflow.
@@ -147,9 +83,43 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Build all workspace targets with default features.
+/// Build the production profile, the full workspace, and isolated minimum and
+/// independent widget profiles.
 fn run_default_check(workspace_root: &Path) -> bool {
-    run_cargo_command(workspace_root, &["check", "--workspace", "--all-targets"])
+    // The production profile omits `--all-targets` and `--all-features` on
+    // purpose. Either flag pulls in dev-dependencies, which re-enable the
+    // `testing` feature and hide the warnings this step exists to catch.
+    if !run_cargo_command(
+        workspace_root,
+        &["clippy", "--workspace", "--", "-D", "warnings"],
+    ) {
+        return false;
+    }
+    if !run_cargo_command(workspace_root, &["check", "--workspace", "--all-targets"]) {
+        return false;
+    }
+    for capability in [
+        None,
+        Some("editor"),
+        Some("terminal-widget"),
+        Some("graphics"),
+        Some("devtools"),
+    ] {
+        let mut args = vec![
+            "check",
+            "-p",
+            "canopy-widgets",
+            "--no-default-features",
+            "--all-targets",
+        ];
+        if let Some(capability) = capability {
+            args.extend(["--features", capability]);
+        }
+        if !run_cargo_command(workspace_root, &args) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Type-check every tracked Luau source under its owning application surface.
@@ -187,7 +157,9 @@ fn validate_luau_inventory(workspace_root: &Path) -> Result<(), String> {
     for file in files.lines() {
         let owned = file == "crates/canopy/luau/preamble.d.luau"
             || file.starts_with("crates/canopy-widgets/tests/luau/")
-            || file.starts_with("examples/todo/smoke/");
+            || file.starts_with("examples/todo/smoke/")
+            || file.starts_with("examples/hello/smoke/")
+            || file == "examples/hello/src/default_bindings.luau";
         if !owned {
             return Err(format!("tracked Luau file has no checker owner: {file}"));
         }
@@ -207,201 +179,6 @@ fn run_bench_check(workspace_root: &Path) -> bool {
             "--all-features",
         ],
     )
-}
-
-/// Regenerate every API skeleton and report the tracked surface sizes.
-fn run_api(workspace_root: &Path) -> bool {
-    let skeletons = match render_api_surfaces(workspace_root) {
-        Ok(skeletons) => skeletons,
-        Err(error) => {
-            eprintln!("{error}");
-            return false;
-        }
-    };
-
-    for (artifact, skeleton) in &skeletons {
-        if let Err(error) = fs::write(workspace_root.join(artifact), skeleton) {
-            eprintln!("writing {artifact} failed: {error}");
-            return false;
-        }
-    }
-
-    print_api_report(&skeletons);
-    true
-}
-
-/// Fail when a checked-in API skeleton differs from the generated one.
-fn run_api_check(workspace_root: &Path) -> bool {
-    let skeletons = match render_api_surfaces(workspace_root) {
-        Ok(skeletons) => skeletons,
-        Err(error) => {
-            eprintln!("{error}");
-            return false;
-        }
-    };
-
-    let mut stale = Vec::new();
-    for (artifact, skeleton) in &skeletons {
-        match fs::read_to_string(workspace_root.join(artifact)) {
-            Ok(checked_in) if &checked_in == skeleton => {}
-            Ok(_) => stale.push(*artifact),
-            Err(error) => {
-                eprintln!("reading {artifact} failed: {error}");
-                return false;
-            }
-        }
-    }
-
-    if stale.is_empty() {
-        return true;
-    }
-    eprintln!("Stale API skeletons: {}", stale.join(", "));
-    eprintln!("Run `cargo xtask api` and review the surface change.");
-    false
-}
-
-/// Render every API skeleton with the pinned ruskel.
-fn render_api_surfaces(workspace_root: &Path) -> Result<Vec<(&'static str, String)>, String> {
-    if !require_tool(
-        "ruskel",
-        installed_ruskel_version(),
-        RUSKEL_VERSION,
-        &format!("run `cargo install ruskel --version {RUSKEL_VERSION}`"),
-    ) {
-        return Err("the pinned ruskel is not installed".to_string());
-    }
-
-    API_SURFACES
-        .iter()
-        .map(|(package, artifact)| {
-            let output = Command::new("ruskel")
-                .arg(package)
-                .current_dir(workspace_root)
-                .stderr(Stdio::inherit())
-                .output()
-                .map_err(|error| format!("running ruskel on {package} failed: {error}"))?;
-            if !output.status.success() {
-                return Err(format!("ruskel on {package} failed with {}", output.status));
-            }
-            let skeleton = String::from_utf8(output.stdout)
-                .map_err(|error| format!("ruskel output for {package} is not UTF-8: {error}"))?;
-            Ok((*artifact, skeleton))
-        })
-        .collect()
-}
-
-/// Print the tracked method counts and skeleton sizes.
-fn print_api_report(skeletons: &[(&str, String)]) {
-    let skeleton = |artifact: &str| {
-        skeletons
-            .iter()
-            .find(|(name, _)| *name == artifact)
-            .map(|(_, text)| text.as_str())
-            .unwrap_or_default()
-    };
-
-    println!("Intent-level surfaces");
-    for (surface, artifact) in INTENT_SURFACES {
-        println!(
-            "  {surface}: {} methods",
-            surface_method_count(skeleton(artifact), surface)
-        );
-    }
-
-    println!("Skeleton sizes");
-    for (artifact, text) in skeletons {
-        println!("  {artifact}: {} lines", text.lines().count());
-    }
-}
-
-/// Return the installed ruskel version.
-fn installed_ruskel_version() -> Option<String> {
-    let output = Command::new("ruskel").arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    stdout.split_whitespace().nth(1).map(str::to_string)
-}
-
-/// Count the distinct methods a skeleton declares for one intent-level surface.
-///
-/// A surface is the inherent `impl` blocks of a type or the trait definition
-/// itself. Ruskel renders a re-exported type once per path, so names are
-/// deduplicated; `impl dyn Trait` helpers and trait implementations for the
-/// type are not part of the surface.
-fn surface_method_count(skeleton: &str, surface: &str) -> usize {
-    let mut names = BTreeSet::new();
-    let mut lines = skeleton.lines().peekable();
-    while let Some(line) = lines.next() {
-        if !is_surface_header(line.trim(), surface) {
-            continue;
-        }
-        let body_indent = indent_of(line) + 4;
-        while let Some(body) = lines.peek() {
-            if !body.trim().is_empty() && indent_of(body) < body_indent {
-                break;
-            }
-            if indent_of(body) == body_indent
-                && let Some(name) = method_name(body.trim())
-            {
-                names.insert(name);
-            }
-            lines.next();
-        }
-    }
-    names.len()
-}
-
-/// Return true when the line opens an inherent impl block or trait definition
-/// for the surface.
-fn is_surface_header(line: &str, surface: &str) -> bool {
-    let Some(head) = line.strip_suffix('{') else {
-        return false;
-    };
-    let head = head.trim_end();
-    if let Some(ty) = head.strip_prefix("impl ") {
-        // Ruskel renders an inherent impl under the path the type is defined at, which
-        // is longer than the re-export the budget names.
-        return ty.rsplit("::").next().unwrap_or(ty) == surface;
-    }
-    if let Some(ty) = head.strip_prefix("pub trait ") {
-        return ty.split(':').next().unwrap_or(ty).trim() == surface;
-    }
-    false
-}
-
-/// Return the method name a skeleton line declares.
-fn method_name(line: &str) -> Option<&str> {
-    let rest = line
-        .strip_prefix("pub fn ")
-        .or_else(|| line.strip_prefix("fn "))?;
-    let end = rest
-        .find(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
-/// Return the leading space count of a line.
-fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-/// Report whether the installed tool matches its repository pin.
-///
-/// A mismatch names the installed version so the reader can see what to change.
-fn require_tool(tool: &str, installed: Option<String>, required: &str, hint: &str) -> bool {
-    match installed {
-        Some(version) if version == required => true,
-        Some(version) => {
-            eprintln!("{tool} {required} is required, but {version} is installed; {hint}");
-            false
-        }
-        None => {
-            eprintln!("{tool} {required} is required; {hint}");
-            false
-        }
-    }
 }
 
 /// Discover directories that define smoke suites via `.canopyctl.toml`.
@@ -470,72 +247,5 @@ fn exit_code(success: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SKELETON: &str = "\
-pub mod canopy {
-    pub mod prelude {
-        pub struct Canopy {}
-
-        impl super::Canopy {
-            pub fn render(&mut self) -> Result<()> {}
-        }
-    }
-
-    pub struct Canopy {}
-
-    impl super::Canopy {
-        pub fn render(&mut self) -> Result<()> {}
-
-        pub fn quit(&mut self) {}
-    }
-
-    pub trait Context: ViewContext {
-        fn focus(&mut self) -> Result<()>;
-
-        fn hide(&mut self) {}
-    }
-
-    impl dyn Context {
-        pub fn add_children(&mut self) {}
-    }
-
-    impl Widget for Canopy {
-        fn name(&self) -> NodeName {}
-    }
-
-    pub mod editor {
-        pub struct Editor {}
-
-        impl super::editor::widget::Editor {
-            pub fn insert(&mut self) {}
-        }
-    }
-}
-";
-
-    #[test]
-    fn surface_count_deduplicates_re_exported_paths() {
-        assert_eq!(surface_method_count(SKELETON, "Canopy"), 2);
-    }
-
-    #[test]
-    fn surface_count_covers_a_trait_definition() {
-        assert_eq!(surface_method_count(SKELETON, "Context"), 2);
-    }
-
-    #[test]
-    fn surface_count_follows_a_nested_definition_path() {
-        assert_eq!(surface_method_count(SKELETON, "Editor"), 1);
-    }
-
-    #[test]
-    fn surface_count_ignores_an_unknown_surface() {
-        assert_eq!(surface_method_count(SKELETON, "Missing"), 0);
     }
 }

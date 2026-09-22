@@ -3,12 +3,14 @@
 use std::hint::black_box;
 
 use canopy::{
-    Canopy, Context, NodeId, TermBuf, ViewContext, Widget, command, derive_commands,
+    Canopy, Context, ContextExt, KeyedChildren, NodeId, NodeName, Render, TermBuf, ViewContext,
+    Widget,
+    commands::CommandTarget,
+    derive_commands,
     error::Result,
     geom::{Line, Point, Size},
     layout::{Layout, MeasureConstraints, Measurement},
-    render::{Render, RenderBackend},
-    state::NodeName,
+    render::RenderBackend,
     style::{AttrSet, Color, ResolvedStyle},
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -237,7 +239,7 @@ fn bench_tree_edit(c: &mut Criterion) {
             |(mut app, child)| {
                 let root = app.root_id();
                 app.with_root_context(|context| {
-                    context.apply_tree_edit(&mut |context| context.attach(root, child.into()))
+                    context.edit_structure(&mut |context| context.attach(root, child.into()))
                 })
                 .expect("tree edit should succeed");
                 black_box(app)
@@ -263,11 +265,50 @@ fn bench_render_diffing(c: &mut Criterion) {
     });
 }
 
+/// Benchmark the short style runs used by image previews and color gradients.
+fn bench_render_color_cells(c: &mut Criterion) {
+    let mut current =
+        TermBuf::new((160, 60), ' ', style()).expect("benchmark buffer should allocate");
+    for y in 0..60 {
+        for x in 0..160 {
+            let mut cell_style = style();
+            cell_style.fg = Color::Rgb {
+                r: x as u8,
+                g: y as u8,
+                b: 128,
+            };
+            current
+                .text(&cell_style, Line::new(x, y, 1), "▀")
+                .expect("benchmark cell should fit");
+        }
+    }
+    let previous = TermBuf::new((160, 60), ' ', style()).expect("benchmark buffer should allocate");
+    let mut backend = CountingBackend::default();
+    c.bench_function("render_color_cells_full", |b| {
+        b.iter(|| {
+            current
+                .render(black_box(&mut backend))
+                .expect("full render should succeed");
+            black_box(backend.text_bytes);
+        });
+    });
+    c.bench_function("render_color_cells_diff", |b| {
+        b.iter(|| {
+            current
+                .diff(black_box(&previous), black_box(&mut backend))
+                .expect("diff render should succeed");
+            black_box(backend.text_bytes);
+        });
+    });
+}
+
 /// Benchmark command target resolution through the synthetic subtree.
 fn bench_command_resolution(c: &mut Criterion) {
     c.bench_function("command_resolution", |b| {
         let app = build_command_tree().expect("command benchmark tree should build");
-        b.iter(|| black_box(app.command_availability_from_node(black_box(app.root_id()))));
+        b.iter(|| {
+            black_box(app.command_availability(CommandTarget::From(black_box(app.root_id()))))
+        });
     });
 }
 
@@ -334,14 +375,51 @@ fn bench_large_tree_render(c: &mut Criterion) {
     });
 }
 
+/// Benchmark stable and rolling key sets against an existing 1,000-row tree.
+fn bench_keyed_reconciliation(c: &mut Criterion) {
+    for (name, step) in [
+        ("keyed_reconcile_unchanged_1000", 0),
+        ("keyed_reconcile_rolling_1000", 1),
+    ] {
+        let mut app = Canopy::new();
+        let mut items = KeyedChildren::<usize, BenchNode>::new();
+        app.with_root_context(|ctx| {
+            items.reconcile(
+                ctx,
+                0..1_000,
+                |key| Ok(BenchNode::leaf(*key)),
+                |_, _, _| Ok(()),
+            )
+        })
+        .expect("keyed benchmark tree should build");
+        let mut start = 0;
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                start += step;
+                app.with_root_context(|ctx| {
+                    items.reconcile(
+                        ctx,
+                        black_box(start..start + 1_000),
+                        |key| Ok(BenchNode::leaf(*key)),
+                        |_, _, _| Ok(()),
+                    )
+                })
+                .expect("keyed reconciliation should succeed")
+            });
+        });
+    }
+}
+
 criterion_group!(
     benches,
     bench_tree_edit,
     bench_layout,
     bench_render_diffing,
+    bench_render_color_cells,
     bench_command_resolution,
     bench_script_startup,
     bench_text_buffer,
-    bench_large_tree_render
+    bench_large_tree_render,
+    bench_keyed_reconciliation
 );
 criterion_main!(benches);

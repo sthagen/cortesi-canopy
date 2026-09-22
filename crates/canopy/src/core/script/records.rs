@@ -5,11 +5,147 @@ use std::collections::BTreeMap;
 use ruau::vm::Scope;
 
 use super::{
-    ArgValue, AttrSet, Canopy, Cell, Color, CommandSpec, CoreViewContext, NodeId, Point, RectI32,
-    Result, ViewContext, commands, error, inputmap, node_id_to_arg, node_list_to_arg, point_to_arg,
-    rect_to_arg, size_to_arg, widget_access,
+    ArgValue, AttrSet, Canopy, Cell, Color, CoreViewContext, NodeId, Point, RectI32, Result,
+    ViewContext, commands, error, inputmap, node_list_to_arg, point_to_arg, rect_to_arg,
+    size_to_arg, widget_access,
 };
-use crate::core::termbuf::TermBuf;
+use crate::{FrameSnapshot, NodeSnapshot, core::termbuf::TermBuf, help};
+
+/// Convert a publication without consulting live widget or node state.
+pub(super) fn snapshot_to_arg(frame: &FrameSnapshot) -> ArgValue {
+    let mut rows = Vec::with_capacity(frame.viewport.h as usize);
+    for y in 0..frame.viewport.h {
+        let row = (0..frame.viewport.w)
+            .map(|x| {
+                let index = y as usize * frame.viewport.w as usize + x as usize;
+                cell_to_arg(x, y, &frame.cells[index])
+            })
+            .collect();
+        rows.push(ArgValue::Array(row));
+    }
+    ArgValue::Map(BTreeMap::from([
+        ("frame_id".into(), ArgValue::UInt(frame.frame_id.0)),
+        ("viewport".into(), size_to_arg(frame.viewport)),
+        (
+            "focus".into(),
+            frame.focus.map(ArgValue::Node).unwrap_or(ArgValue::Null),
+        ),
+        (
+            "nodes".into(),
+            ArgValue::Array(frame.nodes.iter().map(snapshot_node_to_arg).collect()),
+        ),
+        ("cells".into(), ArgValue::Array(rows)),
+    ]))
+}
+
+/// Serialize owned semantic and geometry data, including expired node tokens.
+fn snapshot_node_to_arg(node: &NodeSnapshot) -> ArgValue {
+    let semantics = &node.semantics;
+    let action_status = semantics
+        .action_status
+        .as_ref()
+        .map(|status| {
+            let reason = match status {
+                commands::CommandStatus::Enabled => ArgValue::Null,
+                commands::CommandStatus::Disabled(reason) => ArgValue::String(reason.clone()),
+            };
+            ArgValue::Map(BTreeMap::from([
+                ("kind".into(), ArgValue::String(status.label().into())),
+                ("reason".into(), reason),
+            ]))
+        })
+        .unwrap_or(ArgValue::Null);
+    let (rect, content_rect, scroll, canvas) = match node.view {
+        Some(view) => (
+            rect_to_arg(view.outer),
+            rect_to_arg(view.content),
+            point_to_arg(view.scroll),
+            size_to_arg(view.canvas),
+        ),
+        None => (
+            ArgValue::Null,
+            ArgValue::Null,
+            ArgValue::Null,
+            ArgValue::Null,
+        ),
+    };
+    ArgValue::Map(BTreeMap::from([
+        ("id".into(), ArgValue::Node(node.id)),
+        (
+            "parent".into(),
+            node.parent.map(ArgValue::Node).unwrap_or(ArgValue::Null),
+        ),
+        (
+            "children".into(),
+            node_list_to_arg(node.children.iter().copied()),
+        ),
+        ("name".into(), ArgValue::String(node.name.to_string())),
+        (
+            "semantic_identity".into(),
+            node.semantic_identity
+                .as_ref()
+                .map(|identity| {
+                    ArgValue::Map(BTreeMap::from([
+                        ("scope".into(), ArgValue::Node(identity.scope)),
+                        ("key".into(), ArgValue::String(identity.key.clone())),
+                    ]))
+                })
+                .unwrap_or(ArgValue::Null),
+        ),
+        ("attached".into(), ArgValue::Bool(node.attached)),
+        ("displayed".into(), ArgValue::Bool(node.displayed)),
+        (
+            "intersects_viewport".into(),
+            ArgValue::Bool(node.intersects_viewport),
+        ),
+        ("rect".into(), rect),
+        ("content_rect".into(), content_rect),
+        ("scroll".into(), scroll),
+        ("canvas".into(), canvas),
+        ("focused".into(), ArgValue::Bool(node.focused)),
+        (
+            "semantics".into(),
+            ArgValue::Map(BTreeMap::from([
+                (
+                    "role".into(),
+                    semantics
+                        .role
+                        .clone()
+                        .map(ArgValue::String)
+                        .unwrap_or(ArgValue::Null),
+                ),
+                (
+                    "label".into(),
+                    semantics
+                        .label
+                        .clone()
+                        .map(ArgValue::String)
+                        .unwrap_or(ArgValue::Null),
+                ),
+                (
+                    "value".into(),
+                    semantics
+                        .value
+                        .clone()
+                        .map(ArgValue::String)
+                        .unwrap_or(ArgValue::Null),
+                ),
+                (
+                    "selected".into(),
+                    semantics
+                        .selected
+                        .map(ArgValue::Bool)
+                        .unwrap_or(ArgValue::Null),
+                ),
+                (
+                    "selected_keys".into(),
+                    ArgValue::Array(semantics.selected_keys.clone()),
+                ),
+                ("action_status".into(), action_status),
+            ])),
+        ),
+    ]))
+}
 
 /// Convert a node into the `NodeInfo` scripting record.
 pub(super) fn node_info_to_arg(
@@ -32,18 +168,29 @@ pub(super) fn node_info_to_arg(
     };
     let accept_focus = widget_access::accepts_focus(&canopy.core, node_id);
     Ok(BTreeMap::from([
-        ("id".to_string(), node_id_to_arg(node_id)),
+        ("id".to_string(), ArgValue::Node(node_id)),
         ("name".to_string(), ArgValue::String(node.name.to_string())),
         (
+            "semantic_identity".to_string(),
+            root_ctx
+                .semantic_identity(node_id)
+                .map(|identity| {
+                    ArgValue::Map(BTreeMap::from([
+                        ("scope".to_string(), ArgValue::Node(identity.scope)),
+                        ("key".to_string(), ArgValue::String(identity.key)),
+                    ]))
+                })
+                .unwrap_or(ArgValue::Null),
+        ),
+        (
             "focused".to_string(),
-            ArgValue::Bool(root_ctx.node_is_focused(node_id)),
+            ArgValue::Bool(root_ctx.is_focused_of(node_id)),
         ),
         (
             "on_focus_path".to_string(),
-            ArgValue::Bool(root_ctx.node_is_on_focus_path(node_id)),
+            ArgValue::Bool(root_ctx.is_on_focus_path_of(node_id)),
         ),
         ("hidden".to_string(), ArgValue::Bool(node.hidden)),
-        ("visible".to_string(), ArgValue::Bool(!node.hidden)),
         (
             "children".to_string(),
             node_list_to_arg(node.children.iter().copied()),
@@ -137,6 +284,13 @@ pub(super) fn binding_info_to_arg(binding: &inputmap::BindingRecord) -> ArgValue
             ArgValue::String(binding.target.label().to_string()),
         ),
     ]);
+    record.insert(
+        "phase".to_string(),
+        ArgValue::String(binding.phase.label().to_string()),
+    );
+    if let inputmap::BindingTarget::Command(action) = &binding.target {
+        insert_command_action(&mut record, action);
+    }
     if let Some(mode) = binding.scope.mode() {
         record.insert("mode".to_string(), ArgValue::String(mode.to_string()));
     }
@@ -144,6 +298,71 @@ pub(super) fn binding_info_to_arg(binding: &inputmap::BindingRecord) -> ArgValue
         record.insert("source".to_string(), ArgValue::String(source.clone()));
     }
     ArgValue::Map(record)
+}
+
+/// Add a stored command's arguments and target policy to an observation record.
+fn insert_command_action(
+    record: &mut BTreeMap<String, ArgValue>,
+    action: &commands::CommandAction,
+) {
+    record.insert(
+        "command".to_string(),
+        ArgValue::String(action.invocation.id.0.to_string()),
+    );
+    record.insert(
+        "arguments".to_string(),
+        match &action.invocation.args {
+            commands::CommandArgs::Positional(values) => ArgValue::Array(values.clone()),
+            commands::CommandArgs::Named(fields) => ArgValue::Map(fields.clone()),
+        },
+    );
+    let (kind, node) = match action.target {
+        None => ("route", None),
+        Some(commands::CommandTarget::Exact(node)) => ("exact", Some(node)),
+        Some(commands::CommandTarget::From(node)) => ("from", Some(node)),
+        Some(commands::CommandTarget::Focus) => ("focus", None),
+    };
+    let mut target = BTreeMap::from([("kind".to_string(), ArgValue::String(kind.to_string()))]);
+    if let Some(node) = node {
+        target.insert("node".to_string(), ArgValue::Node(node));
+    }
+    record.insert("command_target".to_string(), ArgValue::Map(target));
+}
+
+/// Add availability and eligibility without conflating them with target
+/// resolution or missing context.
+fn insert_command_availability(
+    record: &mut BTreeMap<String, ArgValue>,
+    status: Option<&commands::CommandStatus>,
+    missing: &[commands::CommandRequirement],
+    available: bool,
+    target: Option<NodeId>,
+) {
+    record.insert("available".to_string(), ArgValue::Bool(available));
+    if let Some(status) = status {
+        record.insert(
+            "status".to_string(),
+            ArgValue::String(status.label().to_string()),
+        );
+        if let commands::CommandStatus::Disabled(reason) = status {
+            record.insert(
+                "disabled_reason".to_string(),
+                ArgValue::String(reason.clone()),
+            );
+        }
+    }
+    record.insert(
+        "missing_requirements".to_string(),
+        ArgValue::Array(
+            missing
+                .iter()
+                .map(|requirement| ArgValue::String(requirement.as_str().to_string()))
+                .collect(),
+        ),
+    );
+    if let Some(target) = target {
+        record.insert("target".to_string(), ArgValue::Node(target));
+    }
 }
 
 /// Convert a command parameter specification into its scripting record.
@@ -170,6 +389,12 @@ fn command_param_to_arg(param: &commands::CommandParamSpec) -> ArgValue {
         ),
         ("optional".to_string(), ArgValue::Bool(param.optional)),
     ]);
+    if let Some(requirement) = param.requirement.and_then(|requirement| requirement()) {
+        record.insert(
+            "requirement".to_string(),
+            ArgValue::String(requirement.as_str().to_string()),
+        );
+    }
     if let Some(doc) = param.ty.doc {
         record.insert("doc".to_string(), ArgValue::String(doc.to_string()));
     }
@@ -177,14 +402,14 @@ fn command_param_to_arg(param: &commands::CommandParamSpec) -> ArgValue {
 }
 
 /// Convert a command specification into its scripting record.
-pub(super) fn command_info_to_arg(
-    spec: &CommandSpec,
-    resolution: Option<commands::CommandResolution>,
-) -> ArgValue {
-    let owner = match spec.dispatch {
-        commands::CommandDispatchKind::Node { owner } => owner,
-        commands::CommandDispatchKind::Free => "",
-    };
+pub(super) fn command_info_to_arg(availability: commands::CommandAvailability<'_>) -> ArgValue {
+    let commands::CommandAvailability {
+        spec,
+        resolution,
+        status,
+        missing_requirements,
+    } = availability;
+    let owner = spec.dispatch.owner().unwrap_or("");
     let mut record = BTreeMap::from([
         ("name".to_string(), ArgValue::String(spec.name.to_string())),
         ("owner".to_string(), ArgValue::String(owner.to_string())),
@@ -199,11 +424,14 @@ pub(super) fn command_info_to_arg(
                 commands::CommandReturnSpec::Value(ty) => ty.luau_ty().render(),
             }),
         ),
-        (
-            "available".to_string(),
-            ArgValue::Bool(resolution.is_some()),
-        ),
     ]);
+    insert_command_availability(
+        &mut record,
+        status.as_ref(),
+        &missing_requirements,
+        resolution.is_some(),
+        resolution.and_then(commands::CommandResolution::target),
+    );
     if let Some(doc) = spec.doc {
         record.insert("doc".to_string(), ArgValue::String(doc.to_string()));
     }
@@ -212,18 +440,15 @@ pub(super) fn command_info_to_arg(
     {
         record.insert("ret_doc".to_string(), ArgValue::String(doc.to_string()));
     }
-    if let Some(target) = resolution.and_then(commands::CommandResolution::target) {
-        record.insert("target".to_string(), node_id_to_arg(target));
-    }
     ArgValue::Map(record)
 }
 
 /// Refresh the app snapshot and borrow its rendered buffer.
 fn rendered_buffer(canopy: &mut Canopy) -> Result<&TermBuf> {
-    canopy.refresh_snapshot()?;
+    canopy.flush()?;
     canopy
         .buf()
-        .ok_or_else(|| error::Error::Script("screen unavailable before render".into()))
+        .ok_or_else(|| error::Error::script("screen unavailable before render"))
 }
 
 /// Convert the current rendered screen buffer into its scripting record.
@@ -345,7 +570,7 @@ pub(super) fn route_trace_to_arg(canopy: &Canopy) -> ArgValue {
                     ("detail".to_string(), ArgValue::String(entry.detail.clone())),
                 ]);
                 if let Some(node) = entry.node {
-                    record.insert("node".to_string(), node_id_to_arg(node));
+                    record.insert("node".to_string(), ArgValue::Node(node));
                 }
                 ArgValue::Map(record)
             })
@@ -361,61 +586,70 @@ fn owner_label(owner: inputmap::BindingOwner) -> String {
     }
 }
 
+/// Convert one effective binding to a scripting record.
+///
+/// Key and mouse records carry the same fields, so one conversion serves both
+/// and the two lists cannot drift apart.
+fn available_binding_to_arg<I: ToString>(binding: help::AvailableBinding<I>) -> ArgValue {
+    let mut record = BTreeMap::from([
+        ("id".to_string(), ArgValue::UInt(binding.id.as_u64())),
+        (
+            "input".to_string(),
+            ArgValue::String(binding.input.to_string()),
+        ),
+        (
+            "description".to_string(),
+            ArgValue::String(binding.description),
+        ),
+        (
+            "owner".to_string(),
+            ArgValue::String(owner_label(binding.owner)),
+        ),
+        (
+            "scope".to_string(),
+            ArgValue::String(binding.scope.label().to_string()),
+        ),
+        ("path".to_string(), ArgValue::String(binding.path_filter)),
+        (
+            "route_path".to_string(),
+            ArgValue::String(binding.route_path.to_string()),
+        ),
+        (
+            "phase".to_string(),
+            ArgValue::String(binding.phase.label().to_string()),
+        ),
+    ]);
+    if let Some(command) = binding.command {
+        let mut detail = BTreeMap::new();
+        insert_command_action(&mut detail, &command.action);
+        insert_command_availability(
+            &mut detail,
+            command.status.as_ref(),
+            &command.missing_requirements,
+            command.resolution.is_some(),
+            command
+                .resolution
+                .and_then(commands::CommandResolution::target),
+        );
+        record.insert("command".to_string(), ArgValue::Map(detail));
+    }
+    if let Some(mode) = binding.scope.mode() {
+        record.insert("mode".to_string(), ArgValue::String(mode.to_string()));
+    }
+    if let Some(source) = binding.source {
+        record.insert("source".to_string(), ArgValue::String(source));
+    }
+    ArgValue::Map(record)
+}
+
 /// Convert a contextual binding snapshot to a scripting record.
 pub(super) fn available_bindings_to_arg(
     canopy: &Canopy,
     requested: Option<NodeId>,
 ) -> Result<ArgValue> {
     let snapshot = canopy.available_bindings(requested)?;
-    let bindings = snapshot
-        .bindings
-        .into_iter()
-        .map(|binding| {
-            let mut record = BTreeMap::from([
-                ("id".to_string(), ArgValue::UInt(binding.id.as_u64())),
-                (
-                    "input".to_string(),
-                    ArgValue::String(binding.key.to_string()),
-                ),
-                (
-                    "description".to_string(),
-                    ArgValue::String(binding.description),
-                ),
-                (
-                    "owner".to_string(),
-                    ArgValue::String(owner_label(binding.owner)),
-                ),
-                (
-                    "scope".to_string(),
-                    ArgValue::String(binding.scope.label().to_string()),
-                ),
-                ("path".to_string(), ArgValue::String(binding.path_filter)),
-                (
-                    "route_path".to_string(),
-                    ArgValue::String(binding.route_path.to_string()),
-                ),
-                (
-                    "phase".to_string(),
-                    ArgValue::String(
-                        match binding.phase {
-                            inputmap::BindingPhase::BeforeWidget => "before_widget",
-                            inputmap::BindingPhase::AfterIgnore => "after_ignore",
-                        }
-                        .to_string(),
-                    ),
-                ),
-            ]);
-            if let Some(mode) = binding.scope.mode() {
-                record.insert("mode".to_string(), ArgValue::String(mode.to_string()));
-            }
-            if let Some(source) = binding.source {
-                record.insert("source".to_string(), ArgValue::String(source));
-            }
-            ArgValue::Map(record)
-        })
-        .collect();
     Ok(ArgValue::Map(BTreeMap::from([
-        ("focus".to_string(), node_id_to_arg(snapshot.focus)),
+        ("focus".to_string(), ArgValue::Node(snapshot.focus)),
         (
             "focus_path".to_string(),
             ArgValue::String(snapshot.focus_path.to_string()),
@@ -430,7 +664,32 @@ pub(super) fn available_bindings_to_arg(
                     .collect(),
             ),
         ),
-        ("bindings".to_string(), ArgValue::Array(bindings)),
+        (
+            "bindings".to_string(),
+            ArgValue::Array(
+                snapshot
+                    .bindings
+                    .into_iter()
+                    .map(available_binding_to_arg)
+                    .collect(),
+            ),
+        ),
+        (
+            "mouse_bindings".to_string(),
+            ArgValue::Array(
+                snapshot
+                    .mouse_bindings
+                    .into_iter()
+                    .map(available_binding_to_arg)
+                    .collect(),
+            ),
+        ),
+        (
+            "transient_mode".to_string(),
+            snapshot
+                .transient_mode
+                .map_or(ArgValue::Null, ArgValue::String),
+        ),
         (
             "exclusive_group".to_string(),
             snapshot.exclusive_group.map_or(ArgValue::Null, |group| {
@@ -449,7 +708,10 @@ pub(super) fn script_journal_to_arg(canopy: &Canopy) -> ArgValue {
             .map(|entry| {
                 ArgValue::Map(BTreeMap::from([
                     ("id".to_string(), ArgValue::UInt(entry.id)),
-                    ("origin".to_string(), ArgValue::String(entry.origin.clone())),
+                    (
+                        "origin".to_string(),
+                        ArgValue::String(entry.origin.to_string()),
+                    ),
                     ("source".to_string(), ArgValue::String(entry.source.clone())),
                     ("ok".to_string(), ArgValue::Bool(entry.ok)),
                     (

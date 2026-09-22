@@ -1,9 +1,8 @@
 use canopy::{
-    ViewContext, Widget,
+    Render, ViewContext, Widget,
     error::Result,
     geom::{Point, Rect, Size},
     layout::Layout,
-    render::Render,
     style::ResolvedStyle,
 };
 
@@ -124,7 +123,7 @@ impl Widget for FontBanner {
         if view_rect.w == 0 || view_rect.h == 0 {
             return Ok(());
         }
-        let size = Size::new(view_rect.w, view_rect.h);
+        let size = view_rect.size();
         self.refresh_layout(size);
         let options = self.options;
         let style = &self.style;
@@ -145,7 +144,7 @@ impl Widget for FontBanner {
                     continue;
                 }
                 let point = Point { x, y };
-                let resolved = rndr.resolve_style_name_at(style, bounds, point);
+                let resolved = rndr.resolve_style(style).resolve_at(bounds, point);
                 let blended = blend_style(resolved, cell.fg_coverage, cell.bg_coverage);
                 rndr.put_cell(blended, point, cell.ch)?;
             }

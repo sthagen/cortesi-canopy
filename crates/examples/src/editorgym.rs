@@ -1,7 +1,9 @@
 use canopy::{
-    command, derive_commands, geom,
-    layout::{CanvasContext, Edges},
-    prelude::*,
+    Canopy, CanopyBuilder, Context, ContextExt, FocusDirection, Loader, NodeId, Widget,
+    derive_commands,
+    error::Result,
+    geom::Size,
+    layout::{CanvasContext, Direction, Edges, Layout, MeasureOverflow},
 };
 use canopy_widgets::{
     Frame,
@@ -14,30 +16,29 @@ use canopy_widgets::{
 const DEFAULT_BINDINGS: &str = r#"
 root.default_bindings()
 
-canopy.bind("Tab", { path = "editor_gym", description = "Next focus" }, function()
-    root.focus("Next")
-end)
-canopy.bind("BackTab", { path = "editor_gym", description = "Previous focus" }, function()
-    root.focus("Prev")
-end)
-canopy.bind("PageDown", { path = "editor_gym", description = "Page down" }, function()
-    editor_gym.page(1)
-end)
-canopy.bind("PageUp", { path = "editor_gym", description = "Page up" }, function()
-    editor_gym.page(-1)
-end)
-canopy.bind("Home", { path = "editor_gym", description = "Top" }, function()
-    editor_gym.scroll_to(0, 0)
-end)
-canopy.bind_mouse("ScrollDown", { path = "editor_gym", description = "Scroll down" }, function()
-    editor_gym.scroll("Down")
-end)
-canopy.bind_mouse("ScrollUp", { path = "editor_gym", description = "Scroll up" }, function()
-    editor_gym.scroll("Up")
-end)
-canopy.bind("q", { path = "root", description = "Quit" }, function()
-    root.quit()
-end)
+canopy.keymap({
+    path = "editor_gym",
+    { key = "Tab", description = "Next focus", action = command.root.focus("Next") },
+    { key = "BackTab", description = "Previous focus", action = command.root.focus("Prev") },
+    { key = "PageDown", description = "Page down", action = command.editor_gym.page(1) },
+    { key = "PageUp", description = "Page up", action = command.editor_gym.page(-1) },
+    { key = "Home", description = "Top", action = command.editor_gym.scroll_to(0, 0) },
+    {
+        mouse = "ScrollDown",
+        description = "Scroll down",
+        action = function()
+            editor_gym.scroll("Down")
+        end,
+    },
+    {
+        mouse = "ScrollUp",
+        description = "Scroll up",
+        action = function()
+            editor_gym.scroll("Up")
+        end,
+    },
+})
+canopy.bind("q", { path = "root", description = "Quit" }, command.root.quit())
 "#;
 
 /// Seed text for the single-line editor sample.
@@ -119,7 +120,10 @@ impl EditorColumn {
 
 impl Widget for EditorColumn {
     fn layout(&self) -> Layout {
-        Layout::column().flex_horizontal(1).gap(1).overflow_y()
+        Layout::column()
+            .flex_horizontal(1)
+            .gap(1)
+            .overflow_y(MeasureOverflow::Unbounded)
     }
 }
 
@@ -142,29 +146,20 @@ impl EditorGym {
     #[command]
     /// Scroll the outer pane by one line in the specified direction.
     /// @param dir The direction to scroll.
-    pub fn scroll(&mut self, c: &mut dyn Context, dir: geom::Direction) {
-        match dir {
-            geom::Direction::Up => c.scroll_up(),
-            geom::Direction::Down => c.scroll_down(),
-            geom::Direction::Left => c.scroll_left(),
-            geom::Direction::Right => c.scroll_right(),
-        };
+    pub(crate) fn scroll(&self, c: &mut dyn Context, dir: FocusDirection) {
+        crate::scroll_in(c, dir);
     }
 
     #[command]
     /// Page the outer pane. Negative values move up; positive values move down.
     /// @param delta Signed page delta.
-    pub fn page(&mut self, c: &mut dyn Context, delta: i32) {
-        if delta < 0 {
-            c.page_up();
-        } else if delta > 0 {
-            c.page_down();
-        }
+    pub(crate) fn page(&self, c: &mut dyn Context, delta: i32) {
+        crate::page_by(c, delta);
     }
 
     #[command]
     /// Scroll the outer pane to an absolute content position.
-    pub fn scroll_to(&mut self, c: &mut dyn Context, x: u32, y: u32) {
+    pub(crate) fn scroll_to(&self, c: &mut dyn Context, x: u32, y: u32) {
         c.scroll_to(x, y);
     }
 
@@ -301,7 +296,10 @@ impl EditorGym {
 
 impl Widget for EditorGym {
     fn layout(&self) -> Layout {
-        Layout::fill().direction(Direction::Row).gap(1).overflow_y()
+        Layout::fill()
+            .direction(Direction::Row)
+            .gap(1)
+            .overflow_y(MeasureOverflow::Unbounded)
     }
 
     fn canvas(&self, view: Size, ctx: &CanvasContext) -> Size {
@@ -324,8 +322,8 @@ impl Loader for EditorGym {
     }
 }
 
-/// Install key bindings for the editor gym demo.
-pub fn setup_bindings(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.eval_script(DEFAULT_BINDINGS)?;
-    Ok(())
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.bindings("editorgym", DEFAULT_BINDINGS)
 }

@@ -5,6 +5,8 @@ use syn::Type;
 pub struct MacroArgs {
     /// Ignore command return value when dispatching.
     pub(crate) ignore_result: bool,
+    /// Read-only command eligibility method.
+    pub(crate) enabled: Option<syn::Ident>,
 }
 
 /// Classification of command parameter sources.
@@ -26,6 +28,8 @@ pub enum ParamKind {
 pub struct ParamMeta {
     /// Rust identifier for binding.
     pub(crate) ident: syn::Ident,
+    /// User-facing parameter identifier.
+    pub(crate) user_ident: syn::Ident,
     /// Normalized parameter name.
     pub(crate) name: String,
     /// Original Rust type.
@@ -68,6 +72,8 @@ pub struct ReturnMeta {
 /// Parsed metadata describing a command.
 #[derive(Debug, Clone)]
 pub struct CommandMeta {
+    /// Conditional compilation gates shared by every generated item.
+    pub(crate) cfg_attrs: Vec<syn::Attribute>,
     /// Command name (snake_case).
     pub(crate) name: String,
     /// Owner type name.
@@ -76,6 +82,8 @@ pub struct CommandMeta {
     pub(crate) params: Vec<ParamMeta>,
     /// Whether the return value is ignored.
     pub(crate) ignore_result: bool,
+    /// Read-only command eligibility method.
+    pub(crate) enabled: Option<syn::Ident>,
     /// Return type metadata.
     pub(crate) ret: ReturnMeta,
     /// Command documentation, taken from the method's doc comment.

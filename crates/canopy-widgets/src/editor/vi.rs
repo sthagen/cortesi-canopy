@@ -7,10 +7,10 @@ use canopy::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    Selection, TextPosition, TextRange,
     search::SearchDirection,
     widget::{Editor, is_word_char},
 };
+use crate::text_buffer::{Selection, TextPosition, TextRange};
 
 /// Vi mode state for the editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,115 +212,69 @@ impl Editor {
             }
         }
 
-        match event {
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('i'),
-                ..
-            }) => {
+        let Event::Key(key::Key { key, mods }) = event else {
+            return EventOutcome::Ignore;
+        };
+        if (mods.ctrl || mods.alt) && !(mods.ctrl && matches!(key, key::KeyCode::Char('r'))) {
+            return EventOutcome::Ignore;
+        }
+
+        match key {
+            key::KeyCode::Char('i') => {
                 self.begin_text_entry_transaction();
                 self.vi.begin_insert();
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('a'),
-                ..
-            }) => {
+            key::KeyCode::Char('a') => {
                 let _ = self.buffer.move_right(self.config.multiline);
                 self.update_preferred_column();
                 self.begin_text_entry_transaction();
                 self.vi.begin_insert();
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('I'),
-                ..
-            }) => {
+            key::KeyCode::Char('I') => {
                 self.buffer.move_line_start();
                 self.update_preferred_column();
                 self.begin_text_entry_transaction();
                 self.vi.begin_insert();
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('A'),
-                ..
-            }) => {
+            key::KeyCode::Char('A') => {
                 self.buffer.move_line_end();
                 self.update_preferred_column();
                 self.begin_text_entry_transaction();
                 self.vi.begin_insert();
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('o'),
-                ..
-            }) => {
-                self.begin_text_entry_transaction();
-                if self.config.multiline {
-                    let cursor = self.buffer.cursor();
-                    let end = self.buffer.line_end_position(cursor.line, true);
-                    self.buffer.set_cursor(end);
-                    self.handle_insert_text("\n");
-                }
-                self.vi.begin_insert();
-                self.vi.set_last_edit(RepeatableEdit::OpenBelow);
+            key::KeyCode::Char('o') => {
+                self.record_and_apply(RepeatableEdit::OpenBelow);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('O'),
-                ..
-            }) => {
-                self.begin_text_entry_transaction();
-                if self.config.multiline {
-                    let cursor = self.buffer.cursor();
-                    let start = TextPosition::new(cursor.line, 0);
-                    self.buffer.set_cursor(start);
-                    self.handle_insert_text("\n");
-                    let _ = self.buffer.move_left(true);
-                }
-                self.vi.begin_insert();
-                self.vi.set_last_edit(RepeatableEdit::OpenAbove);
+            key::KeyCode::Char('O') => {
+                self.record_and_apply(RepeatableEdit::OpenAbove);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('v'),
-                ..
-            }) => {
+            key::KeyCode::Char('v') => {
                 self.enter_visual(VisualMode::Character);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('V'),
-                ..
-            }) => {
+            key::KeyCode::Char('V') => {
                 self.enter_visual(VisualMode::Line);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Esc,
-                ..
-            }) => {
+            key::KeyCode::Esc => {
                 self.vi.set_pending(None);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('/'),
-                ..
-            }) => {
+            key::KeyCode::Char('/') => {
                 self.start_search_prompt(SearchDirection::Forward);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('?'),
-                ..
-            }) => {
+            key::KeyCode::Char('?') => {
                 self.start_search_prompt(SearchDirection::Backward);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('n'),
-                ..
-            }) => {
+            key::KeyCode::Char('n') => {
                 if let Some(pos) = self.search.move_next(&self.buffer, false) {
                     self.buffer.set_cursor(pos);
                     self.update_preferred_column();
@@ -328,10 +282,7 @@ impl Editor {
                 }
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('N'),
-                ..
-            }) => {
+            key::KeyCode::Char('N') => {
                 if let Some(pos) = self.search.move_next(&self.buffer, true) {
                     self.buffer.set_cursor(pos);
                     self.update_preferred_column();
@@ -339,47 +290,34 @@ impl Editor {
                 }
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('R'),
-                ..
-            }) => {
+            key::KeyCode::Char('R') => {
                 self.start_replace_prompt();
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('u'),
-                ..
-            }) => {
-                self.buffer.undo();
+            key::KeyCode::Char('u') => {
+                if self.config.read_only {
+                    return EventOutcome::Handle;
+                }
+                self.undo_edit();
                 self.update_preferred_column();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('r'),
-                mods,
-            }) if mods.ctrl => {
-                self.buffer.redo();
+            key::KeyCode::Char('r') if mods.ctrl => {
+                if self.config.read_only {
+                    return EventOutcome::Handle;
+                }
+                self.redo_edit();
                 self.update_preferred_column();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('.'),
-                ..
-            }) => {
+            key::KeyCode::Char('.') => {
                 self.repeat_last_edit();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('h'),
-                ..
-            })
-            | Event::Key(key::Key {
-                key: key::KeyCode::Left,
-                ..
-            }) => {
+            key::KeyCode::Char('h') | key::KeyCode::Left => {
                 let moved = self.buffer.move_left(true);
                 if moved {
                     self.update_preferred_column();
@@ -387,14 +325,7 @@ impl Editor {
                 }
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('l'),
-                ..
-            })
-            | Event::Key(key::Key {
-                key: key::KeyCode::Right,
-                ..
-            }) => {
+            key::KeyCode::Char('l') | key::KeyCode::Right => {
                 let moved = self.buffer.move_right(true);
                 if moved {
                     self.update_preferred_column();
@@ -402,184 +333,108 @@ impl Editor {
                 }
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('j'),
-                ..
-            })
-            | Event::Key(key::Key {
-                key: key::KeyCode::Down,
-                ..
-            }) => {
+            key::KeyCode::Char('j') | key::KeyCode::Down => {
                 self.move_vertical(1);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('k'),
-                ..
-            })
-            | Event::Key(key::Key {
-                key: key::KeyCode::Up,
-                ..
-            }) => {
+            key::KeyCode::Char('k') | key::KeyCode::Up => {
                 self.move_vertical(-1);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('0'),
-                ..
-            }) => {
+            key::KeyCode::Char('0') => {
                 self.buffer.move_line_start();
                 self.update_preferred_column();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('$'),
-                ..
-            }) => {
+            key::KeyCode::Char('$') => {
                 self.buffer.move_line_end();
                 self.update_preferred_column();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('^'),
-                ..
-            }) => {
+            key::KeyCode::Char('^') => {
                 self.buffer.move_line_first_non_ws();
                 self.update_preferred_column();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('w'),
-                ..
-            }) => {
+            key::KeyCode::Char('w') => {
                 self.move_word_forward();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('b'),
-                ..
-            }) => {
+            key::KeyCode::Char('b') => {
                 self.move_word_backward();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('e'),
-                ..
-            }) => {
+            key::KeyCode::Char('e') => {
                 self.move_word_end();
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('g'),
-                ..
-            }) => {
+            key::KeyCode::Char('g') => {
                 self.vi.set_pending(Some(PendingKey::G));
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('d'),
-                ..
-            }) => {
+            key::KeyCode::Char('d') => {
                 self.vi.set_pending(Some(PendingKey::Delete));
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('c'),
-                ..
-            }) => {
+            key::KeyCode::Char('c') => {
                 self.vi.set_pending(Some(PendingKey::Change));
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('y'),
-                ..
-            }) => {
+            key::KeyCode::Char('y') => {
                 self.vi.set_pending(Some(PendingKey::Yank));
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('Y'),
-                ..
-            }) => {
+            key::KeyCode::Char('Y') => {
                 self.yank_line();
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('p'),
-                ..
-            }) => {
+            key::KeyCode::Char('p') => {
                 let text = self.yank.clone();
                 let linewise = self.yank_linewise;
-                self.put_yank(false);
-                if !text.is_empty() {
-                    self.vi.set_last_edit(RepeatableEdit::Put {
-                        text,
-                        linewise,
-                        before: false,
-                    });
-                }
+                self.record_and_apply(RepeatableEdit::Put {
+                    text,
+                    linewise,
+                    before: false,
+                });
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('P'),
-                ..
-            }) => {
+            key::KeyCode::Char('P') => {
                 let text = self.yank.clone();
                 let linewise = self.yank_linewise;
-                self.put_yank(true);
-                if !text.is_empty() {
-                    self.vi.set_last_edit(RepeatableEdit::Put {
-                        text,
-                        linewise,
-                        before: true,
-                    });
-                }
+                self.record_and_apply(RepeatableEdit::Put {
+                    text,
+                    linewise,
+                    before: true,
+                });
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('x'),
-                ..
-            }) => {
-                if self.delete_char_forward() {
-                    self.vi.set_last_edit(RepeatableEdit::DeleteChar);
+            key::KeyCode::Char('x') => {
+                if self.record_and_apply(RepeatableEdit::DeleteChar) {
                     self.ensure_cursor_visible(ctx);
                 }
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('D'),
-                ..
-            }) => {
-                self.delete_to_line_end();
-                self.vi.set_last_edit(RepeatableEdit::DeleteToEnd);
+            key::KeyCode::Char('D') => {
+                self.record_and_apply(RepeatableEdit::DeleteToEnd);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('C'),
-                ..
-            }) => {
-                self.begin_text_entry_transaction();
-                self.delete_to_line_end();
-                self.vi.set_last_edit(RepeatableEdit::ChangeToEnd);
-                self.vi.begin_insert();
+            key::KeyCode::Char('C') => {
+                self.record_and_apply(RepeatableEdit::ChangeToEnd);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
             }
-            Event::Key(key::Key {
-                key: key::KeyCode::Char('G'),
-                ..
-            }) => {
+            key::KeyCode::Char('G') => {
                 let last_line = self.buffer.line_count().saturating_sub(1);
                 let pos = TextPosition::new(last_line, 0);
                 self.buffer.set_cursor(pos);
@@ -643,8 +498,7 @@ impl Editor {
                     ..
                 }),
             ) => {
-                self.delete_line();
-                self.vi.set_last_edit(RepeatableEdit::DeleteLine);
+                self.record_and_apply(RepeatableEdit::DeleteLine);
                 self.vi.set_pending(None);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
@@ -656,10 +510,7 @@ impl Editor {
                     ..
                 }),
             ) => {
-                self.begin_text_entry_transaction();
-                self.delete_line();
-                self.vi.set_last_edit(RepeatableEdit::ChangeLine);
-                self.vi.begin_insert();
+                self.record_and_apply(RepeatableEdit::ChangeLine);
                 self.vi.set_pending(None);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
@@ -779,7 +630,7 @@ impl Editor {
                 EventOutcome::Handle
             }
             Event::Paste(content) => {
-                let inserted = self.handle_paste(content);
+                let inserted = self.handle_insert_text(content);
                 self.vi.push_inserted(&inserted);
                 self.ensure_cursor_visible(ctx);
                 EventOutcome::Handle
@@ -821,7 +672,7 @@ impl Editor {
                     range = self.linewise_range(range);
                 }
                 self.set_yank(range, linewise);
-                self.buffer.replace_range(range, "");
+                self.replace_range(range, "");
                 self.update_preferred_column();
                 self.exit_visual();
                 self.vi.set_last_edit(RepeatableEdit::DeleteChar);
@@ -855,9 +706,9 @@ impl Editor {
                 }
                 self.set_yank(range, linewise);
                 self.begin_text_entry_transaction();
-                self.buffer.replace_range(range, "");
-                self.vi.begin_insert();
+                self.replace_range(range, "");
                 self.exit_visual();
+                self.vi.begin_insert();
                 self.vi.set_last_edit(RepeatableEdit::ChangeLine);
                 EventOutcome::Handle
             }
@@ -988,7 +839,7 @@ impl Editor {
             yank_range
         };
         self.set_yank(yank_range, true);
-        self.buffer.replace_range(delete_range, "");
+        self.replace_range(delete_range, "");
         if cursor.line + 1 == line_count && cursor.line > 0 {
             let prev_line = cursor.line.saturating_sub(1);
             self.buffer.set_cursor(TextPosition::new(prev_line, 0));
@@ -1008,7 +859,7 @@ impl Editor {
             return;
         }
         self.set_yank(range, false);
-        self.buffer.replace_range(range, "");
+        self.replace_range(range, "");
         self.update_preferred_column();
     }
 
@@ -1032,13 +883,22 @@ impl Editor {
         if self.config.read_only || self.yank.is_empty() {
             return;
         }
-        let content = self.normalize_insert_text(&self.yank);
+        let mut content = self.normalize_insert_text(&self.yank);
         let multiline = self.config.multiline;
         let linewise = self.yank_linewise;
         {
             let mut transaction = self.buffer.transaction();
             if linewise {
                 let cursor = transaction.cursor();
+                if multiline {
+                    if !before && cursor.line + 1 == transaction.line_count() {
+                        if transaction.line_char_len(cursor.line) > 0 {
+                            content.insert(0, '\n');
+                        }
+                    } else if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                }
                 let target = if before {
                     TextPosition::new(cursor.line, 0)
                 } else {
@@ -1231,57 +1091,61 @@ impl Editor {
         }
     }
 
-    /// Repeat the last recorded vi edit.
-    pub(super) fn repeat_last_edit(&mut self) {
-        if self.config.read_only {
-            return;
-        }
-        let Some(edit) = self.vi.last_edit() else {
-            return;
-        };
+    /// Apply a repeatable edit using normal-mode key semantics.
+    ///
+    /// Returns whether the edit changed the buffer and should therefore be
+    /// recorded as the last edit.
+    fn apply_edit(&mut self, edit: &RepeatableEdit) -> bool {
         match edit {
             RepeatableEdit::Insert { text } => {
-                self.handle_insert_text(&text);
+                self.handle_insert_text(text);
+                true
             }
             RepeatableEdit::Put {
                 text,
                 linewise,
                 before,
             } => {
-                self.yank = text;
-                self.yank_linewise = linewise;
-                self.put_yank(before);
+                let changed = !text.is_empty();
+                self.yank = text.clone();
+                self.yank_linewise = *linewise;
+                self.put_yank(*before);
+                changed
             }
             RepeatableEdit::DeleteLine => {
                 self.delete_line();
+                true
             }
             RepeatableEdit::ChangeLine => {
+                self.begin_text_entry_transaction();
                 self.delete_line();
                 self.vi.begin_insert();
-                self.begin_text_entry_transaction();
+                true
             }
-            RepeatableEdit::DeleteChar => {
-                let _ = self.handle_delete_forward();
-            }
+            RepeatableEdit::DeleteChar => self.delete_char_forward(),
             RepeatableEdit::DeleteToEnd => {
                 self.delete_to_line_end();
+                true
             }
             RepeatableEdit::ChangeToEnd => {
+                self.begin_text_entry_transaction();
                 self.delete_to_line_end();
                 self.vi.begin_insert();
-                self.begin_text_entry_transaction();
+                true
             }
             RepeatableEdit::OpenBelow => {
+                self.begin_text_entry_transaction();
                 if self.config.multiline {
                     let cursor = self.buffer.cursor();
-                    let end = self.buffer.line_end_position(cursor.line, true);
+                    let end = self.buffer.line_end_position(cursor.line, false);
                     self.buffer.set_cursor(end);
                     self.handle_insert_text("\n");
                 }
                 self.vi.begin_insert();
-                self.begin_text_entry_transaction();
+                true
             }
             RepeatableEdit::OpenAbove => {
+                self.begin_text_entry_transaction();
                 if self.config.multiline {
                     let cursor = self.buffer.cursor();
                     let start = TextPosition::new(cursor.line, 0);
@@ -1290,8 +1154,30 @@ impl Editor {
                     let _ = self.buffer.move_left(true);
                 }
                 self.vi.begin_insert();
-                self.begin_text_entry_transaction();
+                true
             }
         }
+    }
+
+    /// Apply an edit and record it as the last repeatable edit.
+    ///
+    /// Returns whether the edit changed the buffer.
+    fn record_and_apply(&mut self, edit: RepeatableEdit) -> bool {
+        let applied = self.apply_edit(&edit);
+        if applied {
+            self.vi.set_last_edit(edit);
+        }
+        applied
+    }
+
+    /// Repeat the last recorded vi edit.
+    pub(super) fn repeat_last_edit(&mut self) {
+        if self.config.read_only {
+            return;
+        }
+        let Some(edit) = self.vi.last_edit() else {
+            return;
+        };
+        self.apply_edit(&edit);
     }
 }

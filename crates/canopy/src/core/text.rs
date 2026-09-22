@@ -1,4 +1,4 @@
-use std::iter::repeat_n;
+use std::{borrow::Cow, iter::repeat_n};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -19,8 +19,8 @@ pub fn slice_by_columns(s: &str, start: usize, max: usize) -> (&str, usize) {
         let g_width = grapheme_width(grapheme);
 
         if !started {
-            // A grapheme that ends at or before the start column, or straddles it, is
-            // skipped.
+            // A grapheme that ends at or before the start column, or straddles
+            // it, is skipped.
             if col < start || col + g_width <= start {
                 col += g_width;
                 continue;
@@ -59,7 +59,10 @@ pub fn grapheme_width(grapheme: &str) -> usize {
 }
 
 /// Expand tabs into spaces using the configured tab stop.
-pub fn expand_tabs(s: &str, tab_stop: usize) -> String {
+pub fn expand_tabs(s: &str, tab_stop: usize) -> Cow<'_, str> {
+    if !s.contains('\t') {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::new();
     let mut col = 0usize;
     for grapheme in s.graphemes(true) {
@@ -77,7 +80,7 @@ pub fn expand_tabs(s: &str, tab_stop: usize) -> String {
         out.push_str(grapheme);
         col = col.saturating_add(grapheme_width(grapheme));
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Compute the width of the next tab from the provided column.
@@ -92,9 +95,50 @@ pub fn tab_width(column: usize, tab_stop: usize) -> usize {
 }
 
 /// Return the display width of a string in terminal cells.
-#[cfg(test)]
 pub fn display_width(s: &str) -> usize {
     s.graphemes(true).map(grapheme_width).sum()
+}
+
+/// Marker standing in for the text a truncation removed.
+const ELLIPSIS: &str = "…";
+
+/// Shorten `s` to `budget` display columns, marking a dropped head.
+///
+/// Text that already fits is returned as it is, so a caller pays nothing for
+/// the common case. The marker keeps the tail visible, which is what a long
+/// filesystem path needs: its last components identify it, and its leading
+/// ones repeat.
+pub fn truncate_start(s: &str, budget: usize) -> Cow<'_, str> {
+    let width = display_width(s);
+    if width <= budget {
+        return Cow::Borrowed(s);
+    }
+    if budget == 0 {
+        return Cow::Borrowed("");
+    }
+    // The marker spends one column, and the tail takes the rest. A tail that
+    // would start inside a wide grapheme drops it, so the result can be one
+    // column narrower than the budget, never wider.
+    let tail = budget - 1;
+    let (kept, _) = slice_by_columns(s, width - tail, tail);
+    Cow::Owned(format!("{ELLIPSIS}{kept}"))
+}
+
+/// Shorten `s` to `budget` display columns, marking a dropped tail.
+///
+/// Text that already fits is returned as it is. This is the ordinary
+/// direction, for text whose opening identifies it.
+pub fn truncate_end(s: &str, budget: usize) -> Cow<'_, str> {
+    let width = display_width(s);
+    if width <= budget {
+        return Cow::Borrowed(s);
+    }
+    if budget == 0 {
+        return Cow::Borrowed("");
+    }
+    let head = budget - 1;
+    let (kept, _) = slice_by_columns(s, 0, head);
+    Cow::Owned(format!("{kept}{ELLIPSIS}"))
 }
 
 #[cfg(test)]
@@ -153,5 +197,52 @@ mod tests {
     #[test]
     fn standalone_zero_width_graphemes_remain_zero_width() {
         assert_eq!(grapheme_width("\u{0301}"), 0);
+    }
+
+    #[test]
+    fn truncation_keeps_text_that_already_fits() {
+        for budget in [4, 5, 99] {
+            assert_eq!(truncate_start("abcd", budget), "abcd");
+            assert_eq!(truncate_end("abcd", budget), "abcd");
+        }
+        // An exact fit must not gain a marker.
+        assert_eq!(truncate_start("界界", 4), "界界");
+        assert_eq!(truncate_end("界界", 4), "界界");
+    }
+
+    #[test]
+    fn truncation_marks_the_end_it_dropped() {
+        assert_eq!(truncate_start("/usr/local/bin", 6), "…l/bin");
+        assert_eq!(truncate_end("/usr/local/bin", 6), "/usr/…");
+        // One column leaves room for the marker alone, and none for nothing.
+        assert_eq!(truncate_start("abcd", 1), "…");
+        assert_eq!(truncate_end("abcd", 1), "…");
+        assert_eq!(truncate_start("abcd", 0), "");
+        assert_eq!(truncate_end("abcd", 0), "");
+    }
+
+    #[test]
+    fn truncation_never_exceeds_its_budget_on_wide_graphemes() {
+        // A budget that splits a wide grapheme drops it rather than overrun.
+        for budget in 1..=8 {
+            for text in ["a界b界c", "A👩‍💻B", "界界界"] {
+                assert!(
+                    display_width(&truncate_start(text, budget)) <= budget,
+                    "truncate_start({text:?}, {budget}) overran its budget"
+                );
+                assert!(
+                    display_width(&truncate_end(text, budget)) <= budget,
+                    "truncate_end({text:?}, {budget}) overran its budget"
+                );
+            }
+        }
+        // "a界b" is four columns, so a budget of three leaves two for the tail
+        // after the marker. Those two columns start inside the wide grapheme,
+        // which is dropped rather than split, so the result spends one column
+        // less than it was given. Keeping the grapheme would fit here, but only
+        // by measuring back from the end, and a result narrower than its budget
+        // is what the budget promises.
+        assert_eq!(truncate_start("a界b", 3), "…b");
+        assert_eq!(truncate_end("a界b", 3), "a…");
     }
 }

@@ -2,7 +2,7 @@
 use std::cell::RefCell;
 
 use crate::{
-    Canopy, Context, NodeId, ViewContext, command,
+    Canopy, Context, NodeId, ViewContext,
     core::Core,
     derive_commands,
     error::Result,
@@ -35,7 +35,6 @@ impl State {
     pub fn add_event(&mut self, n: &NodeName, evt: &str, result: &EventOutcome) {
         let outcome = match result {
             EventOutcome::Handle => "handle",
-            EventOutcome::Consume => "consume",
             EventOutcome::Ignore => "ignore",
         };
         self.path.push(format!("{n}@{evt}->{outcome}"))
@@ -244,6 +243,8 @@ pub fn run_ttree(func: impl FnOnce(&mut Canopy, TestRender, TestTree) -> Result<
     c.add_commands::<Bb>()?;
 
     c.set_root_size(Size::new(100, 100))?;
+    // Isolated Core tests need geometry before focus and API initialization.
+    c.core.update_layout(Size::new(100, 100))?;
     reset_state();
     func(&mut c, tr, tree)
 }

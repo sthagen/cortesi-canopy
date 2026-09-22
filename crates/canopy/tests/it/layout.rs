@@ -3,12 +3,10 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Loader, NodeId, ViewContext, Widget,
+        ContextExt, Loader, NodeId, NodeName, Render, ViewContext, Widget,
         error::Result,
         geom::Size,
         layout::{Edges, Layout, MeasureConstraints, Measurement},
-        render::Render,
-        state::NodeName,
         testing::harness::Harness,
     };
 
@@ -90,8 +88,8 @@ mod tests {
 
         let (container_view, child_view) = h.canopy.with_root_view(|context| {
             (
-                context.node_view(container).expect("missing container"),
-                context.node_view(child).expect("missing child"),
+                context.view_of(container).expect("missing container"),
+                context.view_of(child).expect("missing child"),
             )
         });
         assert_eq!(child_view.outer.tl.x, container_view.content.tl.x);

@@ -7,6 +7,14 @@ use crate::{LineSegment, Rect};
 /// Geometry error type.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum Error {
+    /// A point cannot be represented in the destination coordinate type.
+    #[error("point ({x}, {y}) is outside the destination coordinate range")]
+    CoordinateOutOfRange {
+        /// Rejected x coordinate.
+        x: i64,
+        /// Rejected y coordinate.
+        y: i64,
+    },
     /// A zero-length window cannot be projected into a track.
     #[error("window cannot be zero length")]
     ZeroLengthWindow,
@@ -34,9 +42,6 @@ pub enum Error {
         /// Rectangle height.
         height: u32,
     },
-    /// A split requested zero sections.
-    #[error("cannot split a length into zero sections")]
-    ZeroSections,
 }
 
 /// Result type for geometry operations.
