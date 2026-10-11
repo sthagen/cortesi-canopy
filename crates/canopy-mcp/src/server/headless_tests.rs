@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use canopy::{CanopyBuilder, Widget, Work, derive_commands, geom::Size};
+use canopy::{CanopyBuilder, Widget, derive_commands, geom::Size, runtime::TurnInput};
 use tmcp::schema::ClientRequest;
 use tokio::{
     io::{duplex, split},
@@ -67,14 +67,14 @@ fn fixture(workers: usize) -> Fixture {
             dropped: dropped_tx.clone(),
         };
         Ok(CanopyBuilder::new()
-            .configure(|canopy| {
-                canopy.add_commands::<Probe>()?;
-                canopy.register_startup_script(
+            .configure(|setup| {
+                setup.add_commands::<Probe>()?;
+                setup.register_startup_script(
                     "startup",
-                    "function setup() canopy.set_mode('ready') end",
+                    "function setup() canopy.enter_mode('ready') end",
                 )
             })
-            .bindings("bindings", "canopy.set_mode('building')")
+            .script("bindings", "canopy.enter_mode('building')")
             .assemble(move |canopy| canopy.replace_root(probe).map(|_| ()))
             .build()?)
     });
@@ -314,12 +314,12 @@ async fn live_transport_cancellation_and_disconnect_wake_the_ui_driver() {
                 dropped: async_mpsc::unbounded_channel().0,
             };
             let mut canopy = CanopyBuilder::new()
-                .configure(|canopy| canopy.add_commands::<Probe>())
+                .configure(|setup| setup.add_commands::<Probe>())
                 .assemble(move |canopy| canopy.replace_root(probe).map(|_| ()))
                 .build()
                 .expect("live app");
-            canopy.set_root_size(Size::new(20, 5)).unwrap();
-            canopy.turn(Work::Prepare).unwrap();
+            canopy.set_screen_size(Size::new(20, 5)).unwrap();
+            canopy.turn(TurnInput::Prepare).unwrap();
             ready_tx
                 .send(canopy.automation_handle())
                 .ok()
@@ -331,7 +331,7 @@ async fn live_transport_cancellation_and_disconnect_wake_the_ui_driver() {
                     .block_on(async { timeout(DEADLINE, events.next()).await })
                     .expect("UI receives a wake")
                     .expect("UI event");
-                canopy.turn(Work::Wake).expect("UI turn");
+                canopy.turn(TurnInput::Wake).expect("UI turn");
                 if !reported
                     && canopy.script_journal().iter().any(|entry| {
                         entry.source == SOURCE

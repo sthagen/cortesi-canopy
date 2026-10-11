@@ -3,10 +3,11 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        ContextExt, Loader, NodeId, NodeName, Render, ViewContext, Widget,
+        ContextExt, NodeId, NodeName, ViewContext, Widget,
         error::Result,
         geom::Size,
         layout::{Edges, Layout, MeasureConstraints, Measurement},
+        render::Render,
         testing::harness::Harness,
     };
 
@@ -68,19 +69,17 @@ mod tests {
         }
     }
 
-    impl Loader for Root {}
-
     #[test]
     fn child_respects_parent_padding() -> Result<()> {
         let mut h = Harness::builder(Root::new()).size(20, 20).build()?;
         let (container, child) = h.canopy.with_root_context(|context| {
             let container: NodeId = context.create_detached(Container::new())?.into();
             let child: NodeId = context.create_detached(Huge::new())?.into();
-            context.set_children_of(h.root, vec![container])?;
-            context.set_children_of(container, vec![child])?;
-            context.set_layout_of(h.root, Layout::fill())?;
-            context.set_layout_of(container, Layout::fill().padding(Edges::all(1)))?;
-            context.set_layout_of(child, Layout::fill())?;
+            context.set_children(h.root, vec![container])?;
+            context.set_children(container, vec![child])?;
+            context.set_layout_override(h.root, Layout::fill().into())?;
+            context.set_layout_override(container, Layout::fill().padding(Edges::all(1)).into())?;
+            context.set_layout_override(child, Layout::fill().into())?;
             Ok((container, child))
         })?;
 

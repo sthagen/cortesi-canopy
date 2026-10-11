@@ -5,7 +5,7 @@
 
 use std::{
     cell::{RefCell, RefMut},
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     fmt,
     future::{Future, poll_fn},
     mem,
@@ -14,8 +14,7 @@ use std::{
     rc::Rc,
     result::Result as StdResult,
     sync::{Arc, Mutex},
-    task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use ruau::{
@@ -24,34 +23,40 @@ use ruau::{
         BlockingRuntime, BlockingRuntimeError, FunctionHandle, LifecycleError, RootHandle, Runtime,
     },
     source::{ModuleId, Source, SourceProvider},
-    surface::{CheckOptions, PrepareOptions, PreparedGraph, Surface, VmConfig},
+    surface::{CheckOptions, PrepareGraphError, PrepareOptions, PreparedGraph, Surface, VmConfig},
     typecheck::{DiagnosticRecord, ModuleDiagnosticRecord, Severity},
     vm::{
-        Ambient, CallOptions, Cancel, Limits, NativeModule, RuntimeCapabilities, Scope, SinkQuota,
-        StashedClosure,
+        Ambient, CallOptions, Cancel, Limits, RuntimeCapabilities, Scope, SinkQuota, StashedClosure,
     },
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Base `canopy` scripting API declarations and native registration.
+pub use super::{
+    canopy::{
+        AutomationCallback, AutomationHandle, EvalId, EvalOutcome, EvalRequest, EvalTicket,
+        ScriptJournalEntry, ScriptOrigin, ScriptTrust,
+    },
+    fixture::{Fixture, FixtureInfo},
+};
 use crate::{
-    Canopy, ChangeOutcome, FixtureInfo, NodeId,
-    commands::{self, ArgValue, CommandArgs, CommandInvocation, CommandSet, CommandSpec},
+    Canopy, ChangeOutcome, NodeId, commands,
+    commands::{ArgValue, CommandArgs, CommandSet, CommandSpec},
     core::{
         Core,
         context::{Context, CoreContext, CoreViewContext, FocusScope, ViewContext},
         inputmap,
         termbuf::Cell,
-        widget_access,
     },
-    error::{self, Result},
-    event::{key, mouse},
+    error,
+    error::Result,
     geom::{Point, RectI32, Size},
+    input::{key, mouse},
     path::PathFilter,
     style::{AttrSet, Color},
 };
 
-/// Base `canopy` scripting API declarations and native registration.
 mod base_api;
 /// Guards and the bridge between a running script scope and the live `Canopy`.
 mod bridge;
@@ -86,34 +91,15 @@ static BLOCKING_RUNTIME: BlockingRuntime = BlockingRuntime::new("canopy-script")
 /// Drive a borrowed future only where blocking is supported by the caller.
 pub(crate) fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     BLOCKING_RUNTIME.block_on(future).map_err(|error| match error {
-        BlockingRuntimeError::AsyncContext => error::Error::InvalidOperation(
+        BlockingRuntimeError::AsyncContext => error::Error::Invalid(
             "synchronous script execution cannot block this Tokio context; construct and run the application on a blocking worker".into(),
         ),
-        BlockingRuntimeError::Build(message) => error::Error::RunLoop(message),
+        BlockingRuntimeError::Build(message) => error::Error::Driver(message),
     })?
 }
 
 /// Script identifier.
 pub(crate) type ScriptId = u64;
-
-/// One-shot fault-injection checkpoints for finalization tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FinalizeStep {
-    /// Audited surfaces have been built but not staged.
-    SurfacePrepared,
-    /// Module declaration conformance has succeeded.
-    DeclarationsValidated,
-    /// Default binding scripts have compiled.
-    DefaultBindingsCompiled,
-    /// Startup scripts have compiled.
-    StartupScriptsCompiled,
-    /// The retained runtime has been built.
-    RuntimeBuilt,
-    /// A pending script is about to be loaded by sorted index.
-    PendingScript(usize),
-    /// All roots are loaded and publication is about to commit.
-    BeforePublish,
-}
 
 /// Stable handle for a stored Luau closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,13 +122,23 @@ pub struct ScriptAssertion {
     pub message: String,
 }
 
+/// Severity of a checked Luau source diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptCheckSeverity {
+    /// The diagnostic fails script evaluation.
+    Error,
+    /// The diagnostic does not fail script evaluation.
+    Warning,
+}
+
 /// Structured Luau typecheck diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ScriptCheckDiagnostic {
     /// Diagnostic source name, when the diagnostic belongs to a named source.
     pub source: Option<String>,
-    /// Diagnostic severity such as `error` or `warning`.
-    pub severity: String,
+    /// Diagnostic severity.
+    pub severity: ScriptCheckSeverity,
     /// One-based line number, or zero when the diagnostic is not source-bound.
     pub line: usize,
     /// One-based column number, or zero when the diagnostic is not
@@ -155,7 +151,7 @@ pub struct ScriptCheckDiagnostic {
 impl ScriptCheckDiagnostic {
     /// Return true if this diagnostic should fail script evaluation.
     pub fn is_error(&self) -> bool {
-        self.severity == "error"
+        self.severity == ScriptCheckSeverity::Error
     }
 }
 
@@ -184,11 +180,6 @@ impl ScriptCheckResult {
     /// Construct a result from checker diagnostics.
     pub(crate) fn from_diagnostics(diagnostics: Vec<ScriptCheckDiagnostic>) -> Self {
         Self { diagnostics }
-    }
-
-    /// Return true if there are no failing diagnostics.
-    pub fn is_ok(&self) -> bool {
-        !self.has_errors()
     }
 
     /// Return all diagnostics.
@@ -255,7 +246,7 @@ impl ScriptCache {
     ) -> Result<ScriptId> {
         let id = self.next_script_id;
         self.next_script_id = self.next_script_id.checked_add(1).ok_or_else(|| {
-            error::Error::InvalidOperation("script identifier space exhausted".to_string())
+            error::Error::Invalid("script identifier space exhausted".to_string())
         })?;
         self.scripts.insert(
             id,
@@ -350,7 +341,7 @@ impl ClosureRegistry {
     fn insert(&mut self, stashed: StashedClosure) -> Result<LuauFunctionId> {
         let id = LuauFunctionId(self.next_function_id);
         self.next_function_id = self.next_function_id.checked_add(1).ok_or_else(|| {
-            error::Error::InvalidOperation("closure identifier space exhausted".to_string())
+            error::Error::Invalid("closure identifier space exhausted".to_string())
         })?;
         self.functions
             .insert(id, StoredFunctionTarget::Pending(stashed));
@@ -408,16 +399,33 @@ struct LuauState {
     surface: Option<Surface>,
     /// Script surface with startup-root global obligations.
     startup_surface: Option<Surface>,
-    /// Typed globals every startup script root must define.
-    startup_requirements: Vec<StartupRequirement>,
     /// Whether the command surface has been finalized.
     finalized: bool,
     /// Whether a top-level async eval is currently driving the retained VM.
     active_eval: bool,
     /// Deferred hooks to execute after the first live render.
     on_start_hooks: Vec<LuauFunctionId>,
-    /// Optional one-shot finalization failure used by deterministic tests.
-    finalize_failure: Option<FinalizeStep>,
+}
+
+impl LuauState {
+    /// Construct empty script host state.
+    fn new() -> Self {
+        Self {
+            scripts: ScriptCache::new(),
+            closures: ClosureRegistry::new(),
+            ..Self::default()
+        }
+    }
+
+    /// Mark a fully prepared script API as ready.
+    fn publish(&mut self) {
+        self.finalized = true;
+    }
+
+    /// Drain deferred `on_start` hooks in registration order.
+    fn drain_on_start_hooks(&mut self) -> Vec<LuauFunctionId> {
+        mem::take(&mut self.on_start_hooks)
+    }
 }
 
 /// Luau host state shared by the canopy runtime.
@@ -548,10 +556,9 @@ pub(crate) fn diagnostic_record_to_script(
     ScriptCheckDiagnostic {
         source,
         severity: match diagnostic.severity {
-            Severity::Error => "error",
-            Severity::Warning | Severity::Info => "warning",
-        }
-        .to_string(),
+            Severity::Error => ScriptCheckSeverity::Error,
+            Severity::Warning | Severity::Info => ScriptCheckSeverity::Warning,
+        },
         line,
         column,
         message: diagnostic.message,
@@ -575,6 +582,28 @@ fn check_source_with_surface(surface: &Surface, source: &Source) -> ScriptCheckR
             .map(|diagnostic| diagnostic_record_to_script(Some(source_name.clone()), diagnostic))
             .collect(),
     }
+}
+
+/// Most script output lines, or assertions, one buffer retains. Each call
+/// already has its own print quota; this bounds what accumulates across the
+/// binding callbacks of a long-running app, whose buffer nothing drains. The
+/// oldest half goes once it fills.
+const SCRIPT_OUTPUT_LIMIT: usize = 16_384;
+
+/// Append `item`, dropping the oldest half of `buffer` once it is full.
+fn push_bounded<T>(buffer: &mut Vec<T>, item: T) {
+    if buffer.len() >= SCRIPT_OUTPUT_LIMIT {
+        buffer.drain(..SCRIPT_OUTPUT_LIMIT / 2);
+    }
+    buffer.push(item);
+}
+
+/// Why compiling a source failed.
+enum CompileFailure<E> {
+    /// Graph preparation, including typechecking, failed.
+    Prepare(E),
+    /// Any other failure.
+    Other(error::Error),
 }
 
 /// Return the Luau-safe global name for a command owner.
@@ -606,49 +635,9 @@ impl LuauHost {
         self.state.borrow().finalized
     }
 
-    /// Configure a one-shot finalization failure.
-    #[cfg(test)]
-    pub(crate) fn inject_finalize_failure(&self, step: FinalizeStep) {
-        self.state.borrow_mut().finalize_failure = Some(step);
-    }
-
-    /// Fail once when the configured finalization checkpoint is reached.
-    pub(crate) fn finalize_checkpoint(&self, step: FinalizeStep) -> Result<()> {
-        let mut state = self.state.borrow_mut();
-        if state.finalize_failure == Some(step) {
-            state.finalize_failure = None;
-            Err(error::Error::script(format!(
-                "fault injected at finalization step {step:?}"
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
     /// Return the finalized script surface.
     pub(crate) fn surface(&self) -> Option<Surface> {
         self.state.borrow().surface.clone()
-    }
-
-    /// Add a required global definition for startup script roots.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn require_startup_global(&self, name: &str, type_text: &str) -> Result<()> {
-        let mut state = self.state.borrow_mut();
-        if state.finalized {
-            return Err(error::Error::InvalidOperation(
-                "startup global requirements are sealed after finalize_api()".into(),
-            ));
-        }
-        if name.trim().is_empty() {
-            return Err(error::Error::Invalid(
-                "startup global requirement name cannot be empty".into(),
-            ));
-        }
-        state.startup_requirements.push(StartupRequirement {
-            name: name.to_string(),
-            type_text: type_text.to_string(),
-        });
-        Ok(())
     }
 
     /// Mark the retained runtime as busy with a top-level async evaluation.
@@ -664,9 +653,7 @@ impl LuauHost {
     /// Type-check a named Luau source against the finalized canopy API.
     pub fn check_script(&self, source_name: &str, source: &str) -> Result<ScriptCheckResult> {
         let surface = self.state.borrow().surface.clone().ok_or_else(|| {
-            error::Error::InvalidOperation(
-                "cannot type-check scripts before finalize_api()".to_string(),
-            )
+            error::Error::Invalid("cannot type-check scripts before finalize_api()".to_string())
         })?;
         let source = named_source(ModuleId::new(source_name), source);
         Ok(check_source_with_surface(&surface, &source))
@@ -676,12 +663,12 @@ impl LuauHost {
     /// and enforce the startup-script obligation.
     fn typecheck_startup_source(&self, source: &Source) -> Result<()> {
         let surface = self.state.borrow().startup_surface.clone().ok_or_else(|| {
-            error::Error::InvalidOperation(
+            error::Error::Invalid(
                 "cannot type-check startup scripts before finalize_api()".to_string(),
             )
         })?;
         let result = check_source_with_surface(&surface, source);
-        if result.is_ok() {
+        if !result.has_errors() {
             Ok(())
         } else {
             Err(error::Error::Parse(error::ParseError::new(
@@ -692,15 +679,15 @@ impl LuauHost {
 
     /// Append a log line to the current evaluation state.
     fn push_log(&self, message: String) {
-        self.state.borrow_mut().logs.push(message);
+        push_bounded(&mut self.state.borrow_mut().logs, message);
     }
 
     /// Append an assertion result to the current evaluation state.
     fn push_assertion(&self, passed: bool, message: String) {
-        self.state
-            .borrow_mut()
-            .assertions
-            .push(ScriptAssertion { passed, message });
+        push_bounded(
+            &mut self.state.borrow_mut().assertions,
+            ScriptAssertion { passed, message },
+        );
     }
 
     /// Drain deferred `on_start` hooks in registration order.
@@ -723,7 +710,8 @@ impl LuauHost {
         !self.state.borrow().on_start_hooks.is_empty()
     }
 
-    /// Take the logs collected during the most recent evaluation.
+    /// Take the logs collected outside a top-level evaluation.
+    #[cfg(any(test, feature = "testing"))]
     pub fn take_logs(&self) -> Vec<String> {
         mem::take(&mut self.state.borrow_mut().logs)
     }
@@ -733,7 +721,8 @@ impl LuauHost {
         self.state.borrow().logs.clone()
     }
 
-    /// Take the assertions collected during the most recent evaluation.
+    /// Take the assertions collected outside a top-level evaluation.
+    #[cfg(any(test, feature = "testing"))]
     pub fn take_assertions(&self) -> Vec<ScriptAssertion> {
         mem::take(&mut self.state.borrow_mut().assertions)
     }
@@ -757,17 +746,16 @@ impl LuauHost {
         &self,
         commands: &CommandSet,
         default_binding_owners: &BTreeSet<String>,
-        extra_modules: &[Arc<dyn NativeModule>],
         module_source: Option<Arc<dyn SourceProvider>>,
         fixtures: &[FixtureInfo],
+        actions: &inputmap::IntentCatalog,
     ) -> Result<String> {
         if self.is_finalized() || self.state.borrow().surface.is_some() {
-            return Err(error::Error::InvalidOperation(
+            return Err(error::Error::Invalid(
                 "Luau API finalization is already active or complete".into(),
             ));
         }
-        let mut modules = vec![build_base_module()?];
-        modules.extend(extra_modules.iter().map(Arc::clone));
+        let mut modules = vec![build_base_module(actions)?];
         modules.extend(build_owner_modules(commands, default_binding_owners)?);
         modules.push(build_command_module(commands)?);
         let definitions = defs::render_definitions(&modules, fixtures);
@@ -783,14 +771,13 @@ impl LuauHost {
             error::Error::script(format!("building script surface failed: {err}"))
         })?;
         let mut startup_surface = surface.clone();
-        for requirement in &self.state.borrow().startup_requirements {
-            startup_surface
-                .require_global(&requirement.name, &requirement.type_text)
-                .map_err(|err| {
-                    error::Error::script(format!("building startup script checker failed: {err}"))
-                })?;
-        }
-        self.finalize_checkpoint(FinalizeStep::SurfacePrepared)?;
+        // Every startup script root must define `setup()`, the built-in
+        // startup obligation.
+        startup_surface
+            .require_global("setup", "() -> ()")
+            .map_err(|err| {
+                error::Error::script(format!("building startup script checker failed: {err}"))
+            })?;
         let mut state = self.state.borrow_mut();
         state.surface = Some(surface);
         state.startup_surface = Some(startup_surface);
@@ -801,19 +788,19 @@ impl LuauHost {
     /// step succeeds.
     pub(crate) fn publish_finalize(&self) -> Result<()> {
         if self.is_finalized() {
-            return Err(error::Error::InvalidOperation(
-                "Luau API already finalized".into(),
-            ));
+            return Err(error::Error::Invalid("Luau API already finalized".into()));
         }
-        let surface = self.state.borrow().surface.clone().ok_or_else(|| {
-            error::Error::InvalidOperation("Luau API surface is not prepared".into())
-        })?;
+        let surface = self
+            .state
+            .borrow()
+            .surface
+            .clone()
+            .ok_or_else(|| error::Error::Invalid("Luau API surface is not prepared".into()))?;
         let mut runtime = Runtime::new(
             surface.clone(),
             &VmConfig::untrusted(Ambient::production(0), default_vm_limits()),
         )
         .map_err(|err| error::Error::script(format!("building script VM failed: {err}")))?;
-        self.finalize_checkpoint(FinalizeStep::RuntimeBuilt)?;
 
         let pending = self
             .state
@@ -826,8 +813,7 @@ impl LuauHost {
         let mut pending = pending;
         pending.sort_by_key(|(id, _, _)| *id);
         let mut loaded = Vec::with_capacity(pending.len());
-        for (index, (id, source, prepared)) in pending.into_iter().enumerate() {
-            self.finalize_checkpoint(FinalizeStep::PendingScript(index))?;
+        for (id, source, prepared) in pending {
             let prepared = match prepared {
                 Some(prepared) => prepared,
                 None => surface
@@ -839,7 +825,6 @@ impl LuauHost {
             })?;
             loaded.push((id, prepared, root));
         }
-        self.finalize_checkpoint(FinalizeStep::BeforePublish)?;
         *self.runtime.borrow_mut() = Some(runtime);
         {
             let mut state = self.state.borrow_mut();
@@ -852,61 +837,70 @@ impl LuauHost {
         Ok(())
     }
 
-    /// Discard a failed finalization attempt and scripts compiled only for that
-    /// attempt.
-    pub(crate) fn abort_finalize(&self, existing_scripts: &HashSet<ScriptId>) {
-        *self.runtime.borrow_mut() = None;
-        let mut state = self.state.borrow_mut();
-        state
-            .scripts
-            .scripts
-            .retain(|id, _| existing_scripts.contains(id));
-        state.surface = None;
-        state.startup_surface = None;
-        state.finalized = false;
-    }
-
-    /// Return the script IDs that existed before a finalization attempt.
-    pub(crate) fn script_ids(&self) -> HashSet<ScriptId> {
-        self.state
-            .borrow()
-            .scripts
-            .scripts
-            .keys()
-            .copied()
-            .collect()
-    }
-
     /// Compile a script and return its id.
     pub fn compile(&self, source: &str) -> Result<ScriptId> {
         self.compile_source(&Source::text(ModuleId::new(b"canopy".to_vec()), source))
     }
 
+    /// Compile an evaluation's source. A typecheck failure returns its
+    /// diagnostics beside the error, so a caller can report both without
+    /// checking the source a second time.
+    pub(crate) fn compile_eval(
+        &self,
+        source: &str,
+    ) -> StdResult<ScriptId, (error::Error, Vec<ScriptCheckDiagnostic>)> {
+        let source = Source::text(ModuleId::new(b"canopy".to_vec()), source);
+        self.compile_source_with(&source, &mut |error| {
+            (
+                prepare_graph_error_to_canopy(error),
+                prepare_graph_diagnostics(error),
+            )
+        })
+        .map_err(|error| match error {
+            CompileFailure::Prepare(failure) => failure,
+            CompileFailure::Other(error) => (error, Vec::new()),
+        })
+    }
+
     /// Compile a source while preserving its module identity and diagnostic
     /// metadata.
     pub(crate) fn compile_source(&self, source: &Source) -> Result<ScriptId> {
-        self.ensure_eval_idle()?;
-        let runtime_source = strict_named_source(source)?;
+        self.compile_source_with(source, &mut prepare_graph_error_to_canopy)
+            .map_err(|error| match error {
+                CompileFailure::Prepare(error) | CompileFailure::Other(error) => error,
+            })
+    }
+
+    /// Compile a source, mapping a graph preparation failure with `prepare`.
+    fn compile_source_with<E>(
+        &self,
+        source: &Source,
+        prepare: &mut dyn FnMut(&PrepareGraphError) -> E,
+    ) -> StdResult<ScriptId, CompileFailure<E>> {
+        self.ensure_eval_idle().map_err(CompileFailure::Other)?;
+        let runtime_source = strict_named_source(source).map_err(CompileFailure::Other)?;
         let prepared = if let Some(surface) = self.state.borrow().surface.clone() {
             Some(
                 surface
                     .prepare_graph_ready(runtime_source.clone())
-                    .map_err(|error| prepare_graph_error_to_canopy(&error))?,
+                    .map_err(|error| CompileFailure::Prepare(prepare(&error)))?,
             )
         } else {
             // Compiling before finalization proves the source is well formed;
             // the retained runtime recompiles it from the prepared
             // graph.
-            compile_chunk(runtime_source.as_str().expect("strict source is UTF-8"))?;
+            compile_chunk(runtime_source.as_str().expect("strict source is UTF-8"))
+                .map_err(CompileFailure::Other)?;
             None
         };
         let sid = self
             .state
             .borrow_mut()
             .scripts
-            .insert(runtime_source, prepared)?;
+            .insert(runtime_source, prepared)
+            .map_err(CompileFailure::Other)?;
         if self.is_finalized() {
-            self.load_script(sid)?;
+            self.load_script(sid).map_err(CompileFailure::Other)?;
         }
         Ok(sid)
     }
@@ -937,7 +931,7 @@ impl LuauHost {
         let runtime_source = source_with_text(source, startup_runtime_source(original));
         let runtime_source = strict_named_source(&runtime_source)?;
         let surface = self.state.borrow().surface.clone().ok_or_else(|| {
-            error::Error::InvalidOperation(
+            error::Error::Invalid(
                 "cannot compile startup scripts before finalize_api()".to_string(),
             )
         })?;
@@ -977,7 +971,7 @@ impl LuauHost {
             error::Error::script("cannot load a script while the script VM is executing")
         })?;
         let runtime = runtime_cell.as_mut().ok_or_else(|| {
-            error::Error::InvalidOperation("cannot load scripts before finalize_api()".to_string())
+            error::Error::Invalid("cannot load scripts before finalize_api()".to_string())
         })?;
         if runtime.invalidate_if_source_changed().is_some() {
             self.clear_script_root_caches();
@@ -1018,37 +1012,20 @@ impl LuauHost {
     }
 
     /// Execute a compiled script and return its value.
-    ///
-    /// A `timeout` bounds cooperative execution; `None` runs without one.
     pub fn execute(
         &self,
         canopy: &mut Canopy,
         node_id: impl Into<NodeId>,
         sid: ScriptId,
-        timeout: Option<Duration>,
     ) -> Result<ArgValue> {
         let node_id = node_id.into();
         let mut invocation = self.start_invocation(node_id, sid)?;
         if let Some(entry) = canopy.core.nodes.get(node_id) {
-            invocation.set_anchor_incarnation(entry.incarnation);
+            invocation.set_origin_incarnation(entry.incarnation);
         }
-        invocation.set_reporting_timeout(timeout);
-        let started = Instant::now();
         let mut gas = SCRIPT_GAS_LIMIT;
         let future = poll_fn(|cx| {
-            let remaining = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
-            if remaining == Some(Duration::ZERO) {
-                return Poll::Ready(self.abort_invocation(&mut invocation).and_then(|()| {
-                    Err(error::Error::ScriptTimeout {
-                        timeout_ms: timeout
-                            .unwrap_or_default()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                    })
-                }));
-            }
-            let step = self.poll_invocation(canopy, &mut invocation, cx, gas, remaining);
+            let step = self.poll_invocation(canopy, &mut invocation, cx, gas, None);
             gas = gas.saturating_sub(step.gas_spent);
             step.poll
         });
@@ -1084,9 +1061,7 @@ impl LuauHost {
             .try_borrow_mut()
             .map_err(|_| error::Error::script(busy.to_string()))?;
         RefMut::filter_map(runtime, Option::as_mut).map_err(|_| {
-            error::Error::InvalidOperation(
-                "cannot execute scripts before finalize_api()".to_string(),
-            )
+            error::Error::Invalid("cannot execute scripts before finalize_api()".to_string())
         })
     }
 
@@ -1130,7 +1105,7 @@ impl LuauHost {
         label: &str,
         timeout: Option<Duration>,
     ) -> Result<ArgValue> {
-        let _guard = ScriptAnchorGuard::push(scope, node_id)
+        let _guard = ScriptOriginGuard::push(scope, node_id)
             .map_err(|err| runtime_error_to_canopy(&err, label, timeout))?;
         let function = target.resolve(scope, label, timeout)?;
         call_in_scope(scope, function, label, timeout)

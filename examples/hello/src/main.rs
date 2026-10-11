@@ -1,11 +1,13 @@
 #![deny(unsafe_code)]
 //! Command-line entry point for the Hello example application.
 
-use std::{env, path::PathBuf, process};
+use std::{path::PathBuf, process::ExitCode};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use canopy::terminal::RunOptions;
-use canopy_mcp::{AppFactory, AppMetadata, Error as McpError, LaunchMode, ResetPolicy, launch};
+use canopy_mcp::{
+    AppFactory, AppMetadata, ConfigHome, Error as McpError, LaunchMode, ResetPolicy, launch,
+};
 use clap::{Parser, Subcommand};
 
 /// Minimal Canopy application.
@@ -25,11 +27,12 @@ struct Args {
     mcp: Option<PathBuf>,
 
     /// Do not read or create the user Luau configuration.
-    #[arg(long, global = true)]
+    #[arg(long)]
     no_config: bool,
 
-    /// Directory containing `init.luau` and `bindings.luau`.
-    #[arg(long, global = true)]
+    /// Directory holding `init.luau`, in place of `HELLO_CONFIG_HOME` or
+    /// `~/.hello`.
+    #[arg(long)]
     config_home: Option<PathBuf>,
 }
 
@@ -40,51 +43,38 @@ enum Command {
     Mcp,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let args = Args::parse();
-    if args.no_config && args.config_home.is_some() {
-        bail!("--no-config conflicts with --config-home");
-    }
 
-    // Headless and API modes must never read or create user state. `--api`
-    // opts out here; `.canopyctl.toml` passes `--no-config` to the headless
-    // command so automation runs stay hermetic.
-    let config_root = if args.no_config || args.api {
-        None
-    } else {
-        let root = args.config_home.map_or_else(default_config_root, Ok)?;
-        hello::ensure_user_config(&root)
-            .with_context(|| format!("initialize user config at {}", root.display()))?;
-        Some(root)
-    };
+    // The API is a property of the application itself, so it is rendered
+    // without user state.
+    if args.api {
+        print!("{}", hello::create_app(None)?.script_api()?);
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let mode = match args.command {
         Some(Command::Mcp) => LaunchMode::HeadlessMcp,
-        None if args.api => LaunchMode::Api,
         None => LaunchMode::Run {
             mcp_socket: args.mcp,
+            options: RunOptions::default(),
         },
     };
+
+    // Headless mode resolves no home, so automation runs stay hermetic. An
+    // interactive first run writes the defaults for the user to edit.
+    let home = ConfigHome::resolve("hello", args.config_home, args.no_config, &mode)?;
+    if let Some(home) = &home {
+        home.write_defaults(hello::DEFAULT_CONFIG)
+            .with_context(|| format!("write default config to {}", home.path().display()))?;
+    }
 
     let factory = AppFactory::new(
         AppMetadata {
             app: "hello".into(),
             reset: ResetPolicy::Isolated,
         },
-        move || hello::create_app(config_root.clone()).map_err(McpError::app),
+        move || hello::create_app(home.as_ref()).map_err(McpError::app),
     );
-    let code = launch(factory, mode, RunOptions::default())?;
-    if code != 0 {
-        process::exit(code);
-    }
-    Ok(())
-}
-
-/// Resolve the default persistent script root.
-fn default_config_root() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("HELLO_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = env::var_os("HOME").context("HOME is not set; use --config-home")?;
-    Ok(PathBuf::from(home).join(".hello"))
+    Ok(launch(factory, mode)?)
 }

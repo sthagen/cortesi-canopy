@@ -1,24 +1,31 @@
 #![deny(unsafe_code)]
 //! Todo application used as Canopy's end-to-end example and smoke-test target.
 
-use std::{collections::HashMap, fmt::Display, path::Path};
+use std::{collections::HashMap, fmt::Display};
 
 use anyhow::Result as AnyResult;
 use canopy::{
-    Canopy, CanopyBuilder, Context, ContextExt, InteractionToken, Loader, ModalBindings,
-    ModalOptions, NodeId, NodeName, Render, ViewContext, ViewContextExt, Widget,
+    Canopy, CanopyBuilder, Context, ContextExt, NodeId, NodeName, Register, Setup, ViewContext,
+    ViewContextExt, Widget,
     commands::CommandStatus,
     derive_commands,
     error::{Error, Result},
     geom::{Rect, Size},
+    input::{ModalBindings, ModalOptions, ModalToken},
     layout::{Constraint, Direction, Layout, LayoutOverride, MeasureConstraints, Measurement},
-    style::canopy as palette,
+    render::Render,
+    script::Fixture,
+    style::{StyleRules, themes::Palette},
+    tree::ChildSlot,
 };
-use canopy_widgets::{Center, Frame, Input, List, Root, Selectable, ValueExposure};
+use canopy_mcp::{ConfigHome, UserConfig};
+use canopy_widgets::{
+    Container, Frame, Input, KeyHint, List, Root, Selectable, StatusBar, Text, ValueExposure,
+};
 
 // Typed keys for keyed children
 canopy::slot!(MainSlot: MainContent);
-canopy::slot!(ModalSlot: Center);
+canopy::slot!(ModalSlot: Container);
 
 pub mod store;
 
@@ -124,21 +131,6 @@ impl Widget for TodoEntry {
     }
 }
 
-/// Status bar widget for the todo demo.
-pub(crate) struct StatusBar;
-
-impl Widget for StatusBar {
-    fn render(&mut self, r: &mut Render, ctx: &dyn canopy::ViewContext) -> Result<()> {
-        r.push_layer("statusbar");
-        r.text(
-            "statusbar/text",
-            ctx.view().outer_rect_local().line(0)?,
-            "todo",
-        )?;
-        Ok(())
-    }
-}
-
 /// Container for main content (list frame + status bar).
 struct MainContent;
 
@@ -149,7 +141,7 @@ pub(crate) struct Todo {
     /// Database owned by this application.
     store: store::Store,
     /// Owned interaction scope for the add-item modal.
-    adder: Option<InteractionToken>,
+    adder: Option<ModalToken>,
 }
 
 #[derive_commands]
@@ -161,27 +153,23 @@ impl Todo {
 
     /// Build the Todo widget subtree once.
     fn ensure_tree(&self, c: &mut dyn Context) -> Result<()> {
-        if c.has_slot::<MainSlot>()? {
+        if c.child_slot_of(c.node_id(), MainSlot::KEY).is_some() {
             return Ok(());
         }
 
         let scope = c.node_id();
-        c.compose(scope, |tree| {
-            tree.keyed::<MainSlot>(MainContent, |main| {
-                main.layout_override(LayoutOverride::full(Layout::fill()))?;
-                main.child(Frame::new(), |frame| {
-                    frame.child(List::<TodoEntry, i64>::new(), |list| {
-                        list.semantic_key(scope, "todo.list")
-                    })?;
-                    Ok(())
-                })?;
-                main.child(StatusBar, |status| {
-                    status.layout_override(LayoutOverride::full(
-                        Layout::row().flex_horizontal(1).fixed_height(1),
-                    ))
-                })?;
-                Ok(())
-            })?;
+        c.edit_structure(&mut |c| {
+            let main = c.add_slot::<MainSlot>(scope, MainContent)?;
+            c.set_layout_override(main.into(), LayoutOverride::from(Layout::fill()))?;
+            let frame = c.add_child(main, Frame::new())?;
+            let list = c.add_child(frame, List::<TodoEntry, i64>::new())?;
+            c.set_identity(list.into(), scope, "todo.list")?;
+            c.add_child(
+                main,
+                StatusBar::new()
+                    .with_left(Text::new("todo"))
+                    .with_right(KeyHint::for_command(Root::call_toggle_help(), "help")),
+            )?;
             Ok(())
         })?;
         let items = self.store.todos().map_err(store_error)?;
@@ -193,33 +181,30 @@ impl Todo {
 
     /// Build the add-item modal once.
     fn ensure_modal(&self, c: &mut dyn Context) -> Result<()> {
-        if c.has_slot::<ModalSlot>()? {
+        if c.child_slot_of(c.node_id(), ModalSlot::KEY).is_some() {
             return Ok(());
         }
 
         let scope = c.node_id();
-        c.compose(scope, |tree| {
-            tree.keyed::<ModalSlot>(Center::new(), |modal| {
-                modal.child(Frame::new(), |frame| {
-                    frame.layout_override(LayoutOverride {
-                        min_width: Some(Some(30)),
-                        max_width: Some(Some(50)),
-                        ..LayoutOverride::new().fixed_height(3)
-                    })?;
-                    frame.child(
-                        Input::new("")
-                            .with_label("New todo item")
-                            .with_value_exposure(ValueExposure::Public),
-                        |input| {
-                            input.layout_override(LayoutOverride::full(Layout::fill()))?;
-                            input.semantic_key(scope, "todo.input")
-                        },
-                    )?;
-                    Ok(())
-                })?;
-                Ok(())
-            })?;
-            Ok(())
+        c.edit_structure(&mut |c| {
+            let modal = c.add_slot::<ModalSlot>(scope, Container::center())?;
+            let frame = c.add_child(modal, Frame::new())?;
+            c.set_layout_override(
+                frame.into(),
+                LayoutOverride {
+                    min_width: Some(Some(30)),
+                    max_width: Some(Some(50)),
+                    ..LayoutOverride::new().fixed_height(3)
+                },
+            )?;
+            let input = c.add_child(
+                frame,
+                Input::new("")
+                    .with_label("New todo item")
+                    .with_value_exposure(ValueExposure::Public),
+            )?;
+            c.set_layout_override(input.into(), LayoutOverride::from(Layout::fill()))?;
+            c.set_identity(input.into(), scope, "todo.input")
         })
     }
 
@@ -325,8 +310,8 @@ impl Todo {
         })?;
         let input = self.input_id(c)?;
         if !self.adder.is_some_and(|token| c.modal_is_open(token)) {
-            let modal = c.get_slot::<ModalSlot>()?.expect("modal initialized");
-            let main = c.get_slot::<MainSlot>()?.expect("main initialized");
+            let modal = c.get_slot::<ModalSlot>(c.node_id())?;
+            let main = c.get_slot::<MainSlot>(c.node_id())?;
             self.adder = Some(c.open_modal(ModalOptions {
                 owner: c.node_id(),
                 modal: modal.into(),
@@ -345,7 +330,7 @@ impl Todo {
         let Ok(list) = self.list_id(ctx) else {
             return Ok(CommandStatus::Disabled("No item selected".into()));
         };
-        ctx.with_widget(ctx.typed_id::<List<TodoEntry, i64>>(list)?, |list| {
+        ctx.with_widget(list, |list: &List<TodoEntry, i64>| {
             Ok(if list.selected_item().is_some() {
                 CommandStatus::Enabled
             } else {
@@ -420,71 +405,22 @@ impl Widget for Todo {
     }
 }
 
-impl Loader for Todo {
-    fn load(c: &mut Canopy) -> Result<()> {
-        c.add_commands::<Self>()?;
-        c.add_commands::<List<TodoEntry, i64>>()?;
-        c.add_commands::<Input>()?;
+impl Register for Todo {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        setup.add_commands::<List<TodoEntry, i64>>()?;
+        Input::register(setup)?;
         Ok(())
     }
 }
 
-/// Default Luau bindings for the todo app.
-pub(crate) const DEFAULT_BINDINGS: &str = r#"
-canopy.bind("?", {
-    path = "/root/**/",
-    phase = "before_widget",
-    tier = "global",
-    description = "Show key bindings",
-}, command.root.toggle_help())
-canopy.keymap({
-    { key = "q", description = "Quit", action = command.root.quit() },
-    { key = "d", description = "Delete item", action = command.todo.delete_item() },
-    { key = "a", description = "Add item", action = command.todo.enter_item() },
-    { key = "g", description = "First item", action = command.todo.select_first() },
-    { key = { "j", "Down" }, description = "Next item", action = command.todo.select_by(1) },
-    { key = { "k", "Up" }, description = "Previous item", action = command.todo.select_by(-1) },
-    { key = { "Space", "PageDown" }, description = "Page down", action = command.todo.page(1) },
-    { key = "PageUp", description = "Page up", action = command.todo.page(-1) },
-    {
-        mouse = "ScrollUp",
-        description = "Previous item",
-        action = function()
-            todo.select_by(-1)
-        end,
-    },
-    {
-        mouse = "ScrollDown",
-        description = "Next item",
-        action = function()
-            todo.select_by(1)
-        end,
-    },
-})
-
-canopy.keymap({
-    path = "input",
-    phase = "before_widget",
-    { key = "Left", description = "Cursor left", action = command.input.left() },
-    { key = "Right", description = "Cursor right", action = command.input.right() },
-    { key = "Backspace", description = "Delete char", action = command.input.backspace() },
-    { key = "Enter", description = "Confirm new item", action = command.todo.accept_add() },
-    { key = "Escape", description = "Cancel add", action = command.todo.cancel_add() },
-})
-"#;
+/// Default configuration: the startup script that runs when the user has no
+/// `init.luau`.
+pub const DEFAULT_CONFIG: &str = include_str!("default_config.luau");
 
 /// Install the todo application's style rules.
-pub(crate) fn style(cnpy: &mut Canopy) {
-    use canopy::style::StyleBuilder;
-
-    cnpy.style_mut()
-        .rules()
-        .style(
-            "statusbar/text",
-            StyleBuilder::new().fg(palette::SUBTEXT).bg(palette::PANEL),
-        )
-        .fg("list/selected", palette::ACCENT)
-        .apply();
+pub(crate) fn style(palette: &Palette, rules: StyleRules<'_>) {
+    rules.fg("list/selected", palette.accent).apply();
 }
 
 /// Convert persistence failures into application errors.
@@ -506,8 +442,8 @@ fn with_todo<R>(
 }
 
 /// Register the Todo automation fixtures.
-fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
-    cnpy.register_fixture(canopy::Fixture::new(
+fn register_fixtures(setup: &mut Setup) -> Result<()> {
+    setup.register_fixture(Fixture::new(
         "empty",
         "App with no todo items and no modal open",
         |cnpy| {
@@ -517,7 +453,7 @@ fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
             })
         },
     ))?;
-    cnpy.register_fixture(canopy::Fixture::new(
+    setup.register_fixture(Fixture::new(
         "with_items",
         "App with a pre-populated todo list",
         |cnpy| {
@@ -530,7 +466,7 @@ fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
             })
         },
     ))?;
-    cnpy.register_fixture(canopy::Fixture::new(
+    setup.register_fixture(Fixture::new(
         "modal_open",
         "App with the add-item modal open and ready for typing",
         |cnpy| {
@@ -546,27 +482,22 @@ fn register_fixtures(cnpy: &mut Canopy) -> Result<()> {
     Ok(())
 }
 
-/// Queue API registration and binding sources without constructing a database.
-fn app_builder(config: Option<&Path>) -> CanopyBuilder {
-    let builder = CanopyBuilder::new()
-        .configure(|cnpy| {
-            Root::load(cnpy)?;
-            <Todo as Loader>::load(cnpy)?;
-            style(cnpy);
-            register_fixtures(cnpy)
+/// Queue API registration and configuration without constructing a database.
+fn app_builder(home: Option<&ConfigHome>) -> CanopyBuilder {
+    CanopyBuilder::new()
+        .configure(|setup| {
+            Root::register(setup)?;
+            Todo::register(setup)?;
+            setup.widget_styles(style);
+            register_fixtures(setup)
         })
-        .bindings("todo-defaults", DEFAULT_BINDINGS);
-    if let Some(config) = config {
-        builder.config(config.to_owned())
-    } else {
-        builder
-    }
+        .user_config(home, DEFAULT_CONFIG)
 }
 
-/// Create a todo application with an explicit database and optional user
-/// config.
-pub fn create_app(store: store::Store, config: Option<&Path>) -> AnyResult<Canopy> {
-    Ok(app_builder(config)
+/// Create a todo application with an explicit database. A `home` holding
+/// `init.luau` replaces [`DEFAULT_CONFIG`].
+pub fn create_app(store: store::Store, home: Option<&ConfigHome>) -> AnyResult<Canopy> {
+    Ok(app_builder(home)
         .assemble(move |cnpy| {
             let todo = Todo::new(store);
             Root::new().install(cnpy, todo)?;
@@ -622,7 +553,7 @@ mod tests {
         }) else {
             panic!("todo entry has a fixed measurement");
         };
-        let mut canopy = Canopy::new();
+        let mut canopy = CanopyBuilder::new().build()?;
         canopy.replace_root(entry)?;
         let mut harness = Harness::from_canopy(canopy, size)?;
         harness.render()?;
@@ -681,11 +612,21 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_names_the_app_and_the_help_key() -> AnyResult<()> {
+        let store = store::Store::open(":memory:")?;
+        let mut harness = Harness::from_canopy(create_app(store, None)?, Size::new(80, 24))?;
+        harness.render()?;
+        assert!(harness.tbuf().contains_text("todo"));
+        assert!(harness.tbuf().contains_text("ctrl+g: help"));
+        Ok(())
+    }
+
+    #[test]
     fn repeated_modal_opening_keeps_one_dimming_effect() -> AnyResult<()> {
         let store = store::Store::open(":memory:")?;
         let mut harness = Harness::from_canopy(create_app(store, None)?, Size::new(80, 24))?;
         with_todo(&mut harness.canopy, |_, ctx| {
-            let main = ctx.get_slot::<MainSlot>()?.expect("main initialized");
+            let main = ctx.get_slot::<MainSlot>(ctx.node_id())?;
             ctx.push_effect(main.into(), effects::brightness(0.8))?;
             Ok(())
         })?;

@@ -1,24 +1,25 @@
-//! Help for a transient input mode.
+//! Help for a transient mode.
 //!
-//! While a transient mode waits for its key, a small framed panel in the
-//! bottom right corner lists the keys that mode binds. The panel takes no
-//! focus and no keys, so the mode still receives the next key.
+//! While a transient mode waits for its key, a small dialog centred over the
+//! view lists the keys that mode binds, the way every other modal panel sits,
+//! and `Root` dims the application behind it as it does behind a modal. The
+//! panel takes no focus and no keys, so the mode still receives the next key.
 
 use canopy::{
-    ChildSlot, Context, ContextExt, NodeId, NodeName, Render, ViewContext, Widget,
+    Context, ContextExt, NodeId, NodeName, ViewContext, ViewContextExt, Widget,
     error::{Error, Result},
     geom::Size,
-    layout::{Align, Constraint, Direction, Edges, Layout, MeasureConstraints, Measurement},
+    layout::{Constraint, Layout, MeasureConstraints, Measurement},
+    render::Render,
 };
 
 use super::binding_list::{BindingRow, display_lines, key_rows_of, natural_width, render_line};
-use crate::{center::Center, frame::Frame};
-
-canopy::slot!(ModeFrameSlot: Frame);
-canopy::slot!(ModeBindingsSlot: ModeBindings);
+use crate::{dialog::Dialog, frame::Frame};
 
 /// Widest panel content in cells, including the side margins.
 const MAX_WIDTH: u32 = 64;
+/// Widest frame, the content and its two borders.
+const MAX_FRAME_WIDTH: u32 = MAX_WIDTH + 2;
 
 /// Blank columns on each side of the rows.
 const MARGIN: u32 = 1;
@@ -27,7 +28,7 @@ const MARGIN: u32 = 1;
 ///
 /// A transient mode takes the next key, so the panel lists keys alone.
 pub struct ModeBindings {
-    /// Rows for the keys in the mode's own scope.
+    /// Rows for the keys in the mode's own tier.
     bindings: Vec<BindingRow>,
 }
 
@@ -61,9 +62,8 @@ impl Widget for ModeBindings {
     }
 
     fn render(&mut self, render: &mut Render, context: &dyn ViewContext) -> Result<()> {
-        render.push_layer("help");
         let rect = context.view().outer_rect_local();
-        render.fill("help/panel", rect, ' ')?;
+        render.fill("panel", rect, ' ')?;
         let width = rect.w.saturating_sub(2 * MARGIN);
         let lines = display_lines(&self.bindings, width);
         for (y, line) in (0..rect.h).zip(&lines) {
@@ -77,67 +77,87 @@ impl Widget for ModeBindings {
     }
 }
 
-/// Panel listing the keys of a transient mode while it waits.
+/// Overlay that shows a transient mode's bindings in a dialog centred over
+/// the view while it waits for its key.
+///
+/// The overlay pushes the `help` style layer, and the dialog inside it the
+/// `dialog` layer, so the panel reads as the contextual help modal does.
 pub struct ModeHelp;
 
 impl ModeHelp {
     /// Build the mode help subtree and return its root.
     pub(crate) fn install(context: &mut dyn Context) -> Result<NodeId> {
-        let bindings = context.create_detached(ModeBindings::new())?;
-        let frame = context.create_detached(Frame::new())?;
-        context.attach_slot(frame.into(), ModeBindingsSlot::KEY, bindings.into())?;
-        context.with_layout_of(frame.into(), &mut |layout| {
-            *layout = Layout::column().padding(Edges::all(1));
-        })?;
-
-        let overlay = context.create_detached(Center::new())?;
-        context.attach_slot(overlay.into(), ModeFrameSlot::KEY, frame.into())?;
-        context.with_layout_of(overlay.into(), &mut |layout| {
-            *layout = Layout::fill()
-                .direction(Direction::Stack)
-                .align_horizontal(Align::End)
-                .align_vertical(Align::End)
-                .padding(Edges::all(1));
-        })?;
+        let overlay = context.create_detached(Self)?;
+        Dialog::new().with_max_width(MAX_FRAME_WIDTH).add(
+            context,
+            overlay.into(),
+            ModeBindings::new(),
+        )?;
         Ok(overlay.into())
     }
 
     /// Show the bindings of the transient mode that waits for a key, or hide
-    /// the panel when no such mode is active.
+    /// the panel when no such mode is active, and return whether it shows.
     ///
     /// Contextual help replaces the panel while it is open.
-    pub(crate) fn sync(context: &mut dyn Context, overlay: NodeId) -> Result<()> {
+    pub(crate) fn sync(context: &mut dyn Context, overlay: NodeId) -> Result<Shown> {
         let snapshot = context.available_bindings(context.focused_node())?;
-        let mode = snapshot
-            .transient_mode
-            .filter(|_| snapshot.exclusive_group.is_none());
-        let Some(mode) = mode else {
-            context.set_hidden_of(overlay, true)?;
-            return Ok(());
+        let Some(mode) = snapshot.transient_mode else {
+            context.set_hidden(overlay, true)?;
+            return Ok(Shown::Hidden);
         };
         let bindings = snapshot
             .bindings
             .into_iter()
-            .filter(|binding| binding.scope.mode() == Some(mode.as_str()))
+            .filter(|binding| binding.tier.mode() == Some(mode.as_str()))
             .collect::<Vec<_>>();
         let bindings = key_rows_of(&bindings);
 
-        let frame = context
-            .get_slot_of::<ModeFrameSlot>(overlay)?
-            .ok_or_else(|| Error::NotFound("mode help frame".into()))?;
+        let dialog = context
+            .unique_descendant::<Dialog>(overlay)?
+            .ok_or_else(|| Error::NotFound("mode help dialog".into()))?;
         let list = context
-            .get_slot_of::<ModeBindingsSlot>(NodeId::from(frame))?
-            .ok_or_else(|| Error::NotFound("mode bindings".into()))?;
+            .unique_descendant::<ModeBindings>(overlay)?
+            .ok_or_else(|| Error::NotFound("mode help bindings".into()))?;
+        let frame = Dialog::frame(context, dialog.into())?;
         context.with_widget_mut(frame, |frame: &mut Frame, _context| {
             frame.set_title(mode);
             Ok(())
         })?;
-        context.with_widget_mut(list, |list: &mut ModeBindings, context| {
+        context.with_widget_mut(list, |list: &mut ModeBindings, _context| {
             list.bindings = bindings;
-            context.invalidate_layout();
             Ok(())
         })?;
-        context.set_hidden_of(overlay, false)?;
+        Ok(if context.set_hidden(overlay, false)?.changed() {
+            Shown::Opened
+        } else {
+            Shown::Kept
+        })
+    }
+}
+
+/// Whether the mode help panel shows after a sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// The panel was hidden and now shows.
+    Opened,
+    /// The panel showed and still does.
+    Kept,
+    /// The panel is hidden.
+    Hidden,
+}
+
+impl Widget for ModeHelp {
+    fn layout(&self) -> Layout {
+        Layout::fill()
+    }
+
+    fn render(&mut self, render: &mut Render, _context: &dyn ViewContext) -> Result<()> {
+        render.push_layer("help");
         Ok(())
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("mode_help")
     }
 }

@@ -6,11 +6,11 @@ use std::{
 use ruau::{declaration, module, vm::NativeModule};
 
 use crate::{
-    FixtureInfo,
-    commands::{
-        CommandDispatchKind, CommandParamKind, CommandReturnSpec, CommandSet, CommandSpec,
-        DeclRegistry,
-    },
+    commands::{CommandParamKind, CommandReturnSpec, CommandSet, CommandSpec, DeclRegistry},
+    core::inputmap::IntentCatalog,
+    input::RouteTraceKind,
+    runtime::NoticeSource,
+    script::FixtureInfo,
 };
 
 /// Header comment shared by every rendered canopy API surface.
@@ -50,10 +50,7 @@ pub(super) fn owner_command_specs(
 ) -> BTreeMap<String, Vec<&'static CommandSpec>> {
     let mut owners: BTreeMap<String, Vec<&'static CommandSpec>> = BTreeMap::new();
     for (_, spec) in commands.iter() {
-        let CommandDispatchKind::Node { owner } = spec.dispatch else {
-            continue;
-        };
-        owners.entry(owner.to_string()).or_default().push(spec);
+        owners.entry(spec.owner.to_string()).or_default().push(spec);
     }
     for owner in default_binding_owners {
         owners.entry(owner.clone()).or_default();
@@ -92,7 +89,13 @@ fn command_params_sig(spec: &CommandSpec) -> declaration::FunctionSignature {
 }
 
 /// Register framework-owned record and alias declarations.
-pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
+///
+/// Returns the binding action union, which narrows to `IntentName`
+/// whenever the application registered at least one intent.
+pub(super) fn register_framework_declarations(
+    builder: &mut module::Builder,
+    actions: &IntentCatalog,
+) -> declaration::Type {
     builder.alias(declaration::Alias::new(
         "Point",
         declaration::Type::table([
@@ -119,29 +122,16 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
         ]),
     ));
     builder.alias(declaration::Alias::new(
-        "SemanticIdentity",
+        "NodeIdentity",
         declaration::Type::table([
             declaration::Field::new("scope", declaration::Type::named("NodeId")),
             declaration::Field::new("key", declaration::Type::String),
         ]),
     ));
     builder.alias(
-        declaration::Alias::new(
-            "NodeInfo",
-            declaration::Type::table(node_info_fields(
-                declaration::Type::named("NodeId").array(),
-                "Direct child nodes in tree order.",
-            )),
-        )
-        .doc("Summary information for a node in the widget tree."),
+        declaration::Alias::new("NodeInfo", declaration::Type::table(node_info_fields()))
+            .doc("Summary information for a node in the widget tree."),
     );
-    builder.alias(declaration::Alias::new(
-        "TreeNode",
-        declaration::Type::table(node_info_fields(
-            declaration::Type::named("TreeNode").array(),
-            "Recursive child tree entries in tree order.",
-        )),
-    ));
     builder.alias(declaration::Alias::new(
         "CommandTarget",
         declaration::Type::table([
@@ -168,23 +158,26 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
         declaration::Type::table([
             declaration::Field::new("description", declaration::Type::String)
                 .doc("Required user-facing binding description."),
+            declaration::Field::new("show_in_help", declaration::Type::Boolean.optional()).doc(
+                "Show this binding in shortcut help. Defaults to true; routing is unaffected.",
+            ),
             declaration::Field::new("mode", declaration::Type::String.optional())
-                .doc("Optional input mode. Nil or empty uses the default mode."),
+                .doc("Optional mode. Nil or empty uses the default mode."),
             declaration::Field::new("path", declaration::Type::String.optional())
                 .doc("Optional path filter such as `editor/*`."),
             declaration::Field::new(
                 "phase",
                 declaration::Type::literals(["before_widget", "after_widget"]).optional(),
             )
-            .doc("Dispatch phase relative to the widget. The default is after_widget."),
+            .doc(
+                "Dispatch phase relative to the widget. The default is after_widget. A widget \
+                 action always runs before_widget.",
+            ),
             declaration::Field::new("tier", declaration::Type::literals(["global"]).optional())
                 .doc("Use the global tier. A global binding cannot name a mode."),
         ]),
     ));
-    let action_type = declaration::Type::union([
-        declaration::Type::named("CommandCall"),
-        declaration::Type::func(declaration::FunctionSignature::new()),
-    ]);
+    let action_type = register_action_type(builder, actions);
     builder.alias(
         declaration::Alias::new(
             "KeymapEntry",
@@ -209,8 +202,13 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
                 .doc("One mouse spec, or an array of mouse specs. Each spec makes one binding."),
                 declaration::Field::new("description", declaration::Type::String)
                     .doc("User-facing description of every binding the entry makes."),
-                declaration::Field::new("action", action_type)
-                    .doc("A CommandCall from the `command` table, or a function."),
+                declaration::Field::new("show_in_help", declaration::Type::Boolean.optional())
+                    .doc("Override the keymap's shortcut-help visibility for this entry."),
+                declaration::Field::new("action", action_type.clone()).doc(
+                    "A CommandCall, a MenuAction from `canopy.menu`, a function, or a \
+                         registered intent name. An intent entry takes keys only and runs \
+                         before_widget.",
+                ),
             ]),
         )
         .doc("One keymap entry. An entry needs `key`, `mouse`, or both."),
@@ -221,7 +219,7 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
             declaration::Type::table_with_indexer(
                 [
                     declaration::Field::new("mode", declaration::Type::String.optional())
-                        .doc("Optional input mode for every entry. Nil or empty uses the default mode."),
+                        .doc("Optional mode for every entry. Nil or empty uses the default mode."),
                     declaration::Field::new("path", declaration::Type::String.optional())
                         .doc("Optional path filter for every entry, such as `editor/*`."),
                     declaration::Field::new(
@@ -231,6 +229,8 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
                     .doc("Dispatch phase for every entry, relative to the widget. The default is after_widget."),
                     declaration::Field::new("tier", declaration::Type::literals(["global"]).optional())
                         .doc("Use the global tier. A global keymap cannot name a mode."),
+                    declaration::Field::new("show_in_help", declaration::Type::Boolean.optional())
+                        .doc("Show every entry in shortcut help unless an entry overrides it. Defaults to true."),
                 ],
                 declaration::TableIndexer::new(
                     declaration::Type::Number,
@@ -250,12 +250,52 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
         ]),
     ));
     builder.alias(declaration::Alias::new(
-        "PushModeOptions",
-        declaration::Type::table([declaration::Field::new(
-            "transient",
-            declaration::Type::Boolean.optional(),
-        )
-        .doc("Take only the next key, then pop the mode.")]),
+        "CursorShape",
+        declaration::Type::literals(["block", "underline"]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "CursorMotion",
+        declaration::Type::literals(["steady", "blink", "pulse"]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "CursorLook",
+        declaration::Type::table([
+            declaration::Field::new("shape", declaration::Type::named("CursorShape").optional()),
+            declaration::Field::new("color", declaration::Type::String.optional())
+                .doc("Cursor color as #rrggbb."),
+            declaration::Field::new(
+                "motion",
+                declaration::Type::named("CursorMotion").optional(),
+            ),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "CursorInfo",
+        declaration::Type::table([
+            declaration::Field::new("node", declaration::Type::named("NodeId"))
+                .doc("Node that declared the cursor."),
+            declaration::Field::new("x", declaration::Type::Number),
+            declaration::Field::new("y", declaration::Type::Number),
+            declaration::Field::new("role", declaration::Type::String)
+                .doc("Cursor role, such as cursor/vi/insert."),
+            declaration::Field::new("shape", declaration::Type::named("CursorShape")),
+            declaration::Field::new("color", declaration::Type::String)
+                .doc("Painted cursor color as #rrggbb."),
+            declaration::Field::new("motion", declaration::Type::named("CursorMotion")),
+            declaration::Field::new("primary", declaration::Type::Boolean)
+                .doc("True for the cursor of the deepest focused node that declared one."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "MotionOptions",
+        declaration::Type::table([
+            declaration::Field::new("enabled", declaration::Type::Boolean.optional())
+                .doc("Whether cells move. False keeps every cell at rest."),
+            declaration::Field::new("max_fps", declaration::Type::Number.optional())
+                .doc("Most samples a second of continuous motion."),
+            declaration::Field::new("idle_ms", declaration::Type::Number.optional())
+                .doc("Milliseconds without input after which repeating motion rests."),
+        ]),
     ));
     builder.alias(declaration::Alias::new(
         "MouseSpec",
@@ -273,6 +313,69 @@ pub(super) fn register_framework_declarations(builder: &mut module::Builder) {
     register_binding_info(builder);
     register_command_info(builder);
     register_observation_info(builder);
+    action_type
+}
+
+/// Register `IntentName` when the catalog holds actions, and return the
+/// binding action union.
+///
+/// An empty catalog leaves the union at commands and callbacks, because no
+/// string action can be registered in that application.
+fn register_action_type(
+    builder: &mut module::Builder,
+    actions: &IntentCatalog,
+) -> declaration::Type {
+    let mut union = vec![
+        declaration::Type::named("CommandCall"),
+        declaration::Type::named("MenuAction"),
+        declaration::Type::func(declaration::FunctionSignature::new()),
+    ];
+    if actions.is_empty() {
+        return declaration::Type::union(union);
+    }
+    let mut doc = String::from(
+        "Registered intent name. The route offers the action to the focused \
+         widget; a widget that accepts it consumes the key.",
+    );
+    for (name, description) in actions.iter() {
+        doc.push_str(&format!("\n`{name}`: {description}"));
+    }
+    let literals = actions
+        .iter()
+        .map(|(name, _)| name.as_str().to_string())
+        .collect::<Vec<_>>();
+    builder.alias(
+        declaration::Alias::new("IntentName", declaration::Type::literals(literals)).doc(doc),
+    );
+    union.push(declaration::Type::named("IntentName"));
+    declaration::Type::union(union)
+}
+
+/// The binding tier field shared by binding records.
+fn tier_field() -> declaration::Field {
+    declaration::Field::new(
+        "tier",
+        declaration::Type::literals(["framework", "global", "mode", "default"]),
+    )
+    .doc("Resolution tier, in resolution order: framework, global, mode, then default.")
+}
+
+/// The binding phase field shared by binding records.
+fn phase_field() -> declaration::Field {
+    declaration::Field::new(
+        "phase",
+        declaration::Type::literals(["before_widget", "after_widget"]),
+    )
+    .doc("Phase relative to widget input handling. An intent is before_widget.")
+}
+
+/// The binding action-kind field shared by binding records.
+fn action_field() -> declaration::Field {
+    declaration::Field::new(
+        "action",
+        declaration::Type::literals(["script", "command", "intent", "menu"]),
+    )
+    .doc("Kind of action the binding runs. A menu opens a transient mode.")
 }
 
 /// Register the active-binding discovery record.
@@ -285,21 +388,14 @@ fn register_binding_info(builder: &mut module::Builder) {
             declaration::Field::new("input", declaration::Type::String)
                 .doc("Normalized key or mouse spec string."),
             declaration::Field::new("input_type", declaration::Type::literals(["key", "mouse"])),
-            declaration::Field::new("owner", declaration::Type::String)
-                .doc("Application or framework group owner."),
-            declaration::Field::new(
-                "scope",
-                declaration::Type::literals(["global", "mode", "default", "exclusive"]),
-            ),
+            tier_field(),
+            declaration::Field::new("group", declaration::Type::String.optional())
+                .doc("Framework group, when the tier is framework."),
             declaration::Field::new("mode", declaration::Type::String.optional())
-                .doc("Named input mode, when the scope is mode."),
+                .doc("Named mode, when the tier is mode."),
             declaration::Field::new("path", declaration::Type::String)
                 .doc("Path filter string used when matching the focused path."),
-            declaration::Field::new(
-                "phase",
-                declaration::Type::literals(["before_widget", "after_widget"]),
-            )
-            .doc("Phase relative to widget input handling."),
+            phase_field(),
             declaration::Field::new("command", declaration::Type::String.optional()),
             declaration::Field::new("arguments", declaration::Type::Any.optional()),
             declaration::Field::new(
@@ -308,9 +404,15 @@ fn register_binding_info(builder: &mut module::Builder) {
             ),
             declaration::Field::new("description", declaration::Type::String)
                 .doc("Required user-facing description."),
+            declaration::Field::new("show_in_help", declaration::Type::Boolean)
+                .doc("Whether shortcut help displays this binding. Routing is unaffected."),
             declaration::Field::new("source", declaration::Type::String.optional())
                 .doc("Diagnostic source for application bindings."),
-            declaration::Field::new("target", declaration::Type::literals(["script", "command"])),
+            action_field(),
+            declaration::Field::new("intent", declaration::Type::String.optional())
+                .doc("Intent name, present when the action is an intent."),
+            declaration::Field::new("menu", declaration::Type::String.optional())
+                .doc("Mode the binding opens, present when the action is a menu."),
         ]),
     ));
 }
@@ -326,7 +428,7 @@ fn register_command_info(builder: &mut module::Builder) {
                 .doc("Whether the parameter is injected or user-supplied."),
             declaration::Field::new(
                 "requirement",
-                declaration::Type::literals(["event", "mouse", "list_row"]).optional(),
+                declaration::Type::literals(["event", "mouse"]).optional(),
             )
             .doc("Injected context kind. Optional parameters do not require its presence."),
             declaration::Field::new("rust_type", declaration::Type::String)
@@ -341,8 +443,7 @@ fn register_command_info(builder: &mut module::Builder) {
     let mut fields = vec![
         declaration::Field::new("name", declaration::Type::String)
             .doc("Command name relative to its owner table."),
-        declaration::Field::new("owner", declaration::Type::String)
-            .doc("Widget owner name, or the empty string for free commands."),
+        declaration::Field::new("owner", declaration::Type::String).doc("Widget owner name."),
         declaration::Field::new("doc", declaration::Type::String.optional()),
         declaration::Field::new(
             "params",
@@ -381,13 +482,68 @@ fn register_observation_info(builder: &mut module::Builder) {
         ]),
     ));
     builder.alias(declaration::Alias::new(
+        "CaptureStyle",
+        declaration::Type::table([
+            declaration::Field::new("fg", declaration::Type::String)
+                .doc("Foreground color as #rrggbb."),
+            declaration::Field::new("bg", declaration::Type::String)
+                .doc("Background color as #rrggbb."),
+            declaration::Field::new("attrs", declaration::Type::String.array().optional())
+                .doc("Text attributes such as bold or underline, absent when none is on."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "CaptureRun",
+        declaration::Type::table([
+            declaration::Field::new("text", declaration::Type::String).doc("Text in one style."),
+            declaration::Field::new("style", declaration::Type::Number)
+                .doc("Index of the style in the styles of the capture, from 0."),
+            declaration::Field::new("cells", declaration::Type::Number)
+                .doc("Cells that the run covers. A wide grapheme covers two."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "ScreenCapture",
+        declaration::Type::table([
+            declaration::Field::new("width", declaration::Type::Number).doc("Width in cells."),
+            declaration::Field::new("height", declaration::Type::Number).doc("Height in cells."),
+            declaration::Field::new("styles", declaration::Type::named("CaptureStyle").array())
+                .doc("The distinct styles of the frame."),
+            declaration::Field::new(
+                "rows",
+                declaration::Type::named("CaptureRun").array().array(),
+            )
+            .doc("The runs of each row, top to bottom. The runs of a row fill its width."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
         "RouteTraceEntry",
         declaration::Type::table([
-            declaration::Field::new("phase", declaration::Type::String),
+            declaration::Field::new(
+                "kind",
+                declaration::Type::literals(RouteTraceKind::ALL.map(RouteTraceKind::label)),
+            )
+            .doc("What this entry records."),
             declaration::Field::new("node", declaration::Type::named("NodeId").optional()),
             declaration::Field::new("path", declaration::Type::String)
                 .doc("Focused path visible to this step."),
             declaration::Field::new("detail", declaration::Type::String),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "Notice",
+        declaration::Type::table([
+            declaration::Field::new("message", declaration::Type::String)
+                .doc("Human-readable failure message."),
+            declaration::Field::new("kind", declaration::Type::String)
+                .doc("Stable failure category, as script error payloads report it."),
+            declaration::Field::new(
+                "source",
+                declaration::Type::literals(NoticeSource::ALL.map(NoticeSource::label)),
+            )
+            .doc("Where the failure arose: a binding, a widget handler, or a poll."),
+            declaration::Field::new("node", declaration::Type::named("NodeId").optional())
+                .doc("Node the binding, handler, or poll ran on, when known."),
         ]),
     ));
     builder.alias(declaration::Alias::new(
@@ -414,22 +570,20 @@ fn register_observation_info(builder: &mut module::Builder) {
                 .optional(),
             ),
             declaration::Field::new("description", declaration::Type::String),
-            declaration::Field::new("owner", declaration::Type::String)
-                .doc("Application or framework group owner."),
-            declaration::Field::new(
-                "scope",
-                declaration::Type::literals(["global", "mode", "default", "exclusive"]),
-            ),
+            declaration::Field::new("show_in_help", declaration::Type::Boolean)
+                .doc("Whether shortcut help displays this binding. Discovery still includes it."),
+            tier_field(),
+            declaration::Field::new("group", declaration::Type::String.optional())
+                .doc("Framework group, when the tier is framework."),
             declaration::Field::new("mode", declaration::Type::String.optional())
-                .doc("Named mode when the scope is mode."),
+                .doc("Named mode, when the tier is mode."),
             declaration::Field::new("path", declaration::Type::String),
             declaration::Field::new("route_path", declaration::Type::String)
                 .doc("Route path at which this binding wins."),
-            declaration::Field::new(
-                "phase",
-                declaration::Type::literals(["before_widget", "after_widget"]),
-            )
-            .doc("Phase relative to widget input handling."),
+            action_field(),
+            declaration::Field::new("intent", declaration::Type::String.optional())
+                .doc("Intent name, present when the action is an intent."),
+            phase_field(),
             declaration::Field::new("source", declaration::Type::String.optional())
                 .doc("Diagnostic source when available."),
         ]),
@@ -443,14 +597,14 @@ fn register_observation_info(builder: &mut module::Builder) {
             declaration::Field::new("active_modes", declaration::Type::String.array())
                 .doc("Active modes in resolution order."),
             declaration::Field::new("transient_mode", declaration::Type::String.optional())
-                .doc("Newest active mode when it is transient."),
-            declaration::Field::new("exclusive_group", declaration::Type::String.optional())
-                .doc("Active exclusive framework group."),
+                .doc("Transient mode that takes the next key, absent while a framework modal suspends it."),
+            declaration::Field::new("framework_group", declaration::Type::String.optional())
+                .doc("Framework group the open modal admits."),
             declaration::Field::new(
                 "bindings",
                 declaration::Type::named("AvailableBinding").array(),
             )
-            .doc("Effective key bindings for the context."),
+            .doc("Effective key bindings, each with a route to the node where it acts."),
             declaration::Field::new(
                 "mouse_bindings",
                 declaration::Type::named("AvailableBinding").array(),
@@ -459,6 +613,89 @@ fn register_observation_info(builder: &mut module::Builder) {
                 "Effective mouse bindings for the context, routed from the requested node \
                  rather than from the pointer.",
             ),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "KeyExpectation",
+        declaration::Type::table([
+            declaration::Field::new(
+                "kind",
+                declaration::Type::literals([
+                    "widget",
+                    "binding",
+                    "transient",
+                    "transient_dismiss",
+                    "unhandled",
+                ]),
+            ),
+            declaration::Field::new("node", declaration::Type::named("NodeId").optional())
+                .doc("Required when kind is widget."),
+            declaration::Field::new("binding", declaration::Type::Number.optional())
+                .doc("Required when kind is binding or transient."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "StepBinding",
+        declaration::Type::table([
+            declaration::Field::new("id", declaration::Type::Number)
+                .doc("Stable numeric binding identifier."),
+            action_field(),
+            phase_field(),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "KeyRouteStep",
+        declaration::Type::table([
+            declaration::Field::new("node", declaration::Type::named("NodeId")),
+            declaration::Field::new("path", declaration::Type::String),
+            declaration::Field::new(
+                "binding",
+                declaration::Type::named("StepBinding").optional(),
+            )
+            .doc("Binding selected at this node, when one exists."),
+            declaration::Field::new("widget", declaration::Type::literals(["handle", "ignore"]))
+                .doc("Widget prediction for the key."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "KeyRouteOutcome",
+        declaration::Type::table([
+            declaration::Field::new(
+                "kind",
+                declaration::Type::literals([
+                    "binding",
+                    "transient",
+                    "widget",
+                    "transient_dismiss",
+                    "unhandled",
+                ]),
+            ),
+            declaration::Field::new("binding", declaration::Type::Number.optional())
+                .doc("Winning binding, when kind is binding or transient."),
+            declaration::Field::new("node", declaration::Type::named("NodeId").optional())
+                .doc("Node where the binding acts, or the consuming widget."),
+            declaration::Field::new("path", declaration::Type::String.optional())
+                .doc("Route path of node."),
+            declaration::Field::new(
+                "action",
+                declaration::Type::literals(["script", "command", "intent"]).optional(),
+            )
+            .doc("Kind of action the winning binding runs."),
+            declaration::Field::new(
+                "phase",
+                declaration::Type::literals(["before_widget", "after_widget"]).optional(),
+            )
+            .doc("Phase of the winning binding."),
+        ]),
+    ));
+    builder.alias(declaration::Alias::new(
+        "KeyRouteExplanation",
+        declaration::Type::table([
+            declaration::Field::new("key", declaration::Type::String),
+            declaration::Field::new("focus", declaration::Type::named("NodeId")),
+            declaration::Field::new("focus_path", declaration::Type::String),
+            declaration::Field::new("steps", declaration::Type::named("KeyRouteStep").array()),
+            declaration::Field::new("outcome", declaration::Type::named("KeyRouteOutcome")),
         ]),
     ));
     builder.alias(declaration::Alias::new(
@@ -508,8 +745,9 @@ fn register_snapshot_info(builder: &mut module::Builder) {
             Field::new("value", Type::String.optional()),
             Field::new("selected", Type::Boolean.optional()),
             Field::new("selected_keys", Type::Any.array()),
+            Field::new("checked_keys", Type::Any.array()),
             Field::new(
-                "action_status",
+                "activation_status",
                 Type::named("SemanticActionStatus").optional(),
             ),
         ]),
@@ -521,10 +759,7 @@ fn register_snapshot_info(builder: &mut module::Builder) {
             Field::new("parent", Type::named("NodeId").optional()),
             Field::new("children", Type::named("NodeId").array()),
             Field::new("name", Type::String),
-            Field::new(
-                "semantic_identity",
-                Type::named("SemanticIdentity").optional(),
-            ),
+            Field::new("identity", Type::named("NodeIdentity").optional()),
             Field::new("attached", Type::Boolean),
             Field::new("displayed", Type::Boolean),
             Field::new("intersects_viewport", Type::Boolean),
@@ -540,10 +775,12 @@ fn register_snapshot_info(builder: &mut module::Builder) {
         "FrameSnapshot",
         Type::table([
             Field::new("frame_id", Type::Number),
-            Field::new("viewport", Type::named("Size")),
+            Field::new("size", Type::named("Size")).doc("Screen size in cells."),
             Field::new("focus", Type::named("NodeId").optional()),
             Field::new("nodes", Type::named("NodeSnapshot").array()),
             Field::new("cells", Type::named("ScreenCell").array().array()),
+            Field::new("cursors", Type::named("CursorInfo").array())
+                .doc("Cursors the frame painted, the primary cursor first."),
         ]),
     ));
 }
@@ -601,20 +838,16 @@ pub(super) fn command_doc(spec: &CommandSpec) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// Shared node record fields, with the child representation selected by the
-/// alias.
-fn node_info_fields(
-    children: declaration::Type,
-    children_doc: &'static str,
-) -> Vec<declaration::Field> {
+/// Node record fields.
+fn node_info_fields() -> Vec<declaration::Field> {
     vec![
         declaration::Field::new("id", declaration::Type::named("NodeId"))
             .doc("Stable node handle for use in other API calls."),
         declaration::Field::new("name", declaration::Type::String)
             .doc("Widget owner name used in paths and command dispatch."),
         declaration::Field::new(
-            "semantic_identity",
-            declaration::Type::named("SemanticIdentity").optional(),
+            "identity",
+            declaration::Type::named("NodeIdentity").optional(),
         )
         .doc("Application key and explicit arena scope, if registered."),
         declaration::Field::new("focused", declaration::Type::Boolean)
@@ -623,7 +856,10 @@ fn node_info_fields(
             .doc("True when this node lies on the path to the focused node."),
         declaration::Field::new("hidden", declaration::Type::Boolean)
             .doc("True when the node's hidden flag is set."),
-        declaration::Field::new("children", children).doc(children_doc),
+        declaration::Field::new("parent", declaration::Type::named("NodeId").optional())
+            .doc("Parent node, or nil at the root and for detached nodes."),
+        declaration::Field::new("children", declaration::Type::named("NodeId").array())
+            .doc("Direct child nodes in tree order."),
         declaration::Field::new("rect", declaration::Type::named("Rect").optional())
             .doc("Outer rectangle on screen, or nil for zero-sized nodes."),
         declaration::Field::new("content_rect", declaration::Type::named("Rect").optional())
@@ -641,7 +877,7 @@ fn node_info_fields(
 fn command_availability_fields() -> Vec<declaration::Field> {
     vec![
         declaration::Field::new("available", declaration::Type::Boolean)
-            .doc("True when the command can resolve from the current script anchor."),
+            .doc("True when the command can resolve from the current script origin."),
         declaration::Field::new("target", declaration::Type::named("NodeId").optional())
             .doc("Current target node, when a node command can resolve."),
         declaration::Field::new(
@@ -651,7 +887,7 @@ fn command_availability_fields() -> Vec<declaration::Field> {
         declaration::Field::new("disabled_reason", declaration::Type::String.optional()),
         declaration::Field::new(
             "missing_requirements",
-            declaration::Type::literals(["event", "mouse", "list_row"]).array(),
+            declaration::Type::literals(["event", "mouse"]).array(),
         ),
     ]
 }

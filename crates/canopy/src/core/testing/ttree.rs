@@ -2,15 +2,14 @@
 use std::cell::RefCell;
 
 use crate::{
-    Canopy, Context, NodeId, ViewContext,
+    Canopy, CanopyBuilder, Context, NodeId, NodeName, ViewContext,
     core::Core,
     derive_commands,
     error::Result,
-    event::Event,
     geom::Size,
+    input::{Event, key::Key},
     layout::{Direction, Layout},
     render::Render,
-    state::NodeName,
     testing::backend::TestRender,
     widget::{EventOutcome, Widget},
 };
@@ -153,6 +152,10 @@ macro_rules! node {
                 Ok(outcome)
             }
 
+            fn key_outcome(&self, _key: Key, _ctx: &dyn ViewContext) -> EventOutcome {
+                self.next_outcome.unwrap_or(EventOutcome::Ignore)
+            }
+
             fn name(&self) -> NodeName {
                 NodeName::convert($name)
             }
@@ -230,19 +233,21 @@ fn build_tree(core: &mut Core) -> Result<TestTree> {
 /// Run a function on our standard dummy app built from [`TestTree`].
 pub fn run_ttree(func: impl FnOnce(&mut Canopy, TestRender, TestTree) -> Result<()>) -> Result<()> {
     let tr = TestRender::new();
-    let mut c = Canopy::new();
+    let mut c = CanopyBuilder::new()
+        .configure(|setup| {
+            setup.add_commands::<R>()?;
+            setup.add_commands::<BaLa>()?;
+            setup.add_commands::<BaLb>()?;
+            setup.add_commands::<BbLa>()?;
+            setup.add_commands::<BbLb>()?;
+            setup.add_commands::<Ba>()?;
+            setup.add_commands::<Bb>()
+        })
+        .build()?;
 
     let tree = build_tree(&mut c.core)?;
 
-    c.add_commands::<R>()?;
-    c.add_commands::<BaLa>()?;
-    c.add_commands::<BaLb>()?;
-    c.add_commands::<BbLa>()?;
-    c.add_commands::<BbLb>()?;
-    c.add_commands::<Ba>()?;
-    c.add_commands::<Bb>()?;
-
-    c.set_root_size(Size::new(100, 100))?;
+    c.set_screen_size(Size::new(100, 100))?;
     // Isolated Core tests need geometry before focus and API initialization.
     c.core.update_layout(Size::new(100, 100))?;
     reset_state();

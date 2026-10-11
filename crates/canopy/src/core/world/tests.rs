@@ -15,17 +15,18 @@ use super::{
     *,
 };
 use crate::{
-    Context, ContextExt, KeyedChildren, ModalBindings, ModalOptions, ViewContext, ViewContextExt,
+    Context, ContextExt, ViewContext, ViewContextExt,
     core::{
         context::{CoreContext, CoreViewContext},
-        inputmap::FrameworkBindingGroup,
         script::validate_node_handle,
         testing::model::trace_result,
     },
     error::{Error, NodeOperationKind, Result},
     geom::Size,
-    layout::{Layout, Measurement},
+    input::{FrameworkBindingGroup, ModalBindings, ModalOptions},
+    layout::{Layout, LayoutOverride, Measurement},
     path::Path,
+    style::StyleMap,
     widget::Widget,
 };
 
@@ -61,11 +62,10 @@ struct StructuralSnapshot {
     nodes: Vec<NodeSnapshot>,
     focus: Option<NodeId>,
     mouse_capture: Option<NodeId>,
-    focus_hint: Option<(Option<NodeId>, Option<NodeId>, Option<NodeId>)>,
+    deferred_focus_repair: Option<DeferredFocusRepair>,
     exit_requested: Option<i32>,
     pending_style: bool,
     commands: Vec<&'static str>,
-    pending_diagnostic_dump: Option<NodeId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,7 +74,7 @@ struct NodeSnapshot {
     widget_type: TypeId,
     parent: Option<NodeId>,
     children: Vec<NodeId>,
-    child_keys: Vec<(String, NodeId)>,
+    slots: Vec<(String, NodeId)>,
     hidden: bool,
     initialized: bool,
     mounted: bool,
@@ -86,27 +86,24 @@ impl StructuralSnapshot {
             .nodes
             .iter()
             .map(|(id, node)| {
-                let mut child_keys: Vec<_> = node
-                    .child_keys
+                let mut slots: Vec<_> = node
+                    .slots
                     .iter()
                     .map(|(key, child)| (key.clone(), *child))
                     .collect();
-                child_keys.sort_by(|left, right| left.0.cmp(&right.0));
+                slots.sort_by(|left, right| left.0.cmp(&right.0));
                 NodeSnapshot {
                     id,
                     widget_type: node.widget_type,
                     parent: node.parent,
                     children: node.children.clone(),
-                    child_keys,
+                    slots,
                     hidden: node.hidden,
                     initialized: node.initialized,
                     mounted: node.mounted,
                 }
             })
             .collect();
-        let focus_hint = core
-            .focus_hint
-            .map(|hint| (hint.next, hint.prev, hint.ancestor));
         let mut commands: Vec<_> = core.commands.iter().map(|(id, _)| id).collect();
         commands.sort_unstable();
         Self {
@@ -114,11 +111,10 @@ impl StructuralSnapshot {
             nodes,
             focus: core.focus,
             mouse_capture: core.mouse_capture,
-            focus_hint,
+            deferred_focus_repair: core.deferred_focus_repair,
             exit_requested: core.exit_requested,
             pending_style: core.pending_style.is_some(),
             commands,
-            pending_diagnostic_dump: core.pending_diagnostic_dump,
         }
     }
 }
@@ -209,17 +205,17 @@ impl Widget for FaultWidget {
         match self.mount {
             MountAction::Succeed => Ok(()),
             MountAction::FailAfterCoreMutations => {
-                ctx.set_hidden(true)?;
+                ctx.set_hidden(ctx.node_id(), true)?;
                 ctx.exit(73);
-                ctx.request_diagnostic_dump(ctx.node_id());
+                ctx.set_style(StyleMap::default());
                 Err(Error::Invalid("fault-injected mount failure".into()))
             }
             MountAction::FailFromNestedEdit => {
-                ctx.add_child(MountFailWidget)?;
+                ctx.add_child(ctx.node_id(), MountFailWidget)?;
                 Ok(())
             }
             MountAction::HandleNestedFailure => {
-                let error = match ctx.add_child(MountFailWidget) {
+                let error = match ctx.add_child(ctx.node_id(), MountFailWidget) {
                     Ok(_) => panic!("nested mount should fail"),
                     Err(error) => error,
                 };
@@ -253,31 +249,6 @@ impl Widget for FaultWidget {
                 Err(Error::TreeEditDuringRollback { .. })
             );
             self.record(HookEvent::RollbackEditRejected(rejected));
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ReconcileWidget {
-    fail_mount: bool,
-}
-
-impl ReconcileWidget {
-    fn succeeds() -> Self {
-        Self { fail_mount: false }
-    }
-
-    fn fails_mount() -> Self {
-        Self { fail_mount: true }
-    }
-}
-
-impl Widget for ReconcileWidget {
-    fn on_mount(&mut self, _ctx: &mut dyn Context) -> Result<()> {
-        if self.fail_mount {
-            Err(Error::Invalid("reconcile mount failure".into()))
-        } else {
-            Ok(())
         }
     }
 }
@@ -717,7 +688,7 @@ fn focus_path_queries_tolerate_a_stale_internal_id() -> Result<()> {
     core.focus = Some(child);
     assert!(!core.is_on_focus_path(core.root));
     assert_eq!(core.focus_path(core.root), Path::empty());
-    core.ensure_focus_valid(None)?;
+    core.ensure_focus_valid()?;
     assert_eq!(core.focus_id(), None);
     Ok(())
 }
@@ -754,7 +725,7 @@ fn visibility_transition_reports_changes_and_missing_nodes() -> Result<()> {
         Err(Error::NodeNotFound(id)) if id == node
     ));
     assert!(matches!(
-        core.with_layout_of(node, |_| {}),
+        core.set_layout_override(node, LayoutOverride::new()),
         Err(Error::NodeNotFound(id)) if id == node
     ));
     Ok(())
@@ -771,7 +742,7 @@ fn validate_invariants_rejects_missing_child_link() -> Result<()> {
     let error = core
         .validate_invariants()
         .expect_err("missing child should fail validation");
-    assert!(matches!(error, Error::Invariant(_)));
+    assert!(matches!(error, Error::Internal(_)));
     Ok(())
 }
 
@@ -788,7 +759,7 @@ fn validate_invariants_rejects_initialized_attached_unmounted_node() -> Result<(
     let error = core
         .validate_invariants()
         .expect_err("initialized attached node must be mounted");
-    assert!(matches!(error, Error::Invariant(_)));
+    assert!(matches!(error, Error::Internal(_)));
     Ok(())
 }
 
@@ -1083,6 +1054,34 @@ fn set_children_detaches_from_previous_parent() -> Result<()> {
 }
 
 #[test]
+fn set_children_rejects_omitted_children() -> Result<()> {
+    let mut core = Core::new();
+    let parent = wrap_node(&mut core)?;
+    let first = wrap_node(&mut core)?;
+    let second = wrap_node(&mut core)?;
+    core.set_children(parent, vec![first, second])?;
+
+    let err = core
+        .set_children(parent, vec![second])
+        .expect_err("an omitted child is rejected");
+    assert!(matches!(err, Error::Invalid(_)));
+    assert_eq!(core.nodes[parent].children, vec![first, second]);
+    assert_eq!(core.nodes[first].parent, Some(parent));
+
+    // Reordering and adding keep every current child.
+    let third = wrap_node(&mut core)?;
+    core.set_children(parent, vec![second, third, first])?;
+    assert_eq!(core.nodes[parent].children, vec![second, third, first]);
+
+    // An explicit detach takes a child out.
+    core.detach(first)?;
+    core.set_children(parent, vec![third, second])?;
+    assert_eq!(core.nodes[parent].children, vec![third, second]);
+    assert_eq!(core.nodes[first].parent, None);
+    core.validate_invariants()
+}
+
+#[test]
 fn set_children_rejects_cycles() -> Result<()> {
     let mut core = Core::new();
     let parent = wrap_node(&mut core)?;
@@ -1133,11 +1132,11 @@ fn attach_rejects_root_as_child() -> Result<()> {
 
     assert!(matches!(
         core.attach(parent, root).unwrap_err(),
-        Error::InvalidOperation(_)
+        Error::Invalid(_)
     ));
     assert!(matches!(
         core.set_children(parent, vec![root]).unwrap_err(),
-        Error::InvalidOperation(_)
+        Error::Invalid(_)
     ));
 
     assert!(core.nodes[root].parent.is_none());
@@ -1223,7 +1222,7 @@ fn keyed_children_require_unique_keys() -> Result<()> {
         .add_child_to_slot_boxed(parent, "slot", Box::new(other_widget))
         .unwrap_err();
 
-    assert!(matches!(err, Error::DuplicateChildKey(_)));
+    assert!(matches!(err, Error::DuplicateSlot(_)));
     assert_eq!(core.nodes.len(), node_count);
     assert_eq!(core.child_slot(parent, "slot"), Some(child));
     Ok(())
@@ -1266,7 +1265,6 @@ fn set_children_fault_restores_core_state_and_unwinds_completed_mounts() -> Resu
     let mut core = Core::new();
     core.set_focus(core.root)?;
     core.capture_mouse(core.root)?;
-    core.pending_diagnostic_dump = Some(core.root);
     let log = Arc::new(Mutex::new(Vec::new()));
     let mounted = core.create_detached(
         FaultWidget::new("mounted", Arc::clone(&log))
@@ -1443,26 +1441,30 @@ fn pre_remove_veto_leaves_subtree_mounted() -> Result<()> {
 
 #[test]
 fn successful_detach_prunes_modal_bindings_owned_by_the_subtree() -> Result<()> {
+    const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("test.modal");
     let mut core = Core::new();
     let modal = core.create_detached(FocusableWidget)?;
     core.attach(core.root, modal)?;
-    let group = FrameworkBindingGroup::new("test.modal");
     core.open_modal(ModalOptions {
         owner: core.root,
         modal,
         initial_focus: modal,
         dim_target: None,
-        bindings: ModalBindings::Framework(group),
+        bindings: ModalBindings::Framework {
+            groups: &[GROUP],
+            intents: &[],
+        },
     })?;
 
     core.detach(modal)?;
 
-    assert_eq!(core.input_map.active_exclusive_group(), None);
+    assert_eq!(core.input_map.active_framework_group(), None);
     Ok(())
 }
 
 #[test]
 fn failed_removal_keeps_the_restored_owners_modal_bindings() -> Result<()> {
+    const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("test.modal");
     let mut core = Core::new();
     let log = Arc::new(Mutex::new(Vec::new()));
     let modal = core.create_detached(FocusableWidget)?;
@@ -1470,242 +1472,98 @@ fn failed_removal_keeps_the_restored_owners_modal_bindings() -> Result<()> {
     let child = core
         .create_detached(FaultWidget::new("child", log).with_pre_remove(PreRemoveAction::Fail))?;
     core.set_children(modal, vec![child])?;
-    let group = FrameworkBindingGroup::new("test.modal");
+    let group = GROUP;
     core.open_modal(ModalOptions {
         owner: core.root,
         modal,
         initial_focus: modal,
         dim_target: None,
-        bindings: ModalBindings::Framework(group),
+        bindings: ModalBindings::Framework {
+            groups: &[GROUP],
+            intents: &[],
+        },
     })?;
 
     assert!(core.remove_subtree(modal).is_err());
 
-    assert_eq!(core.input_map.active_exclusive_group(), Some(group));
+    assert_eq!(core.input_map.active_framework_group(), Some(group));
     Ok(())
 }
 
 #[test]
 fn successful_widget_replacement_retires_the_old_owners_modal_bindings() -> Result<()> {
+    const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("test.modal");
     let mut core = Core::new();
     let modal = core.create_detached(FocusableWidget)?;
     core.attach(core.root, modal)?;
-    let group = FrameworkBindingGroup::new("test.modal");
     core.open_modal(ModalOptions {
         owner: core.root,
         modal,
         initial_focus: modal,
         dim_target: None,
-        bindings: ModalBindings::Framework(group),
+        bindings: ModalBindings::Framework {
+            groups: &[GROUP],
+            intents: &[],
+        },
     })?;
 
     core.replace_subtree(modal, FocusableWidget)?;
 
-    assert_eq!(core.input_map.active_exclusive_group(), None);
+    assert_eq!(core.input_map.active_framework_group(), None);
     Ok(())
 }
 
 #[test]
 fn failed_widget_replacement_keeps_the_old_owners_modal_bindings() -> Result<()> {
+    const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("test.modal");
     let mut core = Core::new();
     let modal = core.create_detached(FocusableWidget)?;
     core.attach(core.root, modal)?;
-    let group = FrameworkBindingGroup::new("test.modal");
+    let group = GROUP;
     core.open_modal(ModalOptions {
         owner: core.root,
         modal,
         initial_focus: modal,
         dim_target: None,
-        bindings: ModalBindings::Framework(group),
+        bindings: ModalBindings::Framework {
+            groups: &[GROUP],
+            intents: &[],
+        },
     })?;
 
     assert!(core.replace_subtree(modal, MountFailWidget).is_err());
 
-    assert_eq!(core.input_map.active_exclusive_group(), Some(group));
+    assert_eq!(core.input_map.active_framework_group(), Some(group));
     Ok(())
-}
-
-#[test]
-fn keyed_reconcile_removes_in_current_child_order() -> Result<()> {
-    let mut core = Core::new();
-    let parent = core.create_detached(simple_widget())?;
-    core.attach(core.root, parent)?;
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let mut keyed = KeyedChildren::<&'static str, FaultWidget>::new();
-    let mut ctx = CoreContext::new(&mut core, parent);
-    let rows = keyed.reconcile(
-        &mut ctx,
-        ["a", "b", "c", "d"],
-        |key| Ok(FaultWidget::new(key, Arc::clone(&log))),
-        |_, _, _| Ok(()),
-    )?;
-    ctx.set_children([2, 0, 3, 1].map(|index| rows[index].into()).to_vec())?;
-    log.lock().unwrap().clear();
-    let retained = keyed.reconcile(
-        &mut ctx,
-        ["b"],
-        |_| panic!("all requested keys already exist"),
-        |_, _, _| Ok(()),
-    )?;
-    assert_eq!(retained, [rows[1]]);
-    let removed: Vec<_> = log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|event| {
-            if let HookEvent::PreRemove(name) = event {
-                Some(*name)
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(removed, ["c", "a", "d"]);
-    Ok(())
-}
-
-#[test]
-fn keyed_reconcile_update_failure_preserves_core_and_helper_state() -> Result<()> {
-    let mut core = Core::new();
-    let parent = core.create_detached(simple_widget())?;
-    core.attach(core.root, parent)?;
-    let mut keyed = KeyedChildren::<&'static str, ReconcileWidget>::new();
-    let before = StructuralSnapshot::capture(&core);
-
-    let error = {
-        let mut ctx = CoreContext::new(&mut core, parent);
-        keyed
-            .reconcile(
-                &mut ctx,
-                ["a", "b"],
-                |_key| Ok(ReconcileWidget::succeeds()),
-                |key, id, ctx| {
-                    if *key == "a" {
-                        ctx.set_hidden_of(id.into(), true)?;
-                        Ok(())
-                    } else {
-                        Err(Error::Invalid("reconcile update failure".into()))
-                    }
-                },
-            )
-            .expect_err("update failure should abort reconcile")
-    };
-
-    assert!(matches!(error, Error::Invalid(_)));
-    assert_eq!(StructuralSnapshot::capture(&core), before);
-    assert!(keyed.is_empty());
-    core.validate_invariants()
-}
-
-#[test]
-fn keyed_reconcile_mount_failure_preserves_core_and_helper_state() -> Result<()> {
-    let mut core = Core::new();
-    let parent = core.create_detached(simple_widget())?;
-    core.attach(core.root, parent)?;
-    let mut keyed = KeyedChildren::<&'static str, ReconcileWidget>::new();
-    let before = StructuralSnapshot::capture(&core);
-
-    let error = {
-        let mut ctx = CoreContext::new(&mut core, parent);
-        keyed
-            .reconcile(
-                &mut ctx,
-                ["a", "b"],
-                |key| {
-                    Ok(if *key == "b" {
-                        ReconcileWidget::fails_mount()
-                    } else {
-                        ReconcileWidget::succeeds()
-                    })
-                },
-                |_key, _id, _ctx| Ok(()),
-            )
-            .expect_err("mount failure should abort reconcile")
-    };
-
-    assert!(matches!(error, Error::Invalid(_)));
-    assert_eq!(StructuralSnapshot::capture(&core), before);
-    assert!(keyed.is_empty());
-    core.validate_invariants()
-}
-
-#[test]
-fn keyed_reconcile_defers_removal_until_updates_succeed() -> Result<()> {
-    let mut core = Core::new();
-    let parent = core.create_detached(simple_widget())?;
-    core.attach(core.root, parent)?;
-    let mut keyed = KeyedChildren::<&'static str, ReconcileWidget>::new();
-    {
-        let mut ctx = CoreContext::new(&mut core, parent);
-        keyed.reconcile(
-            &mut ctx,
-            ["a", "b"],
-            |_key| Ok(ReconcileWidget::succeeds()),
-            |_key, _id, _ctx| Ok(()),
-        )?;
-    }
-    let before = StructuralSnapshot::capture(&core);
-    let a = keyed.id_for(&"a").expect("a should exist");
-
-    {
-        let mut ctx = CoreContext::new(&mut core, parent);
-        keyed
-            .reconcile(
-                &mut ctx,
-                ["b", "c"],
-                |_key| Ok(ReconcileWidget::succeeds()),
-                |key, _id, _ctx| {
-                    if *key == "c" {
-                        Err(Error::Invalid("late update failure".into()))
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-            .expect_err("late update failure should abort reconcile");
-    }
-
-    assert_eq!(StructuralSnapshot::capture(&core), before);
-    assert_eq!(keyed.keys(), &["a", "b"]);
-    assert_eq!(keyed.id_for(&"a"), Some(a));
-    assert!(core.nodes.contains_key(a.into()));
-    core.validate_invariants()
 }
 
 #[test]
 fn focus_recovery_excludes_hidden_ancestor_subtrees() -> Result<()> {
     for laid_out in [false, true] {
-        for display_none in [false, true] {
-            let mut core = Core::new();
-            let parent = core.create_detached(simple_widget())?;
-            let child = core.create_detached(FocusableWidget)?;
-            let sibling = core.create_detached(FocusableWidget)?;
-            core.set_children(parent, vec![child])?;
-            core.set_children(core.root, vec![parent, sibling])?;
-            for id in [core.root, parent, child, sibling] {
-                core.set_layout_of(id, Layout::fill())?;
-            }
-            if laid_out {
-                core.update_layout(Size::new(20, 10))?;
-            }
-            core.set_focus(child)?;
-            if display_none {
-                core.set_layout_of(parent, Layout::fill().hidden())?;
-                core.ensure_focus_valid(None)?;
-            } else {
-                core.set_hidden(parent, true)?;
-            }
-            assert_eq!(core.focus_id(), Some(sibling));
-            assert!(!core.focusable_leaves(core.root).contains(&child));
-            core.focus_next(core.root)?;
-            assert_eq!(core.focus_id(), Some(sibling));
-            core.set_hidden(sibling, true)?;
-            assert_eq!(core.focus_id(), None);
-            core.set_hidden(parent, false)?;
-            core.set_layout_of(parent, Layout::fill())?;
-            core.focus_first(core.root)?;
-            assert_eq!(core.focus_id(), Some(child));
+        let mut core = Core::new();
+        let parent = core.create_detached(simple_widget())?;
+        let child = core.create_detached(FocusableWidget)?;
+        let sibling = core.create_detached(FocusableWidget)?;
+        core.set_children(parent, vec![child])?;
+        core.set_children(core.root, vec![parent, sibling])?;
+        for id in [core.root, parent, child, sibling] {
+            core.set_layout_of(id, Layout::fill())?;
         }
+        if laid_out {
+            core.update_layout(Size::new(20, 10))?;
+        }
+        core.set_focus(child)?;
+        core.set_hidden(parent, true)?;
+        assert_eq!(core.focus_id(), Some(sibling));
+        assert!(!core.focusable_leaves(core.root).contains(&child));
+        core.focus_next(core.root)?;
+        assert_eq!(core.focus_id(), Some(sibling));
+        core.set_hidden(sibling, true)?;
+        assert_eq!(core.focus_id(), None);
+        core.set_hidden(parent, false)?;
+        core.set_layout_of(parent, Layout::fill())?;
+        core.focus_first(core.root)?;
+        assert_eq!(core.focus_id(), Some(child));
     }
     Ok(())
 }
@@ -1762,6 +1620,124 @@ fn focused_child_survives_nested_parent_callback_visibility_change() -> Result<(
     Ok(())
 }
 
+/// Build a focusable parent whose focused, focusable child sits under the
+/// root beside nothing else that takes focus.
+fn focused_child_of_focusable_parent() -> Result<(Core, NodeId, NodeId)> {
+    let mut core = Core::new();
+    let parent = core.create_detached(FocusableWidget)?;
+    let child = core.create_detached(FocusableWidget)?;
+    core.set_children(parent, vec![child])?;
+    core.set_children(core.root, vec![parent])?;
+    core.set_focus(child)?;
+    Ok((core, parent, child))
+}
+
+#[test]
+fn edits_inside_a_callback_recover_focus_to_the_callback_widget() -> Result<()> {
+    for remove in [false, true] {
+        let (mut core, parent, child) = focused_child_of_focusable_parent()?;
+
+        // The parent's callback holds its cell, so a repair during the call
+        // could not consider the parent. Focus clears, and the repair waits.
+        core.with_widget_dyn_mut(parent, |_widget, core| {
+            if remove {
+                core.remove_subtree(child)?;
+            } else {
+                core.detach(child)?;
+            }
+            assert_eq!(core.focus_id(), None);
+            core.debug_assert_tree_invariants();
+            Ok::<_, Error>(())
+        })??;
+
+        assert_eq!(core.focus_id(), Some(parent));
+        core.validate_invariants()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn hiding_focus_inside_a_callback_repairs_once_the_cell_returns() -> Result<()> {
+    let (mut core, parent, child) = focused_child_of_focusable_parent()?;
+
+    core.with_widget_dyn_mut(parent, |_widget, core| {
+        core.with_widget_dyn_mut(child, |_widget, core| core.set_hidden(child, true))??;
+        // The outer callback still holds the parent's cell.
+        assert_eq!(core.focus_id(), Some(child));
+        Ok::<_, Error>(())
+    })??;
+
+    assert_eq!(core.focus_id(), Some(parent));
+    Ok(())
+}
+
+#[test]
+fn focus_set_inside_a_callback_overrides_the_deferred_repair() -> Result<()> {
+    let (mut core, parent, child) = focused_child_of_focusable_parent()?;
+    let other = core.create_detached(FocusableWidget)?;
+    core.attach(core.root, other)?;
+
+    core.with_widget_dyn_mut(parent, |_widget, core| {
+        core.detach(child)?;
+        core.set_focus(other).map(drop)
+    })??;
+
+    assert_eq!(core.focus_id(), Some(other));
+    Ok(())
+}
+
+#[test]
+fn detach_recovers_focus_like_removal() -> Result<()> {
+    for remove in [false, true] {
+        let mut core = Core::new();
+        let nodes = (0..3)
+            .map(|_| core.create_detached(FocusableWidget))
+            .collect::<Result<Vec<_>>>()?;
+        core.set_children(core.root, nodes.clone())?;
+        core.set_focus(nodes[1])?;
+
+        // Both edits prefer the next candidate after the subtree, not the
+        // first focusable node in the tree.
+        if remove {
+            core.remove_subtree(nodes[1])?;
+        } else {
+            core.detach(nodes[1])?;
+        }
+        assert_eq!(core.focus_id(), Some(nodes[2]));
+
+        core.set_focus(nodes[2])?;
+        if remove {
+            core.remove_subtree(nodes[2])?;
+        } else {
+            core.detach(nodes[2])?;
+        }
+        assert_eq!(core.focus_id(), Some(nodes[0]));
+    }
+    Ok(())
+}
+
+#[test]
+fn attachment_refresh_changes_only_the_moved_subtree() -> Result<()> {
+    let mut core = Core::new();
+    let stay = core.create_detached(simple_widget())?;
+    let moved = core.create_detached(simple_widget())?;
+    let moved_child = core.create_detached(simple_widget())?;
+    core.attach(moved, moved_child)?;
+    core.attach(core.root, stay)?;
+    let stay_generation = core.nodes[stay].attachment_generation;
+    assert!(stay_generation.is_some());
+    assert_eq!(core.nodes[moved_child].attachment_generation, None);
+
+    core.attach(core.root, moved)?;
+    assert!(core.nodes[moved].attachment_generation.is_some());
+    assert!(core.nodes[moved_child].attachment_generation.is_some());
+    core.detach(moved)?;
+    assert_eq!(core.nodes[moved].attachment_generation, None);
+    assert_eq!(core.nodes[moved_child].attachment_generation, None);
+    assert_eq!(core.nodes[stay].attachment_generation, stay_generation);
+    core.validate_invariants()
+}
+
 #[test]
 fn hidden_or_refusing_focused_widget_still_recovers_during_callbacks() -> Result<()> {
     let mut core = Core::new();
@@ -1784,44 +1760,7 @@ fn hidden_or_refusing_focused_widget_still_recovers_during_callbacks() -> Result
     })??;
     assert_eq!(core.focus_id(), Some(focused));
 
-    core.ensure_invariants(None)?;
+    core.repair_focus_and_capture(None)?;
     assert_eq!(core.focus_id(), None);
-    Ok(())
-}
-
-#[test]
-fn keyed_reconcile_preserves_ids_when_reordered_and_rejects_duplicates_first() -> Result<()> {
-    let mut core = Core::new();
-    let parent = core.create_detached(simple_widget())?;
-    core.attach(core.root, parent)?;
-    let mut keyed = KeyedChildren::<&str, ReconcileWidget>::new();
-    let mut ctx = CoreContext::new(&mut core, parent);
-    let first = keyed.reconcile(
-        &mut ctx,
-        ["a", "b"],
-        |_| Ok(ReconcileWidget::succeeds()),
-        |_, _, _| Ok(()),
-    )?;
-    let second = keyed.reconcile(
-        &mut ctx,
-        ["b", "a"],
-        |_| panic!("reordered keys must reuse widgets"),
-        |_, _, _| Ok(()),
-    )?;
-    assert_eq!(second, [first[1], first[0]]);
-    assert_eq!(
-        ctx.children(),
-        second.iter().copied().map(NodeId::from).collect::<Vec<_>>()
-    );
-    let error = keyed
-        .reconcile(
-            &mut ctx,
-            ["a", "a"],
-            |_| panic!("duplicates must fail before creation"),
-            |_, _, _| panic!("duplicates must fail before update"),
-        )
-        .expect_err("duplicate keys must fail");
-    assert!(matches!(error, Error::Invalid(_)));
-    assert_eq!(keyed.keys(), &["b", "a"]);
     Ok(())
 }

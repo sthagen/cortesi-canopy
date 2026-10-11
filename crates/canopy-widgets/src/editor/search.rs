@@ -1,14 +1,31 @@
 use std::mem;
 
 use canopy::{
-    Context, EventOutcome, Render,
+    Context,
     error::Result,
-    event::{Event, key},
     geom::{Line, Point, Rect},
+    input::key,
+    render::Render,
+    style::roles,
 };
 
 use super::widget::{Editor, prompt_text};
 use crate::text_buffer::{Selection, TextBuffer, TextPosition, TextRange};
+
+/// One prompt action in vi mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PromptCommand {
+    /// Close the prompt without applying it.
+    Cancel,
+    /// Delete the last character of the edited field.
+    Backspace,
+    /// Append one character to the edited field.
+    Push(char),
+    /// Advance the prompt state.
+    Enter,
+    /// Answer a replace confirmation.
+    Confirm(char),
+}
 
 /// Search direction for navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,53 +450,66 @@ impl Editor {
         }
     }
 
-    /// Handle prompt input events.
-    pub(super) fn handle_prompt_event(
-        &mut self,
-        event: &Event,
-        ctx: &mut dyn Context,
-    ) -> EventOutcome {
-        let Event::Key(key) = event else {
-            return EventOutcome::Ignore;
+    /// Clear the field of the open prompt, if it has one. Returns whether a
+    /// prompt is open.
+    pub(super) fn clear_prompt(&mut self) -> bool {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return false;
         };
-        if self.prompt.is_none() {
-            return EventOutcome::Ignore;
+        if let Some(field) = Self::prompt_edit_field(prompt) {
+            field.clear();
         }
+        true
+    }
 
+    /// Classify one key while a prompt is open.
+    ///
+    /// Esc cancels every prompt. Editable prompts take backspace, plain text,
+    /// and enter; a replace confirmation takes the characters it answers.
+    pub(super) fn prompt_command(&self, key: key::Key) -> Option<PromptCommand> {
+        let prompt = self.prompt.as_ref()?;
         if matches!(key.key, key::KeyCode::Esc) {
-            self.prompt = None;
-            return EventOutcome::Handle;
+            return Some(PromptCommand::Cancel);
         }
+        match prompt {
+            PromptState::ReplaceConfirm { .. } => match key.key {
+                key::KeyCode::Char(character) => Some(PromptCommand::Confirm(character)),
+                _ => None,
+            },
+            _ => match key.key {
+                key::KeyCode::Backspace => Some(PromptCommand::Backspace),
+                key::KeyCode::Char(character) if !key.mods.ctrl && !key.mods.alt => {
+                    Some(PromptCommand::Push(character))
+                }
+                key::KeyCode::Enter => Some(PromptCommand::Enter),
+                _ => None,
+            },
+        }
+    }
 
-        if let Some(field) = self.prompt.as_mut().and_then(Self::prompt_edit_field) {
-            match key.key {
-                key::KeyCode::Backspace => {
+    /// Run one classified prompt command.
+    pub(super) fn execute_prompt(&mut self, command: PromptCommand, ctx: &mut dyn Context) {
+        match command {
+            PromptCommand::Cancel => self.prompt = None,
+            PromptCommand::Backspace => {
+                if let Some(field) = self.prompt.as_mut().and_then(Self::prompt_edit_field) {
                     let _ = field.pop();
-                    return EventOutcome::Handle;
                 }
-                key::KeyCode::Char(c) if !key.mods.ctrl && !key.mods.alt => {
-                    field.push(c);
-                    return EventOutcome::Handle;
-                }
-                _ => {}
             }
+            PromptCommand::Push(character) => {
+                if let Some(field) = self.prompt.as_mut().and_then(Self::prompt_edit_field) {
+                    field.push(character);
+                }
+            }
+            PromptCommand::Enter => self.handle_prompt_enter(ctx),
+            PromptCommand::Confirm(character) => self.handle_replace_confirm(character, ctx),
         }
-
-        if matches!(key.key, key::KeyCode::Enter) {
-            return self.handle_prompt_enter(ctx);
-        }
-
-        if let key::KeyCode::Char(c) = key.key {
-            return self.handle_replace_confirm(c, ctx);
-        }
-
-        EventOutcome::Ignore
     }
 
     /// Advance a search or replace prompt on Enter.
-    fn handle_prompt_enter(&mut self, ctx: &mut dyn Context) -> EventOutcome {
+    fn handle_prompt_enter(&mut self, ctx: &mut dyn Context) {
         let Some(prompt) = self.prompt.take() else {
-            return EventOutcome::Ignore;
+            return;
         };
         match prompt {
             PromptState::Search { direction, query } => {
@@ -505,20 +535,17 @@ impl Editor {
                     replace_all: false,
                 });
             }
-            prompt => {
-                self.prompt = Some(prompt);
-                return EventOutcome::Ignore;
-            }
+            prompt => self.prompt = Some(prompt),
         }
-        EventOutcome::Handle
     }
 
     /// Handle y/n/a/q during replace confirmation.
-    fn handle_replace_confirm(&mut self, c: char, ctx: &mut dyn Context) -> EventOutcome {
-        if self.config.read_only && matches!(self.prompt, Some(PromptState::ReplaceConfirm { .. }))
+    fn handle_replace_confirm(&mut self, c: char, ctx: &mut dyn Context) {
+        if self.config.interaction.read_only()
+            && matches!(self.prompt, Some(PromptState::ReplaceConfirm { .. }))
         {
             self.prompt = None;
-            return EventOutcome::Handle;
+            return;
         }
         let Some(PromptState::ReplaceConfirm {
             query,
@@ -528,7 +555,7 @@ impl Editor {
             replace_all,
         }) = self.prompt.as_mut()
         else {
-            return EventOutcome::Ignore;
+            return;
         };
 
         match c {
@@ -553,7 +580,7 @@ impl Editor {
             }
             'q' => {
                 self.prompt = None;
-                return EventOutcome::Handle;
+                return;
             }
             _ => {}
         }
@@ -566,7 +593,7 @@ impl Editor {
             replace_all,
         }) = self.prompt.as_mut()
         else {
-            return EventOutcome::Handle;
+            return;
         };
 
         if *replace_all {
@@ -579,13 +606,12 @@ impl Editor {
                 index = 0;
             }
             self.prompt = None;
-            return EventOutcome::Handle;
+            return;
         }
 
         if *index >= matches.len() {
             self.prompt = None;
         }
-        EventOutcome::Handle
     }
 
     /// Replace a match range and return the remaining matches from the cursor.
@@ -615,6 +641,6 @@ impl Editor {
         };
         let y = origin.y.saturating_add(view_rect.h.saturating_sub(1));
         let line = Line::new(origin.x, y, view_rect.w);
-        r.text("editor/prompt", line, &prompt_text(prompt))
+        r.text(roles::PROMPT, line, &prompt_text(prompt))
     }
 }

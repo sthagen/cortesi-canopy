@@ -1,15 +1,26 @@
-use std::{mem, ops::Range};
+#![expect(
+    clippy::multiple_inherent_impl,
+    reason = "TermBuf methods are split between cell storage and motion."
+)]
+
+use std::{collections::BTreeMap, ops::Range};
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     core::text,
-    cursor,
     error::{Error, Result},
     geom::{Line, Point, Rect, Size},
     render::RenderBackend,
-    style::{Attr, ResolvedStyle},
+    style::ResolvedStyle,
 };
+
+/// A frame as styled text, for renderers outside the terminal.
+mod capture;
+/// Motion records and cursor painting.
+mod motion;
+pub use capture::{CaptureRun, CaptureStyle, ScreenCapture};
+pub use motion::MotionStyle;
 
 /// NULL character constant.
 const NULL: char = '\0';
@@ -184,22 +195,29 @@ fn validate_cell_character(ch: char) -> Result<()> {
 }
 
 /// A 2D terminal buffer of styled cells.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TermBuf {
     /// Buffer size in cells.
     pub(crate) size: Size,
     /// Backing cell storage.
     pub(crate) cells: Vec<Cell>,
+    /// Moving graphemes, keyed by base cell index.
+    motion: BTreeMap<usize, motion::MotionRecord>,
 }
 
 impl TermBuf {
+    /// Return the cells in row-major order.
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
     /// Construct a buffer filled with the given character and style.
     pub fn new(size: impl Into<Size>, ch: char, style: ResolvedStyle) -> Result<Self> {
         Self::new_with_limits(size, ch, style, RenderLimits::default())
     }
 
     /// Construct a buffer with explicit visible render-target limits.
-    pub fn new_with_limits(
+    pub(crate) fn new_with_limits(
         size: impl Into<Size>,
         ch: char,
         style: ResolvedStyle,
@@ -214,7 +232,11 @@ impl TermBuf {
             .try_reserve_exact(count)
             .map_err(|_| Error::RenderAllocation { cells: count })?;
         cells.resize(count, cell);
-        Ok(Self { size, cells })
+        Ok(Self {
+            size,
+            cells,
+            motion: BTreeMap::new(),
+        })
     }
 
     /// Return the buffer size.
@@ -250,17 +272,30 @@ impl TermBuf {
         Some(row_start + start..row_start + end)
     }
 
-    /// Clear the complete grapheme occupying one cell index.
-    fn clear_grapheme_at(&mut self, index: usize, style: ResolvedStyle) {
+    /// Prepare a cell for writing, clearing overlapping wide glyphs and motion.
+    fn clear_for_write(&mut self, index: usize, style: ResolvedStyle) {
+        // A single-cell glyph will be replaced directly by the caller.
+        // Only a wide glyph can leave cells outside the write behind.
+        if !self.cells[index].continuation
+            && !self
+                .cells
+                .get(index + 1)
+                .is_some_and(|cell| cell.continuation)
+        {
+            self.clear_motion(index);
+            return;
+        }
         if let Some(range) = self.grapheme_span(index) {
+            self.clear_motion(range.start);
             self.cells[range].fill(Cell::new(NULL, style));
         }
     }
 
-    /// Clear every complete grapheme touched by a destination cell range.
+    /// Prepare a destination range for writing, clearing overlapping wide
+    /// glyphs.
     fn clear_graphemes(&mut self, start: usize, width: usize, style: ResolvedStyle) {
         for index in start..start.saturating_add(width) {
-            self.clear_grapheme_at(index, style);
+            self.clear_for_write(index, style);
         }
     }
 
@@ -270,7 +305,7 @@ impl TermBuf {
         let Some(index) = self.idx(p) else {
             return Ok(());
         };
-        self.clear_grapheme_at(index, style);
+        self.clear_for_write(index, style);
         self.cells[index] = Cell::new(ch, style);
         Ok(())
     }
@@ -315,7 +350,7 @@ impl TermBuf {
     }
 
     /// Fill a rectangle, resolving the style separately for each cell.
-    pub fn fill_with(
+    pub(crate) fn fill_with(
         &mut self,
         r: Rect,
         ch: char,
@@ -326,9 +361,13 @@ impl TermBuf {
             let end_y = isec.tl.y.saturating_add(isec.h);
             let end_x = isec.tl.x.saturating_add(isec.w);
             for y in isec.tl.y..end_y {
+                let row_start = y as usize * self.size.w as usize;
                 for x in isec.tl.x..end_x {
                     let point = Point { x, y };
-                    self.put(point, ch, style_at(point))?;
+                    let style = style_at(point);
+                    let index = row_start + x as usize;
+                    self.clear_for_write(index, style);
+                    self.cells[index] = Cell::new(ch, style);
                 }
             }
         }
@@ -343,31 +382,9 @@ impl TermBuf {
         let Some(range) = self.grapheme_span(idx) else {
             return;
         };
+        self.clear_motion(range.start);
         for cell in &mut self.cells[range] {
             cell.style = style;
-        }
-    }
-
-    /// Overlay a cursor on a cell by adjusting its style.
-    pub fn overlay_cursor(&mut self, location: Point, shape: cursor::CursorShape) {
-        let Some(idx) = self.idx(location) else {
-            return;
-        };
-        if self.cells[idx].is_empty() {
-            self.cells[idx] = Cell::new(' ', self.cells[idx].style);
-        }
-        let Some(range) = self.grapheme_span(idx) else {
-            return;
-        };
-        for cell in &mut self.cells[range] {
-            match shape {
-                cursor::CursorShape::Underscore => {
-                    cell.style.attrs = cell.style.attrs.with(Attr::Underline);
-                }
-                cursor::CursorShape::Block | cursor::CursorShape::Line => {
-                    mem::swap(&mut cell.style.fg, &mut cell.style.bg);
-                }
-            }
         }
     }
 
@@ -380,7 +397,7 @@ impl TermBuf {
     ///
     /// The text is clipped to the line and padded with spaces to the line's
     /// width.
-    pub fn text_with(
+    pub(crate) fn text_with(
         &mut self,
         l: Line,
         txt: &str,
@@ -431,12 +448,12 @@ impl TermBuf {
     /// Validate the canonical base-plus-continuation cell representation.
     fn validate_canonical(&self) -> Result<()> {
         let width = usize::try_from(self.size.w)
-            .map_err(|_| Error::Invariant("terminal buffer width does not fit usize".into()))?;
+            .map_err(|_| Error::Internal("terminal buffer width does not fit usize".into()))?;
         if width == 0 {
             return if self.cells.is_empty() {
                 Ok(())
             } else {
-                Err(Error::Invariant(
+                Err(Error::Internal(
                     "zero-width terminal buffer contains cells".into(),
                 ))
             };
@@ -454,7 +471,7 @@ impl TermBuf {
                                     && base.style == cell.style
                             });
                     if !valid_base {
-                        return Err(Error::Invariant(format!(
+                        return Err(Error::Internal(format!(
                             "orphan terminal continuation at ({x}, {row_index})"
                         )));
                     }
@@ -462,19 +479,19 @@ impl TermBuf {
                 }
                 let rendered_width = cell.rendered_width();
                 if rendered_width == 0 {
-                    return Err(Error::Invariant(format!(
+                    return Err(Error::Internal(format!(
                         "zero-width terminal base at ({x}, {row_index})"
                     )));
                 }
                 if rendered_width == 2 && !row.get(x + 1).is_some_and(|next| next.continuation) {
-                    return Err(Error::Invariant(format!(
+                    return Err(Error::Internal(format!(
                         "wide terminal base lacks continuation at ({x}, {row_index})"
                     )));
                 }
             }
         }
         if !rows.remainder().is_empty() {
-            return Err(Error::Invariant(
+            return Err(Error::Internal(
                 "terminal buffer cell count is not divisible by its width".into(),
             ));
         }
@@ -515,13 +532,12 @@ impl TermBuf {
     }
 
     /// Diff this terminal buffer against a previous state, emitting changes
-    /// to the provided render backend.
-    pub fn diff<R: RenderBackend>(&self, prev: &Self, backend: &mut R) -> Result<()> {
+    /// to the provided render backend. The caller flushes the backend.
+    pub fn emit_diff<R: RenderBackend>(&self, prev: &Self, backend: &mut R) -> Result<()> {
         self.validate_canonical()?;
         prev.validate_canonical()?;
-        let mut wrote = false;
         if self.size != prev.size {
-            return self.render(backend);
+            return self.emit(backend);
         }
         if self.cells == prev.cells {
             return Ok(());
@@ -560,7 +576,6 @@ impl TermBuf {
                     let start = width.saturating_sub(gap);
                     render_line_range(backend, current_row, y, start, gap, &mut text)?;
                 }
-                wrote = true;
                 continue;
             }
 
@@ -589,21 +604,17 @@ impl TermBuf {
                 }
 
                 render_line_range(backend, current_row, y, start_x, end_x - start_x, &mut text)?;
-                wrote = true;
                 x = end_x;
             }
-        }
-        if wrote {
-            backend.flush()?;
         }
         Ok(())
     }
 
-    /// Render this terminal buffer in full using the provided backend,
-    /// batching runs of text with the same style.
-    pub fn render<R: RenderBackend>(&self, backend: &mut R) -> Result<()> {
+    /// Emit this terminal buffer in full to the provided backend,
+    /// batching runs of text with the same style. The caller flushes the
+    /// backend.
+    pub fn emit<R: RenderBackend>(&self, backend: &mut R) -> Result<()> {
         self.validate_canonical()?;
-        let mut wrote = false;
         let width = self.size.w as usize;
         let mut text = String::new();
         for y in 0..self.size.h {
@@ -611,10 +622,6 @@ impl TermBuf {
             let row_end = row_start + width;
             let row = &self.cells[row_start..row_end];
             render_line_range(backend, row, y, 0, width, &mut text)?;
-            wrote = true;
-        }
-        if wrote {
-            backend.flush()?;
         }
         Ok(())
     }
@@ -803,7 +810,7 @@ fn render_shifted_rect<R: RenderBackend>(
         let row = &buf.cells[row_start..row_start + width];
         render_line_range(backend, row, y, 0, width, &mut text)?;
     }
-    backend.flush()
+    Ok(())
 }
 
 /// Determine whether two buffers match for a given vertical shift within a

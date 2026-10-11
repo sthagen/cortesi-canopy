@@ -2,13 +2,13 @@
 
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
-use super::Canopy;
+use super::{Canopy, CanopyBuilder};
 use crate::{
-    FrameId, Invalidation, ViewContext, Widget, WidgetSemantics,
+    Invalidation, ViewContext, Widget,
     core::snapshot,
     error::{Error, Result},
     geom::{RectI32, Size},
-    layout::{Display, Layout},
+    runtime::{FrameId, WidgetSemantics},
 };
 
 struct Observed {
@@ -38,9 +38,8 @@ impl Widget for Leaf {}
 
 /// Make an application with explicit initial preparation still pending.
 fn app() -> Result<Canopy> {
-    let mut app = Canopy::new();
-    app.set_root_size(Size::new(8, 4))?;
-    app.finalize_api()?;
+    let mut app = CanopyBuilder::new().build()?;
+    app.set_screen_size(Size::new(8, 4))?;
     Ok(app)
 }
 
@@ -55,17 +54,17 @@ fn immutable_reads_keep_old_nodes_values_and_frame_ids() -> Result<()> {
         calls: calls.clone(),
         fail,
     })?;
-    app.flush()?;
+    app.prepare()?;
     let old = app.snapshot().unwrap();
     let count = calls.get();
     for _ in 0..3 {
         assert!(Arc::ptr_eq(&old, &app.snapshot().unwrap()));
     }
-    app.flush()?;
+    app.prepare()?;
     assert!(Arc::ptr_eq(&old, &app.snapshot().unwrap()));
     assert_eq!(calls.get(), count);
     app.core.remove_subtree(node)?;
-    app.flush()?;
+    app.prepare()?;
     let new = app.snapshot().unwrap();
     assert!(new.frame_id.0 > old.frame_id.0);
     assert!(!new.nodes.iter().any(|entry| entry.id == node));
@@ -79,7 +78,7 @@ fn immutable_reads_keep_old_nodes_values_and_frame_ids() -> Result<()> {
             .as_deref(),
         Some("old")
     );
-    assert_eq!(old.cells.len(), 32);
+    assert_eq!(old.buffer.cells().len(), 32);
     Ok(())
 }
 
@@ -92,43 +91,45 @@ fn failed_capture_preserves_publication_and_pending_changes() -> Result<()> {
         calls: Rc::new(Cell::new(0)),
         fail: fail.clone(),
     })?;
-    app.flush()?;
+    app.prepare()?;
     let old = app.snapshot().unwrap();
-    let text = app.buf().unwrap().screen_text();
+    let text = app.published_buf().unwrap().screen_text();
     fail.set(true);
     app.core.invalidate(Invalidation::Semantics);
-    assert!(app.flush().is_err());
+    assert!(app.prepare().is_err());
     assert!(Arc::ptr_eq(&old, &app.snapshot().unwrap()));
-    assert_eq!(app.buf().unwrap().screen_text(), text);
+    assert_eq!(app.published_buf().unwrap().screen_text(), text);
     assert_eq!(FrameId(app.driver.publication.generation()), old.frame_id);
     assert!(app.core.changes.is_pending());
     fail.set(false);
-    app.flush()?;
+    app.prepare()?;
     assert_eq!(app.snapshot().unwrap().frame_id.0, old.frame_id.0 + 1);
     Ok(())
 }
 
 #[test]
-fn flush_rejects_an_active_empty_widget_slot_before_preparation() -> Result<()> {
+fn prepare_rejects_an_active_empty_widget_cell_before_preparation() -> Result<()> {
     let mut app = app()?;
     let root = app.core.root;
     let slot = app.core.nodes[root].widget.clone();
     let widget = slot.borrow_mut().take();
     app.core.callback_depth = 1;
-    let result = app.flush();
+    let result = app.prepare();
     app.core.callback_depth = 0;
     *slot.borrow_mut() = widget;
     assert!(matches!(
         result,
-        Err(Error::InvalidPhase { operation: "flush" })
+        Err(Error::InvalidPhase {
+            operation: "prepare"
+        })
     ));
     assert!(app.snapshot().is_none());
-    app.flush()?;
+    app.prepare()?;
     Ok(())
 }
 
 #[test]
-fn capture_distinguishes_attachment_display_and_accumulated_clipping() -> Result<()> {
+fn capture_distinguishes_attachment_visibility_and_accumulated_clipping() -> Result<()> {
     let mut app = app()?;
     let root = app.core.root;
     let parent = app.core.create_detached(Leaf)?;
@@ -136,12 +137,19 @@ fn capture_distinguishes_attachment_display_and_accumulated_clipping() -> Result
     let detached = app.core.create_detached(Leaf)?;
     app.core.attach(root, parent)?;
     app.core.attach(parent, child)?;
-    app.flush()?;
+    app.prepare()?;
     // Explicit cached geometry isolates the observation contract from layout.
     app.core.nodes[parent].view.outer = RectI32::new(0, 0, 2, 2);
     app.core.nodes[parent].view.content = RectI32::new(0, 0, 2, 2);
     app.core.nodes[child].view.outer = RectI32::new(4, 0, 2, 2);
-    let capture = |app: &Canopy| snapshot::capture(&app.core, FrameId(10), app.buf().unwrap());
+    let capture = |app: &Canopy| {
+        snapshot::capture(
+            &app.core,
+            FrameId(10),
+            Arc::new(app.published_buf().unwrap().clone()),
+            Vec::new(),
+        )
+    };
     let snapshot = capture(&app)?;
     let child_entry = snapshot.nodes.iter().find(|node| node.id == child).unwrap();
     assert!(child_entry.attached && child_entry.displayed);
@@ -163,20 +171,6 @@ fn capture_distinguishes_attachment_display_and_accumulated_clipping() -> Result
     assert!(child_entry.attached && !child_entry.displayed);
     assert!(child_entry.view.is_none());
     app.core.nodes[parent].hidden = false;
-    app.core.nodes[parent].layout = Layout {
-        display: Display::None,
-        ..Layout::default()
-    };
-    let suppressed = capture(&app)?;
-    assert!(
-        !suppressed
-            .nodes
-            .iter()
-            .find(|node| node.id == child)
-            .unwrap()
-            .displayed
-    );
-    app.core.nodes[parent].layout.display = Display::Block;
     app.core.nodes[child].view.outer = RectI32::new(-1, 0, 2, 2);
     assert!(
         capture(&app)?

@@ -3,18 +3,20 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Canopy, ContextExt, FocusDirection, FocusScope, NodeId, NodeName, ViewContext, Widget,
-        error::{Error, Result},
+        Canopy, CanopyBuilder, ContextExt, NodeId, NodeName, ViewContext, Widget,
+        error::Result,
         geom::Size,
         layout::Layout,
+        runtime::TurnInput,
         testing::grid::Grid,
+        tree::{FocusDirection, FocusScope},
     };
 
     /// Return the name of the focused grid cell, if a cell holds focus.
     fn focused_cell(canopy: &Canopy) -> Option<String> {
         canopy.with_root_view(|context| {
             let root = context.root_id();
-            let focused = context.focused_leaf(root)?;
+            let focused = context.focused_within(root)?;
             let mut path = context.path_of(root, focused);
             path.pop().filter(|name| name.starts_with("cell_"))
         })
@@ -59,12 +61,11 @@ mod tests {
         let total_cells = grid_width * grid_height;
 
         focus_first(canopy, grid.root)?;
-        let initial = focused_cell(canopy);
-        if initial != Some("cell_0_0".to_string()) {
-            return Err(Error::Invariant(format!(
-                "Expected to start at cell_0_0, but started at {initial:?}"
-            )));
-        }
+        assert_eq!(
+            focused_cell(canopy),
+            Some("cell_0_0".to_string()),
+            "navigation starts at cell_0_0"
+        );
 
         let mut visited_cells: Vec<String> = Vec::new();
         let mut position_errors: Vec<String> = Vec::new();
@@ -110,11 +111,10 @@ mod tests {
                     focus_dir(canopy, grid.root, step)?;
                     let after = focused_cell(canopy);
 
-                    if before == after {
-                        return Err(Error::Invariant(format!(
-                            "Failed to move {step:?} from row {row}, col {col} (stuck at {before:?})"
-                        )));
-                    }
+                    assert_ne!(
+                        before, after,
+                        "failed to move {step:?} from row {row}, col {col}"
+                    );
                 }
             }
 
@@ -123,37 +123,28 @@ mod tests {
                 focus_dir(canopy, grid.root, FocusDirection::Down)?;
                 let after = focused_cell(canopy);
 
-                if before == after {
-                    return Err(Error::Invariant(format!(
-                        "Failed to move down after row {row} (stuck at {before:?})"
-                    )));
-                }
+                assert_ne!(before, after, "failed to move down after row {row}");
             }
         }
 
-        if visited_cells.len() != total_cells {
-            return Err(Error::Invariant(format!(
-                "Only visited {} out of {} cells ({:.1}% coverage)",
-                visited_cells.len(),
-                total_cells,
-                (visited_cells.len() as f64 / total_cells as f64) * 100.0
-            )));
-        }
-
-        if !position_errors.is_empty() {
-            return Err(Error::Invariant(format!(
-                "Navigation completed but {} position errors occurred:\n{}",
-                position_errors.len(),
-                position_errors[..5.min(position_errors.len())].join("\n")
-            )));
-        }
+        assert_eq!(
+            visited_cells.len(),
+            total_cells,
+            "navigation visits every cell"
+        );
+        assert!(
+            position_errors.is_empty(),
+            "{} position errors occurred:\n{}",
+            position_errors.len(),
+            position_errors[..5.min(position_errors.len())].join("\n")
+        );
 
         Ok(())
     }
 
     #[test]
     fn test_focus_dir_simple_grid() -> Result<()> {
-        let mut canopy = Canopy::new();
+        let mut canopy = CanopyBuilder::new().build()?;
         let grid = Grid::install(&mut canopy, 1, 2)?;
         let grid_size = grid.expected_size();
         assert_eq!(grid_size, Size::new(20, 20));
@@ -178,45 +169,52 @@ mod tests {
 
     #[test]
     fn test_focus_snake_navigation_3x3() -> Result<()> {
-        let mut canopy = Canopy::new();
+        let mut canopy = CanopyBuilder::new().build()?;
         let grid = Grid::install(&mut canopy, 1, 3)?;
         test_snake_navigation(&grid, &mut canopy)
     }
 
     #[test]
     fn test_focus_snake_navigation_4x4() -> Result<()> {
-        let mut canopy = Canopy::new();
+        let mut canopy = CanopyBuilder::new().build()?;
         let grid = Grid::install(&mut canopy, 2, 2)?;
         test_snake_navigation(&grid, &mut canopy)
     }
 
     #[test]
     fn test_focus_moves_off_zero_view_nodes() -> Result<()> {
-        let mut canopy = Canopy::new();
-        let first = canopy.create_detached(FocusLeaf::new("first"))?;
-        let second = canopy.create_detached(FocusLeaf::new("second"))?;
-        canopy.with_root_context(|context| {
+        let mut canopy = CanopyBuilder::new().build()?;
+        let (first, second) = canopy.with_root_context(|context| {
+            let first = context.create_detached(FocusLeaf::new("first"))?;
+            let second = context.create_detached(FocusLeaf::new("second"))?;
             let root = context.root_id();
-            context.set_children_of(root, vec![first.into(), second.into()])?;
-            context.set_layout_of(root, Layout::column().flex_horizontal(1).flex_vertical(1))?;
-            context.set_layout_of(first, Layout::column().fixed_width(10).fixed_height(5))?;
-            context.set_layout_of(second, Layout::fill())?;
+            context.set_children(root, vec![first.into(), second.into()])?;
+            context.set_layout_override(
+                root,
+                Layout::column().flex_horizontal(1).flex_vertical(1).into(),
+            )?;
+            context.set_layout_override(
+                first.into(),
+                Layout::column().fixed_width(10).fixed_height(5).into(),
+            )?;
+            context.set_layout_override(second.into(), Layout::fill().into())?;
             context.set_focus(first.into())?;
-            Ok(())
+            Ok((first, second))
         })?;
 
-        canopy.set_root_size(Size::new(10, 10))?;
-        canopy.turn(canopy::Work::Prepare)?;
+        canopy.set_screen_size(Size::new(10, 10))?;
+        canopy.turn(TurnInput::Prepare)?;
         canopy.with_root_context(|context| {
-            context.with_layout_of(first.into(), &mut |layout| {
-                *layout = layout.fixed_height(0);
-            })
+            context.set_layout_override(
+                first.into(),
+                Layout::column().fixed_width(10).fixed_height(0).into(),
+            )
         })?;
-        canopy.set_root_size(Size::new(10, 10))?;
-        canopy.turn(canopy::Work::Prepare)?;
+        canopy.set_screen_size(Size::new(10, 10))?;
+        canopy.turn(TurnInput::Prepare)?;
 
         assert_eq!(
-            canopy.with_root_view(|context| context.focused_leaf(context.root_id())),
+            canopy.with_root_view(|context| context.focused_within(context.root_id())),
             Some(second.into())
         );
         Ok(())

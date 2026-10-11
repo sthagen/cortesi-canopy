@@ -3,26 +3,20 @@
 use std::{borrow::Cow, ops::Range};
 
 use canopy::{
-    Canopy, Context, ContextExt, Loader, NodeName, Render, ViewContext, Widget, WidgetSemantics,
-    commands::{CommandAction, CommandCall, CommandStatus, CommandTarget},
+    Context, NodeName, Register, Setup, ViewContext, Widget,
+    commands::{CommandCall, CommandStatus},
     derive_commands,
     error::Result,
-    geom::{Line, Size},
+    geom::{Line, Rect, Size},
     layout::{Layout, MeasureConstraints, Measurement},
+    render::Render,
+    runtime::WidgetSemantics,
     style::{WidgetState, roles},
     text,
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
-use crate::{
-    Border, Center,
-    boxed::{BoxGlyphs, SINGLE},
-};
-
-canopy::slot!(LabelSlot: ButtonLabel);
-canopy::slot!(BoxSlot: Border);
-canopy::slot!(CenterSlot: Center);
+use crate::border::BoxGlyphs;
 
 /// Default activation bindings exposed through `button.default_bindings()`.
 ///
@@ -42,25 +36,82 @@ canopy.keymap({
 })
 "#;
 
+/// Columns between the label and each side of a button.
+const PADDING: u32 = 2;
+
+/// How a button draws.
+///
+/// A terminal cell has one ground, and a box drawing line runs through the
+/// middle of its cell, so a border cannot enclose a fill of another color
+/// without a ring of the ground showing inside it. The filled looks draw
+/// their edges with block elements instead, which meet the edges of the
+/// cells exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ButtonLook {
+    /// The label on a filled row, one row tall.
+    #[default]
+    Solid,
+    /// A fill inset by half a cell on every side, three rows tall. Its edges
+    /// fall on the middles of the outer cells, where a box border runs.
+    Inset,
+    /// A fill three rows tall, lit along its top edge and shaded along its
+    /// bottom edge, as Textual draws its buttons.
+    Bevel,
+    /// The label inside a box border of these glyphs, on the ground of the
+    /// view, three rows tall.
+    Bordered(BoxGlyphs),
+}
+
+impl ButtonLook {
+    /// Return the rows that a button of this look takes.
+    pub const fn rows(self) -> u32 {
+        match self {
+            Self::Solid => 1,
+            Self::Inset | Self::Bevel | Self::Bordered(_) => 3,
+        }
+    }
+
+    /// Return the style prefix of the label and its key: a filled look draws
+    /// them on its face.
+    const fn label_prefix(self) -> &'static str {
+        match self {
+            Self::Solid | Self::Inset | Self::Bevel => "face/",
+            Self::Bordered(_) => "",
+        }
+    }
+}
+
 /// Button widget that runs a command when it is activated.
 ///
 /// Activation is the `button::press` command, which a click, `Enter`, or
 /// `Space` reaches through ordinary bindings. Install them with
-/// [`Loader::load`] and `button.default_bindings()`, or bind `press` however an
-/// application prefers. A modal that admits only its own framework group must
-/// bind activation in that group.
+/// [`Register::register`] and `button.default_bindings()`, or bind `press`
+/// however an application prefers. A modal that admits only its own framework
+/// group must bind activation in that group.
 ///
-/// User activation of a disabled action is consumed without dispatching.
-/// Calling [`Button::press`] directly still reports command errors.
+/// The button posts its action with [`Context::post`], so the action runs once
+/// the press has returned. It can then close a modal around the button, or
+/// remove the button. User activation of a disabled action is consumed without
+/// posting. Calling [`Button::press`] directly posts the action as well: the
+/// action's errors surface when the outermost dispatch completes, not from the
+/// call.
+///
+/// A button measures its label, and draws in its [`ButtonLook`]. It pushes the
+/// `button` layer, then at most one state layer: `disabled`, `active`, or
+/// `focused`, in that order of precedence. A filled look paints `face`, and its
+/// label and key as `face/text` and `face/key`. A bevel adds
+/// `face/highlight` and `face/shadow`, and an inset paints its edges as
+/// `face/edge`, whose ground is the ground around the button. A bordered look
+/// paints `border`, `fill`, `text`, and `key`.
 pub struct Button {
     /// Button label.
     label: String,
     /// Label character a key is expected to reach this button by.
     accelerator: Option<char>,
-    /// Command invocation to dispatch on click.
-    command: Option<CommandAction>,
-    /// Glyph set for the button border.
-    glyphs: BoxGlyphs,
+    /// Command call to dispatch on click.
+    command: Option<CommandCall>,
+    /// How the button draws.
+    look: ButtonLook,
     /// Active state for the button.
     active: bool,
 }
@@ -73,14 +124,14 @@ impl Button {
             label: label.into(),
             accelerator: None,
             command: None,
-            glyphs: SINGLE,
+            look: ButtonLook::default(),
             active: false,
         }
     }
 
     /// Mark the label character that a key reaches this button by.
     ///
-    /// The first matching character takes the [`roles::BUTTON_KEY`] style, so
+    /// The first matching character takes the [`roles::KEY`] style, so
     /// the label names its key without repeating it and keeps its spelling. An
     /// ASCII letter matches without case; any other character must match
     /// exactly. A label with no match is left alone.
@@ -94,9 +145,10 @@ impl Button {
         self
     }
 
-    /// Build a button with a specified glyph set.
-    pub fn with_glyphs(mut self, glyphs: BoxGlyphs) -> Self {
-        self.glyphs = glyphs;
+    /// Build a button that draws in `look`.
+    #[must_use]
+    pub fn with_look(mut self, look: ButtonLook) -> Self {
+        self.look = look;
         self
     }
 
@@ -112,12 +164,21 @@ impl Button {
     /// A composed dialog builds its buttons before a host knows what each
     /// answer does, so the action arrives after construction.
     pub fn set_command(&mut self, command: CommandCall) {
-        self.command = Some(command.action());
+        self.command = Some(command);
     }
 
     /// Set whether the button is active.
     pub fn set_active(&mut self, active: bool) {
         self.active = active;
+    }
+
+    /// Return the size that the button takes: its label with padding, in the
+    /// rows of its look.
+    pub fn size(&self) -> Size {
+        Size::new(
+            text::width(&self.label).saturating_add(PADDING * 2),
+            self.look.rows(),
+        )
     }
 
     /// Trigger the button action.
@@ -126,18 +187,14 @@ impl Button {
         let Some(command) = self.command.as_ref() else {
             return Ok(());
         };
-        // A click puts focus on the button first. The action can close a modal,
-        // remove the button, or move focus itself, so focusing afterwards would
-        // undo what it did. A direct or keyboard call has no pointer to follow
-        // and leaves focus alone.
+        // A click puts focus on the button first. The action runs after the
+        // press returns, and can move focus itself, so it keeps the last word.
+        // A direct or keyboard call has no pointer to follow and leaves focus
+        // alone.
         if ctx.current_mouse_event().is_some() {
             ctx.set_focus(ctx.node_id())?;
         }
-        ctx.dispatch(
-            command.target.unwrap_or(CommandTarget::From(ctx.node_id())),
-            &command.invocation,
-        )?;
-        Ok(())
+        ctx.post(command)
     }
 
     /// Report the configured action's eligibility as this command's own.
@@ -149,57 +206,147 @@ impl Button {
         Ok(self.command_status(ctx)?.unwrap_or(CommandStatus::Enabled))
     }
 
-    /// Compute the label width in terminal cells.
-    fn label_width(&self) -> u32 {
-        self.label
-            .lines()
-            .map(UnicodeWidthStr::width)
-            .max()
-            .unwrap_or(0)
-            .max(1) as u32
-    }
-
     /// Read command eligibility without conflating it with the active state.
     fn command_status(&self, ctx: &dyn ViewContext) -> Result<Option<CommandStatus>> {
-        if self.command.is_some() && !ctx.is_attached_of(ctx.node_id()) {
+        if self.command.is_some() && !ctx.is_attached(ctx.node_id()) {
             return Ok(Some(CommandStatus::Disabled("Button is detached".into())));
         }
         self.command
             .as_ref()
-            .map(|command| {
-                ctx.command_status(
-                    command.target.unwrap_or(CommandTarget::From(ctx.node_id())),
-                    &command.invocation,
-                )
-            })
+            .map(|command| ctx.command_status(command))
             .transpose()
     }
 
-    /// Sync the label text widget to the current label.
-    fn sync_label(&self, ctx: &mut dyn Context) -> Result<()> {
-        let box_id = ctx.get_or_create_slot::<BoxSlot>(|| {
-            Border::new()
-                .with_glyphs(self.glyphs)
-                .with_border_style(roles::BUTTON_BORDER)
-                .with_fill()
-        })?;
-        let center_id = ctx.get_or_create_slot_of::<CenterSlot>(box_id, Center::new)?;
-        let label_id = ctx.get_or_create_slot_of::<LabelSlot>(center_id, ButtonLabel::default)?;
-        let label = self.label.clone();
-        let accelerator = self.accelerator;
-        ctx.with_widget_mut(label_id, |text: &mut ButtonLabel, _| {
-            text.set_label(label, accelerator);
-            Ok(())
-        })?;
-        ctx.set_layout_of(label_id, Layout::column().max_width(self.label_width()))?;
+    /// Return the state that the button shows, by precedence: a disabled
+    /// action, then the active state, then focus.
+    fn state(&self, ctx: &dyn ViewContext) -> Result<Option<WidgetState>> {
+        Ok(
+            if matches!(self.command_status(ctx)?, Some(CommandStatus::Disabled(_))) {
+                Some(WidgetState::Disabled)
+            } else if self.active {
+                Some(WidgetState::Pressed)
+            } else if ctx.is_on_focus_path(ctx.node_id()) {
+                Some(WidgetState::Focused)
+            } else {
+                None
+            },
+        )
+    }
+
+    /// Draw the label on the middle row of `area`, centred between the
+    /// padding, with its accelerator highlighted.
+    fn draw_label(&self, render: &mut Render, area: Rect) -> Result<()> {
+        let prefix = self.look.label_prefix();
+        let room = area.w.saturating_sub(PADDING * 2).max(1).min(area.w);
+        let shown = text::truncate_end(&self.label, room as usize);
+        let width = text::width(&shown);
+        let x = area.tl.x + area.w.saturating_sub(width) / 2;
+        let y = area.tl.y + area.h / 2;
+        render.text(
+            &format!("{prefix}{}", roles::TEXT),
+            Line::new(x, y, width),
+            &shown,
+        )?;
+        let Some(range) = self
+            .accelerator
+            .and_then(|key| accelerator_range(&self.label, key))
+        else {
+            return Ok(());
+        };
+        // A clipped label spends its last column on the marker, so only the
+        // columns before it still spell the original characters.
+        let kept = width.saturating_sub(u32::from(matches!(shown, Cow::Owned(_))));
+        let column = text::width(&self.label[..range.start]);
+        let key_width = text::width(&self.label[range.clone()]);
+        if column.saturating_add(key_width) > kept {
+            return Ok(());
+        }
+        render.text(
+            &format!("{prefix}{}", roles::KEY),
+            Line::new(x.saturating_add(column), y, key_width),
+            &self.label[range],
+        )
+    }
+
+    /// Draw the inset edges: half and quarter blocks in the face color on
+    /// the ground around the button.
+    fn draw_inset(render: &mut Render, area: Rect) -> Result<()> {
+        let right = area.tl.x + area.w - 1;
+        let bottom = area.tl.y + area.h - 1;
+        let span = area.w.saturating_sub(2);
+        let row = |render: &mut Render, y: u32, left: char, middle: char, end: char| {
+            render.text("face/edge", Line::new(area.tl.x, y, 1), &left.to_string())?;
+            render.fill("face/edge", Rect::new(area.tl.x + 1, y, span, 1), middle)?;
+            render.text("face/edge", Line::new(right, y, 1), &end.to_string())
+        };
+        if area.h >= 2 {
+            row(render, area.tl.y, '▗', '▄', '▖')?;
+            row(render, bottom, '▝', '▀', '▘')?;
+        }
+        let first = if area.h >= 2 {
+            area.tl.y + 1
+        } else {
+            area.tl.y
+        };
+        let last = if area.h >= 2 { bottom } else { area.tl.y + 1 };
+        for y in first..last {
+            render.text("face/edge", Line::new(area.tl.x, y, 1), "▐")?;
+            render.text("face/edge", Line::new(right, y, 1), "▌")?;
+        }
         Ok(())
+    }
+
+    /// Draw a box border of `glyphs` around `area`.
+    fn draw_border(render: &mut Render, area: Rect, glyphs: BoxGlyphs) -> Result<()> {
+        let right = area.tl.x + area.w - 1;
+        let bottom = area.tl.y + area.h - 1;
+        let span = area.w.saturating_sub(2);
+        let border = roles::BORDER;
+        render.text(
+            border,
+            Line::new(area.tl.x, area.tl.y, 1),
+            &glyphs.topleft.to_string(),
+        )?;
+        render.fill(
+            border,
+            Rect::new(area.tl.x + 1, area.tl.y, span, 1),
+            glyphs.horizontal,
+        )?;
+        render.text(
+            border,
+            Line::new(right, area.tl.y, 1),
+            &glyphs.topright.to_string(),
+        )?;
+        for y in area.tl.y + 1..bottom {
+            render.text(
+                border,
+                Line::new(area.tl.x, y, 1),
+                &glyphs.vertical.to_string(),
+            )?;
+            render.text(border, Line::new(right, y, 1), &glyphs.vertical.to_string())?;
+        }
+        render.text(
+            border,
+            Line::new(area.tl.x, bottom, 1),
+            &glyphs.bottomleft.to_string(),
+        )?;
+        render.fill(
+            border,
+            Rect::new(area.tl.x + 1, bottom, span, 1),
+            glyphs.horizontal,
+        )?;
+        render.text(
+            border,
+            Line::new(right, bottom, 1),
+            &glyphs.bottomright.to_string(),
+        )
     }
 }
 
-impl Loader for Button {
-    fn load(canopy: &mut Canopy) -> Result<()> {
-        canopy.add_commands::<Self>()?;
-        canopy.register_default_bindings("button", DEFAULT_BINDINGS)
+impl Register for Button {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        setup.register_default_bindings("button", DEFAULT_BINDINGS)
     }
 }
 
@@ -208,13 +355,19 @@ impl Widget for Button {
         Ok(WidgetSemantics {
             role: Some("button".into()),
             label: Some(self.label.clone()),
-            action_status: self.command_status(ctx)?,
+            activation_status: self.command_status(ctx)?,
             ..WidgetSemantics::default()
         })
     }
 
     fn layout(&self) -> Layout {
-        Layout::fill()
+        Layout::column()
+    }
+
+    fn measure(&self, c: MeasureConstraints) -> Measurement {
+        // A button is a fixed shape around one line, so a narrower offer
+        // clips the label rather than wrapping it.
+        c.clamp(self.size())
     }
 
     /// Take focus only when there is something to activate.
@@ -225,101 +378,45 @@ impl Widget for Button {
         self.command.is_some()
     }
 
-    fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
-        self.sync_label(ctx)
-    }
-
     fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
-        rndr.push_layer(roles::BUTTON);
-        if self.active {
-            rndr.push_layer(WidgetState::Pressed.layer());
+        rndr.push_layer("button");
+        if let Some(state) = self.state(ctx)? {
+            rndr.push_layer(state.layer());
         }
-        if ctx.is_on_focus_path() {
-            rndr.push_layer(WidgetState::Focused.layer());
-        }
-        if matches!(self.command_status(ctx)?, Some(CommandStatus::Disabled(_))) {
-            rndr.push_layer(WidgetState::Disabled.layer());
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> NodeName {
-        NodeName::convert("button")
-    }
-}
-
-/// The label inside a button, with at most one highlighted character.
-///
-/// [`Text`](crate::Text) paints one style across a line, and a mnemonic needs
-/// two. This stays private, so the button keeps its border and centring
-/// composition and no other widget inherits a one-off renderer.
-#[derive(Default)]
-pub struct ButtonLabel {
-    /// Text on the button.
-    label: String,
-    /// Byte range of the highlighted grapheme, when the label has one.
-    accelerator: Option<Range<usize>>,
-}
-
-impl ButtonLabel {
-    /// Show `label`, highlighting the first character `accelerator` names.
-    fn set_label(&mut self, label: String, accelerator: Option<char>) {
-        self.accelerator = accelerator.and_then(|key| accelerator_range(&label, key));
-        self.label = label;
-    }
-}
-
-impl Widget for ButtonLabel {
-    fn layout(&self) -> Layout {
-        Layout::fill()
-    }
-
-    fn measure(&self, c: MeasureConstraints) -> Measurement {
-        // One row, as wide as the label. A narrower offer clips rather than
-        // wraps, because a button is a fixed shape around one line.
-        c.clamp(Size::new(
-            u32::try_from(text::display_width(&self.label)).unwrap_or(u32::MAX),
-            1,
-        ))
-    }
-
-    fn render(&mut self, render: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
         let area = ctx.view().view_rect_local();
         if area.w == 0 || area.h == 0 {
             return Ok(());
         }
-        let budget = area.w as usize;
-        let shown = text::truncate_end(&self.label, budget);
-        let line = area.line(0)?;
-        render.text(roles::BUTTON_LABEL, line, &shown)?;
-
-        let Some(range) = self.accelerator.clone() else {
-            return Ok(());
-        };
-        // A clipped label spends its last column on the marker, so only the
-        // columns before it still spell the original characters.
-        let kept =
-            text::display_width(&shown).saturating_sub(usize::from(matches!(shown, Cow::Owned(_))));
-        let column = text::display_width(&self.label[..range.start]);
-        let width = text::display_width(&self.label[range.clone()]);
-        if column.saturating_add(width) > kept {
-            return Ok(());
+        match self.look {
+            ButtonLook::Solid => rndr.fill("face", area, ' ')?,
+            ButtonLook::Inset => {
+                rndr.fill("face", area, ' ')?;
+                Self::draw_inset(rndr, area)?;
+            }
+            ButtonLook::Bevel => {
+                rndr.fill("face", area, ' ')?;
+                if area.h >= 3 {
+                    let bottom = area.tl.y + area.h - 1;
+                    rndr.fill(
+                        "face/highlight",
+                        Rect::new(area.tl.x, area.tl.y, area.w, 1),
+                        '▔',
+                    )?;
+                    rndr.fill("face/shadow", Rect::new(area.tl.x, bottom, area.w, 1), '▁')?;
+                }
+            }
+            ButtonLook::Bordered(glyphs) => {
+                rndr.fill("fill", area, ' ')?;
+                if area.h >= 3 && area.w >= 2 {
+                    Self::draw_border(rndr, area, glyphs)?;
+                }
+            }
         }
-        render.text(
-            roles::BUTTON_KEY,
-            Line::new(
-                line.tl
-                    .x
-                    .saturating_add(u32::try_from(column).unwrap_or(u32::MAX)),
-                line.tl.y,
-                u32::try_from(width).unwrap_or(u32::MAX),
-            ),
-            &self.label[range],
-        )
+        self.draw_label(rndr, area)
     }
 
     fn name(&self) -> NodeName {
-        NodeName::convert("button_label")
+        NodeName::convert("button")
     }
 }
 
@@ -353,15 +450,19 @@ fn names_grapheme(grapheme: &str, accelerator: char) -> bool {
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Canopy, FocusDirection, FocusScope, FrameworkBindingGroup, InputSpec, Loader,
-        ModalBindings, ModalOptions, NodeId, ViewContextExt,
-        commands::CommandError,
+        ContextExt, NodeId, Register, Setup, ViewContextExt,
+        commands::{CommandError, CommandTarget},
         error::Error,
-        event::{key, key::Key, mouse, mouse::Mouse},
         geom::PointI32,
+        input::{
+            BindingAction, BindingOptions, BindingPhase, BindingTier, FrameworkBindingGroup,
+            InputSpec, ModalBindings, ModalOptions, key, key::Key, mouse, mouse::Mouse,
+        },
         layout::Direction,
+        runtime::NoticeSource,
         style::Color,
         testing::harness::Harness,
+        tree::{FocusDirection, FocusScope},
     };
 
     use super::*;
@@ -402,34 +503,35 @@ mod tests {
     impl Widget for ActionOwner {
         fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
             let mut button = Button::new("Save").with_command(
-                Self::cmd_activate()
+                Self::spec_activate()
                     .call()
                     .with_target(CommandTarget::Exact(ctx.node_id())),
             );
             button.set_active(true);
-            ctx.add_child(button)?;
+            ctx.add_child(ctx.node_id(), button)?;
             Ok(())
         }
     }
 
-    impl Loader for ActionOwner {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Button::load(canopy)?;
-            canopy.add_commands::<Self>()
+    impl Register for ActionOwner {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)?;
+            setup.add_commands::<Self>()
         }
     }
 
     /// Build a harness whose application installed the button defaults.
     ///
-    /// Loading registers the script; an application runs it, and so does a
+    /// Registration adds the script; an application runs it, and so does a
     /// test, before any configuration that might replace a binding.
-    fn activating<W: Widget + Loader + 'static>(
+    fn activating<W: Widget + Register + 'static>(
         root: W,
         width: u32,
         height: u32,
     ) -> Result<Harness> {
         let mut harness = Harness::builder(root)
-            .bindings("button-defaults", "button.default_bindings()")
+            .register::<W>()
+            .script("button-defaults", "button.default_bindings()")
             .size(width, height)
             .build()?;
         harness.render()?;
@@ -457,7 +559,7 @@ mod tests {
     fn the_button(harness: &Harness) -> NodeId {
         harness
             .canopy
-            .with_root_view(|ctx| ctx.unique_descendant::<Button>())
+            .with_root_view(|ctx| ctx.unique_descendant::<Button>(ctx.node_id()))
             .expect("button lookup")
             .expect("button mounted")
             .into()
@@ -476,7 +578,7 @@ mod tests {
                 assert_eq!(active.label.as_deref(), Some("Save"));
                 assert_eq!(active.selected, None);
                 assert_eq!(
-                    active.action_status,
+                    active.activation_status,
                     Some(CommandStatus::Disabled("Unavailable".into()))
                 );
                 Ok(())
@@ -489,10 +591,11 @@ mod tests {
 
     impl Widget for ActionScene {
         fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
-            let owner = ctx.add_child(ActionOwner::default())?;
+            let owner = ctx.add_child(ctx.node_id(), ActionOwner::default())?;
             ctx.add_child(
+                ctx.node_id(),
                 Button::new("External action").with_command(
-                    ActionOwner::cmd_activate()
+                    ActionOwner::spec_activate()
                         .call()
                         .with_target(CommandTarget::Exact(owner.into())),
                 ),
@@ -501,17 +604,20 @@ mod tests {
         }
     }
 
-    impl Loader for ActionScene {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            ActionOwner::load(canopy)
+    impl Register for ActionScene {
+        fn register(setup: &mut Setup) -> Result<()> {
+            ActionOwner::register(setup)
         }
     }
 
     #[test]
     fn detached_buttons_and_removed_targets_still_publish() -> Result<()> {
-        let mut harness = Harness::builder(ActionScene).size(20, 4).build()?;
-        let (owner, button) = harness.with_root_context(|_: &mut ActionScene, ctx| {
-            let children = ctx.children();
+        let mut harness = Harness::builder(ActionScene)
+            .register::<ActionScene>()
+            .size(20, 4)
+            .build()?;
+        let (owner, button) = harness.with_root_widget_context(|_: &mut ActionScene, ctx| {
+            let children = ctx.children_of(ctx.node_id());
             Ok((children[0], children[1]))
         })?;
         harness.canopy.with_root_context(|ctx| ctx.detach(button))?;
@@ -527,7 +633,7 @@ mod tests {
             .expect("button retained");
         assert!(!detached.attached);
         assert!(matches!(
-            detached.semantics.action_status,
+            detached.semantics.activation_status,
             Some(CommandStatus::Disabled(_))
         ));
         harness.canopy.with_root_context(|ctx| {
@@ -543,51 +649,68 @@ mod tests {
             .expect("button retained");
         assert!(live.attached);
         assert!(matches!(
-            live.semantics.action_status,
+            live.semantics.activation_status,
             Some(CommandStatus::Disabled(_))
         ));
         Ok(())
     }
 
+    /// Return the rows of a button of `look`, drawn alone in its own size.
+    fn drawn(look: ButtonLook) -> Result<Vec<String>> {
+        let button = Button::new("Save").with_look(look);
+        let size = button.size();
+        let mut harness = Harness::builder(button)
+            .register::<Button>()
+            .size(size.w, size.h)
+            .build()?;
+        harness.render()?;
+        Ok(harness.tbuf().lines())
+    }
+
     #[test]
-    fn button_label_role_survives_an_extra_center() -> Result<()> {
+    fn each_look_draws_its_shape_around_the_centred_label() -> Result<()> {
+        assert_eq!(drawn(ButtonLook::Solid)?, ["  Save  "]);
+        assert_eq!(
+            drawn(ButtonLook::Inset)?,
+            ["▗▄▄▄▄▄▄▖", "▐ Save ▌", "▝▀▀▀▀▀▀▘"]
+        );
+        assert_eq!(
+            drawn(ButtonLook::Bevel)?,
+            ["▔▔▔▔▔▔▔▔", "  Save  ", "▁▁▁▁▁▁▁▁"]
+        );
+        assert_eq!(
+            drawn(ButtonLook::Bordered(BoxGlyphs::ROUND))?,
+            ["╭──────╮", "│ Save │", "╰──────╯"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_filled_button_paints_its_face_and_its_state() -> Result<()> {
         let mut harness = activating(ActionOwner::default(), 20, 4)?;
         harness
             .canopy
             .style_mut()
             .rules()
-            .fg("button/active/text", Color::Red)
+            .bg("button/disabled/face/text", Color::Red)
+            .fg("button/disabled/face/text", Color::Blue)
             .apply();
         harness.render()?;
-        let label_style = |harness: &Harness| {
+        let cell = |ch: char| {
             harness
                 .canopy
                 .snapshot()
                 .expect("published button")
-                .cells
+                .buffer
+                .cells()
                 .iter()
-                .find(|cell| cell.ch == 'S')
-                .expect("Save label")
+                .find(|cell| cell.ch == ch)
+                .expect("label cell")
                 .style
         };
-        let before = label_style(&harness);
-        harness.with_root_context(|_: &mut ActionOwner, ctx| {
-            ctx.with_unique_descendant::<Button, _>(|_, ctx| {
-                let border = ctx.get_slot::<BoxSlot>()?.expect("button border");
-                let center = ctx
-                    .get_slot_of::<CenterSlot>(border)?
-                    .expect("label center");
-                let label = ctx.get_slot_of::<LabelSlot>(center)?.expect("button label");
-                ctx.edit_structure(&mut |ctx| {
-                    let wrapper = ctx.create_detached(Center::new())?;
-                    ctx.detach(label.into())?;
-                    ctx.attach(wrapper.into(), label.into())?;
-                    ctx.attach(center.into(), wrapper.into())
-                })
-            })
-        })?;
-        harness.render()?;
-        assert_eq!(label_style(&harness), before);
+        // The action is disabled, so the label takes the face of that state.
+        assert_eq!(cell('S').fg, Color::Blue);
+        assert_eq!(cell('S').bg, Color::Red);
         Ok(())
     }
 
@@ -602,17 +725,15 @@ mod tests {
             5,
         )?;
         let button = the_button(&harness);
-        let label = harness
-            .find_nodes("**/button/**/button_label")?
-            .first()
-            .copied()
-            .expect("button label");
-
-        // The border and the label are separate nodes, so a click on either
-        // must still reach the button that contains them.
-        assert_ne!(origin(&harness, button), origin(&harness, label));
-        harness.mouse(press_at(origin(&harness, button)))?;
-        harness.mouse(press_at(origin(&harness, label)))?;
+        // The padding is the button's own, so a click beside the label and a
+        // click on it both reach the button.
+        let corner = origin(&harness, button);
+        let label = PointI32 {
+            x: corner.x + 3,
+            y: corner.y,
+        };
+        harness.mouse(press_at(corner))?;
+        harness.mouse(press_at(label))?;
         harness.with_root_widget(|owner: &mut ActionOwner| assert_eq!(owner.activations, 2));
         Ok(())
     }
@@ -643,6 +764,7 @@ mod tests {
             let owner = ctx.node_id();
             for tag in [1, 2] {
                 ctx.add_child(
+                    ctx.node_id(),
                     Button::new(format!("Button {tag}")).with_command(
                         Self::call_note(tag).with_target(CommandTarget::Exact(owner)),
                     ),
@@ -656,10 +778,10 @@ mod tests {
         }
     }
 
-    impl Loader for Tally {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Button::load(canopy)?;
-            canopy.add_commands::<Self>()
+    impl Register for Tally {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)?;
+            setup.add_commands::<Self>()
         }
     }
 
@@ -736,22 +858,25 @@ mod tests {
         harness.mouse(press_at(location))?;
         harness.with_root_widget(|owner: &mut ActionOwner| assert_eq!(owner.activations, 1));
 
-        // A direct call still reports the reason rather than doing nothing.
+        // A direct call posts the action, so the press itself succeeds, and
+        // the reason arrives when the boundary around the call completes.
         let button = the_button(&harness);
-        harness.canopy.with_context(button, |ctx| {
+        let result = harness.canopy.with_context(button, |ctx| {
             ctx.with_widget_mut(button, |button: &mut Button, ctx| {
-                assert!(matches!(
-                    button.press(ctx),
-                    Err(Error::Command(CommandError::Disabled { .. }))
-                ));
+                assert!(button.press(ctx).is_ok(), "the press only posts");
                 Ok(())
             })
-        })?;
+        });
+        assert!(matches!(
+            result,
+            Err(Error::Command(CommandError::Disabled { .. }))
+        ));
+        harness.with_root_widget(|owner: &mut ActionOwner| assert_eq!(owner.activations, 1));
         Ok(())
     }
 
     #[test]
-    fn activation_propagates_action_errors() -> Result<()> {
+    fn activation_reports_action_errors_as_notices() -> Result<()> {
         let mut harness = activating(
             ActionOwner {
                 enabled: true,
@@ -762,8 +887,80 @@ mod tests {
             5,
         )?;
         let location = origin(&harness, the_button(&harness));
-        assert!(harness.mouse(press_at(location)).is_err());
+        harness.mouse(press_at(location))?;
         harness.with_root_widget(|owner: &mut ActionOwner| assert_eq!(owner.activations, 1));
+        let notice = harness
+            .canopy
+            .notices()
+            .last()
+            .expect("the failed activation is a notice");
+        assert_eq!(notice.source, NoticeSource::Binding);
+        Ok(())
+    }
+
+    /// Root whose button removes itself, reading the click that pressed it.
+    #[derive(Default)]
+    struct Discarding {
+        /// The button, until its action removes it.
+        button: Option<NodeId>,
+        /// Actions of the clicks the action read.
+        clicks: Vec<mouse::Action>,
+    }
+
+    #[derive_commands]
+    impl Discarding {
+        /// Remove the button that ran this action.
+        #[command]
+        fn discard(&mut self, ctx: &mut dyn Context, event: mouse::MouseEvent) -> Result<()> {
+            self.clicks.push(event.action);
+            if let Some(button) = self.button.take() {
+                ctx.remove_subtree(button)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Widget for Discarding {
+        fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
+            let mut button = Button::new("Close").with_command(
+                Self::spec_discard()
+                    .call()
+                    .with_target(CommandTarget::Exact(ctx.node_id())),
+            );
+            button.set_active(true);
+            self.button = Some(ctx.add_child(ctx.node_id(), button)?.into());
+            Ok(())
+        }
+    }
+
+    impl Register for Discarding {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)?;
+            setup.add_commands::<Self>()
+        }
+    }
+
+    #[test]
+    fn an_action_can_remove_its_button_and_read_its_click() -> Result<()> {
+        let mut harness = activating(Discarding::default(), 20, 5)?;
+        let button = the_button(&harness);
+        harness.mouse(press_at(origin(&harness, button)))?;
+        harness.with_root_widget(|root: &mut Discarding| {
+            assert_eq!(
+                root.clicks,
+                [mouse::Action::Down],
+                "the action read the click"
+            );
+            assert_eq!(root.button, None);
+        });
+        let gone = harness
+            .canopy
+            .with_root_view(|ctx| ctx.type_id_of(button).is_none());
+        assert!(gone, "the button's own action removed it");
+        assert!(
+            harness.canopy.notices().is_empty(),
+            "removal raised nothing"
+        );
         Ok(())
     }
 
@@ -797,14 +994,14 @@ mod tests {
 
     impl Widget for Decorative {
         fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
-            ctx.add_child(Button::new("Label only"))?;
+            ctx.add_child(ctx.node_id(), Button::new("Label only"))?;
             Ok(())
         }
     }
 
-    impl Loader for Decorative {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Button::load(canopy)
+    impl Register for Decorative {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)
         }
     }
 
@@ -854,8 +1051,9 @@ mod tests {
             let owner = ctx.node_id();
             self.button = Some(
                 ctx.add_child(
+                    ctx.node_id(),
                     Button::new("Dismiss").with_command(
-                        Self::cmd_dismiss()
+                        Self::spec_dismiss()
                             .call()
                             .with_target(CommandTarget::Exact(owner)),
                     ),
@@ -866,10 +1064,10 @@ mod tests {
         }
     }
 
-    impl Loader for SelfRemoving {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Button::load(canopy)?;
-            canopy.add_commands::<Self>()
+    impl Register for SelfRemoving {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)?;
+            setup.add_commands::<Self>()
         }
     }
 
@@ -914,14 +1112,14 @@ mod tests {
 
     impl Widget for Mnemonic {
         fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
-            ctx.add_child(Button::new(self.0).with_accelerator(self.1))?;
+            ctx.add_child(ctx.node_id(), Button::new(self.0).with_accelerator(self.1))?;
             Ok(())
         }
     }
 
-    impl Loader for Mnemonic {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Button::load(canopy)
+    impl Register for Mnemonic {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)
         }
     }
 
@@ -944,7 +1142,8 @@ mod tests {
             let snapshot = harness.canopy.snapshot().expect("published button");
             let style_of = |needle: char| {
                 snapshot
-                    .cells
+                    .buffer
+                    .cells()
                     .iter()
                     .find(|cell| cell.ch == needle)
                     .map(|cell| (cell.style.fg, cell.style.attrs))
@@ -964,7 +1163,8 @@ mod tests {
             .chars()
             .map(|needle| {
                 snapshot
-                    .cells
+                    .buffer
+                    .cells()
                     .iter()
                     .find(|cell| cell.ch == needle)
                     .map(|cell| (cell.style.fg, cell.style.attrs))
@@ -995,7 +1195,7 @@ mod tests {
         );
         let snapshot = harness.canopy.snapshot().expect("published button");
         assert!(
-            !snapshot.cells.iter().any(|cell| cell.ch == 'm'),
+            !snapshot.buffer.cells().iter().any(|cell| cell.ch == 'm'),
             "a key clipped away is not painted somewhere else"
         );
         Ok(())
@@ -1004,7 +1204,7 @@ mod tests {
     /// Framework group admitted while the guarded dialog is open.
     const GUARDED: FrameworkBindingGroup = FrameworkBindingGroup::new("button.test_dialog");
 
-    /// Root with a dialog it opens as an exclusive modal.
+    /// Root with a dialog it opens as a framework-group modal.
     #[derive(Default)]
     struct Guarded {
         /// Times the dialog's button ran its action.
@@ -1027,8 +1227,8 @@ mod tests {
     impl Widget for Guarded {
         fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
             let owner = ctx.node_id();
-            let dialog = ctx.add_child(Container::column().with_name("dialog"))?;
-            let button = ctx.add_child_to(
+            let dialog = ctx.add_child(ctx.node_id(), Container::column().with_name("dialog"))?;
+            let button = ctx.add_child(
                 dialog,
                 Button::new("Accept")
                     .with_command(Self::call_accept().with_target(CommandTarget::Exact(owner))),
@@ -1039,29 +1239,29 @@ mod tests {
         }
     }
 
-    impl Loader for Guarded {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Button::load(canopy)?;
-            canopy.add_commands::<Self>()?;
-            // The dialog owns activation inside its own group, because an
-            // exclusive scope admits nothing else. The records are the same
-            // three inputs, on a path of the dialog's own.
+    impl Register for Guarded {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Button::register(setup)?;
+            setup.add_commands::<Self>()?;
+            // The dialog owns activation inside its own group, because a
+            // framework-group modal admits nothing else. The records are the
+            // same three inputs, on a path of the dialog's own.
             for (input, description) in [
                 (InputSpec::Key(Key::parse_spec("Enter")?), "Activate"),
                 (InputSpec::Key(Key::parse_spec("Space")?), "Activate"),
                 (InputSpec::Mouse(Mouse::parse_spec("LeftDown")?), "Activate"),
             ] {
-                canopy.bind_framework(
-                    GUARDED,
+                setup.bind(
                     input,
-                    canopy::BindingOptions {
+                    BindingOptions {
+                        show_in_help: true,
                         path: Some("**/dialog/**/".parse()?),
-                        scope: canopy::BindingScope::Exclusive(GUARDED),
+                        tier: BindingTier::Framework(GUARDED),
                         description: description.to_string(),
                         source: None,
-                        phase: canopy::BindingPhase::AfterWidget,
+                        phase: Some(BindingPhase::AfterWidget),
                     },
-                    Button::call_press(),
+                    BindingAction::Command(Button::call_press()),
                 )?;
             }
             Ok(())
@@ -1069,15 +1269,16 @@ mod tests {
     }
 
     #[test]
-    fn an_exclusive_modal_admits_only_its_own_activation_bindings() -> Result<()> {
+    fn a_framework_group_modal_admits_only_its_own_activation_bindings() -> Result<()> {
         let mut harness = activating(Guarded::default(), 20, 6)?;
-        let (owner, dialog, button) = harness.with_root_context(|guarded: &mut Guarded, ctx| {
-            Ok((
-                ctx.node_id(),
-                guarded.dialog.expect("dialog mounted"),
-                guarded.button.expect("button mounted"),
-            ))
-        })?;
+        let (owner, dialog, button) =
+            harness.with_root_widget_context(|guarded: &mut Guarded, ctx| {
+                Ok((
+                    ctx.node_id(),
+                    guarded.dialog.expect("dialog mounted"),
+                    guarded.button.expect("button mounted"),
+                ))
+            })?;
 
         // Outside the modal the ordinary defaults carry the click.
         harness.mouse(press_at(origin(&harness, button)))?;
@@ -1089,7 +1290,10 @@ mod tests {
                 modal: dialog,
                 initial_focus: button,
                 dim_target: None,
-                bindings: ModalBindings::Framework(GUARDED),
+                bindings: ModalBindings::Framework {
+                    groups: &[GUARDED],
+                    intents: &[],
+                },
             })?;
             Ok(())
         })?;
@@ -1151,25 +1355,14 @@ mod tests {
 
         // Rebinding the same selector replaces the default outright.
         harness.script(
-            r#"canopy.bind_mouse("LeftDown", {
+            r#"canopy.keymap({
                 path = "**/button/**/",
-                description = "Ignore the click",
-            }, function() end)"#,
+                { mouse = "LeftDown", description = "Ignore the click", action = function() end },
+            })"#,
         )?;
         harness.mouse(press_at(location))?;
         harness.with_root_widget(|owner: &mut ActionOwner| {
             assert_eq!(owner.activations, 0, "the override took the click");
-        });
-
-        // Loading again is idempotent and installs nothing, so a replaced
-        // binding stays replaced.
-        Button::load(&mut harness.canopy).expect_err("loading after finalization is refused");
-        harness.mouse(press_at(location))?;
-        harness.with_root_widget(|owner: &mut ActionOwner| {
-            assert_eq!(
-                owner.activations, 0,
-                "loading does not reinstall the default"
-            );
         });
         Ok(())
     }

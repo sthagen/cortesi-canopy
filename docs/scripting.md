@@ -7,27 +7,23 @@ that Rust code uses.
 
 ## Generated API
 
-`Canopy::finalize_api()` seals the command surface and renders the app's
-`.d.luau` definition text. `Canopy::script_api()` returns that text.
+`CanopyBuilder::build()` finalizes the script API. Finalization seals the
+command surface and renders the app's `.d.luau` definition text.
+`Canopy::script_api()` returns that text, and Luau `canopy.api()` returns the
+same text to scripts.
 
 Canopy renders the file from the same native modules it installs on the script
 surface, in install order:
 
 1. The header comment in `crates/canopy/luau/preamble.d.luau`.
-2. The base `canopy` module, which declares `NodeId`, `CommandCall`, `Point`,
-   `Size`, `Rect`, `SemanticIdentity`, `NodeInfo`, `TreeNode`, `CommandTarget`,
-   `CommandTargetInfo`, `BindOptions`, `KeymapEntry`, `Keymap`,
-   `UnbindSelector`, `MouseSpec`, `FixtureInfo`, `BindingInfo`,
-   `CommandParamInfo`, `CommandInfo`, `ScreenCell`, `RouteTraceEntry`,
-   `AvailableBinding`, `BindingSnapshot`, `ScriptAssertionInfo`,
-   `ScriptJournalEntry`, `SemanticActionStatus`, `WidgetSemantics`,
-   `NodeSnapshot`, `FrameSnapshot`, the `canopy` global, and `fixtures()`.
-3. Each module registered through `Canopy::register_script_module`.
-4. One module per widget owner, carrying its command table and default-binding
+2. The base `canopy` module, with its record types and the `canopy` global.
+   Read the current type list from `canopy.api()` or
+   `canopyctl api`.
+3. One module per widget owner, carrying its command table and default-binding
    helper.
-5. The `command` global, with one constructor per node command grouped by
+4. The `command` global, with one constructor per node command grouped by
    owner. An owner named `command` fails API finalization.
-6. Fixture comment lines.
+5. Fixture comment lines.
 
 The generated function signatures and the audited surface therefore cannot drift
 apart.
@@ -56,13 +52,16 @@ automation entry points must marshal work back to the UI thread before touching
 The shared runtime driver polls detached Luau invocations. It releases application,
 widget, and VM borrows between polls. Input, timers, node wakes, and bounded native
 automation can progress while an evaluation waits. Resumed segments retain their
-original script anchor. Focus-targeted calls resolve current focus when invoked.
+original script origin. Focus-targeted calls resolve current focus when invoked.
 
 Only one top-level evaluation may run at a time. Another evaluation or module
-reload fails with structured `ScriptBusy`. Live callers submit an `EvalRequest`
-through `AutomationHandle::submit_eval` and await the returned `EvalTicket` outside
-the UI thread. Its completion contains the value or error, logs, and assertions.
-Completion arrives through the original ticket after runtime preparation.
+reload fails with `ScriptBusy`. Live callers submit an `EvalRequest::new(source)`,
+optionally with a `timeout`, through `AutomationHandle::submit_eval` and await
+the returned `EvalTicket` outside the UI thread. An evaluation always starts at
+the root. Its completion, an `EvalOutcome`, is the one channel for the value or
+error, logs, assertions, and typecheck diagnostics: a source that fails to
+typecheck completes at once with its diagnostics and never runs. Completion
+arrives through the original ticket after runtime preparation.
 Dropping its completion receiver cancels queued or active work. Active work wakes
 the UI driver and records cancellation on the next turn.
 
@@ -87,20 +86,30 @@ unwinds.
 
 ## Commands
 
-Use explicit command targets in new scripts:
+A command is a typed operation that a widget type owns. Luau reaches it in two
+forms:
+
+- `owner.command(...)` runs the command now. It dispatches from the script
+  origin, which is the root for a top-level evaluation and the route node for
+  a binding.
+- `command.owner.command(...)` builds a `CommandCall` value and runs nothing.
+  A binding runs the call later.
+
+Both forms take positional arguments. A table is always one argument, even
+when its keys match parameter names.
+
+Three functions give an explicit target:
 
 - `canopy.call_exact(node, "owner::command", ...)` invokes only that owner.
-- `canopy.call_from(node, "owner::command", ...)` searches the origin subtree,
+- `canopy.call_from(node, "owner::command", ...)` searches the node's subtree,
   then its ancestors.
-- `canopy.call_focus("owner::command", ...)` resolves current focus at
-  invocation.
+- `canopy.call_focus("owner::command", ...)` resolves current focus when it
+  runs.
 
-These functions always use positional arguments. A table remains one argument,
-including an empty table or a map whose keys match parameter names. Use
-`canopy.call_named(id, fields, target?)` for explicit named arguments:
+`canopy.call_named(id, fields, target?)` takes named arguments:
 
 ```luau
-canopy.call_from(canopy.root(), "app::configure", { options = "dark" })
+app.configure({ options = "dark" })
 canopy.call_named("app::configure", { options = { options = "dark" } }, {
     kind = "exact", node = app_node,
 })
@@ -108,16 +117,9 @@ canopy.call_named("app::configure", { options = { options = "dark" } }, {
 
 Target tables accept `{ kind = "exact", node = id }`,
 `{ kind = "from", node = id }`, or `{ kind = "focus" }`. Omission uses the
-current script anchor.
-`canopy.commands(target?)` uses the same target policies. Exact dispatch
-rejects stale nodes, wrong owners, and free commands. It never searches for a
+script origin. `canopy.commands(target?)` uses the same target policies. Exact
+dispatch rejects stale nodes and wrong owners. It never searches for a
 replacement target.
-
-Legacy `owner.command(...)`, `canopy.cmd(id, ...)`, and `canopy.cmd_on(node,
-id, ...)` retain their decoding rules. A single table is interpreted as named
-arguments when its keys match user parameters. `cmd_on` retains relative
-subtree-and-ancestor search. Unqualified calls use the script anchor, which is
-root for top-level evaluation and the route node for bindings.
 
 Discovery reports resolution, eligibility, disabled reason, and missing event
 requirements separately. Dispatch rechecks eligibility before invoking the
@@ -134,42 +136,80 @@ become integers; other finite numbers remain floats; non-finite numbers fail
 conversion. Strings must be valid UTF-8. Empty tables become maps, dense
 positive integer tables become arrays, and string-keyed tables become maps.
 Sparse, mixed-key, and unsupported-key tables fail with a path to the nested
-value.
+value. An enum argument or result, such as a `FocusDirection`, is its variant
+name in snake_case, such as `"down"`. Parsing ignores ASCII case.
 
 Live `NodeId` userdata retains its process-local identity. A marshaled Node ID
 token is only an external data record and does not reconstruct that identity.
 
 ## Bindings
 
-A binding action is a `CommandCall` or a function. The `command` table holds
-one constructor for each node command, grouped by owner. A constructor has the
-parameters of the owner function and returns a `CommandCall` that a binding
-runs later. `command.file_select.select_by(1)` builds the call;
+A binding action is a `CommandCall`, a function, or the string name of a
+registered intent. The `command` table holds one constructor for each
+node command, grouped by owner. A constructor has the parameters of the owner
+function and returns a `CommandCall` that a binding runs later.
+`command.file_select.select_by(1)` builds the call;
 `file_select.select_by(1)` runs the command at once. A constructor checks its
 arguments, so a bad argument fails the binding call before it installs a
 binding. In a strict script the typechecker finds the same errors before the
 script runs. Keep functions for composed actions.
 
+A widget that implements an intent registers it with `Setup::register_intent`
+in its `Register` impl, before the script API finalizes. Registering the same
+intent again is harmless. A string action names one of those registered
+intents:
+
+```luau
+canopy.keymap({
+    { key = "ctrl-x", description = "Clear text", action = "canopy.clear" },
+})
+```
+
+An intent takes keys only and always runs `before_widget`, so an explicit
+`phase = "after_widget"` on one is an error. The route offers it to the widget
+at each route node. A widget that accepts it consumes the key, and a dormant
+intent lets the route fall through to the next binding. An
+unregistered name fails at binding registration. Registered names appear in the
+rendered `canopy.api()` and in `canopy.bindings()` output.
+
+Every application has the built-in navigation intents: `canopy.nav.up`,
+`down`, `left`, `right`, `page_up`, `page_down`, `first`, and `last`. A cursor
+widget (List, Selector, PickerList, an open Dropdown) moves its selection.
+Any other node on the route whose view can move scrolls, as the wheel does,
+and a view that cannot move declines. One keymap entry serves every
+scrollable and cursor widget on the focus route:
+
+```luau
+canopy.keymap({
+    { key = { "j", "Down" }, description = "Down", action = "canopy.nav.down" },
+    { key = "PageDown", description = "Page down", action = "canopy.nav.page_down" },
+})
+```
+
+Cursor widgets keep `select_by`, `select_first`, `select_last`, and `page`
+commands for scripts and buttons. A view off the focus route, such as a
+preview beside a list, is moved by an application command that calls
+`scroll_node`.
+
 Use `canopy.keymap` to write a keymap. The named fields of the table are the
-options shared by every entry: `mode`, `path`, `phase`, and `tier`. The array
+options shared by every entry: `mode`, `path`, `phase`, `tier`, and `show_in_help`. The array
 part holds the entries. An entry has `key` (one key spec or an array of key
 specs), `mouse` (one mouse spec or an array), a required `description`, and an
 `action`. An entry needs `key`, `mouse`, or both.
+
+Set `show_in_help = false` to omit a binding from shortcut help and menu hints.
+It defaults to `true`. A keymap entry can override its keymap's value. The
+binding still runs and appears in `canopy.bindings()` and
+`canopy.available_bindings()` with its `show_in_help` value.
 
 ```luau
 local fs = command.file_select
 
 canopy.keymap({
-    mode = "preview",
-    { key = "j", description = "Scroll down", action = fs.pan_preview("Down") },
-    { key = { "k", "Up" }, mouse = "ScrollUp", description = "Scroll up", action = fs.pan_preview("Up") },
-    {
-        key = "esc",
-        description = "Leave the preview",
-        action = function()
-            canopy.set_mode("")
-        end,
-    },
+    path = "preview",
+    { key = "j", description = "Scroll down", action = fs.pan_preview("down") },
+    { key = { "k", "Up" }, mouse = "ScrollUp", description = "Scroll up", action = fs.pan_preview("up") },
+    { key = "esc", description = "Leave the preview", action = fs.exit_preview() },
 })
 ```
 
@@ -181,40 +221,71 @@ order, so a later entry wins a precedence tie. Every binding records the
 `canopy.keymap` call site as its source. The call returns the binding IDs in
 entry order, key bindings before mouse bindings within an entry.
 
-Use `canopy.bind(key, options, action)` and `canopy.bind_mouse(mouse, options,
-action)` for one binding. The options table is required. Its `description`
-field must contain user-facing text. The optional `path` field limits a binding
+Use `canopy.bind(key, options, action)` for one key binding, and a
+`canopy.keymap` entry with `mouse` for a mouse binding. The options table is
+required. Its `description` field must contain user-facing text. The optional `path` field limits a binding
 to matching route paths. The optional `mode` field puts a binding in a named
 mode. Set `tier = "global"` for a global binding; a global binding cannot also
 name a mode, and its path must be anchored at both ends.
 
 ```luau
-canopy.bind("?", {
+canopy.bind("Ctrl+g", {
     description = "Show key bindings",
+    show_in_help = false,
     path = "/root/**/",
     tier = "global",
     phase = "before_widget",
 }, command.root.toggle_help())
 ```
 
-`canopy.set_mode(mode)` replaces the active modes with one mode, and the empty
-string returns to the default mode. `canopy.push_mode(mode)` adds a mode above
-the active modes, and `canopy.pop_mode()` removes the newest one. A key that
-the newest mode does not bind falls through to the older modes and then to the
-default scope.
+`Ctrl+g` is Canopy's standard help key. A control chord reaches its binding
+even while a text field has focus, where `?` is a character to insert.
 
-Pass `{ transient = true }` to `canopy.push_mode` for a mode that takes only
-the next key:
+### Key scope
+
+Keys that belong to one pane follow focus. Put focus in the pane, and scope its
+keys with `path`. The keys then apply while focus is on or inside the pane, and
+help follows focus without further work. Use a mode only for a state that no
+widget holds, such as a menu or an input mode that the script alone controls.
+Do not copy widget state into a mode: when the widget changes that state, the
+mode stays behind.
+
+A path filter is a list of node names separated by `/`. A segment matches one
+node name, `*` matches any one name, and `**` matches any number of names. A
+leading `/` anchors the filter at the root, and a trailing `/` anchors it at the
+end of the path. Without anchors, the filter can match anywhere in the path.
+Routing checks the filter against the path of each node on the route, from the
+focus up to the root.
+
+The trailing anchor changes the scope. A filter such as `preview` matches the
+path of every node in the `preview` region. At the focused node, it therefore
+wins over an unfiltered binding of the same tier. A filter such as `preview/`
+matches only at the region's own node. When focus is on a descendant, an
+unfiltered binding wins there first.
+
+An `after_widget` binding runs only when the focused widget declines the key.
+For example, an `Input` declines Up, Down, PageUp, PageDown, and control chords,
+so the path keys of its region still see them.
+
+### Modes and menus
+
+`canopy.enter_mode(mode)` makes a mode the newest active mode. A mode that is
+already active moves to the top, so one name appears in the stack only once.
+`canopy.leave_mode(mode)` removes a mode wherever it is in the stack, and
+leaving a mode that is not active changes nothing. `canopy.mode()` returns the
+newest active mode, or the empty string for the default mode, and
+`canopy.active_modes()` returns every active mode, newest first. A key that the
+newest mode does not bind falls through to the older modes and then to the
+default tier. No call clears every mode, so a script changes only the modes it
+names. Rust uses the same words: `Canopy::mode`, `enter_mode`, `leave_mode`,
+and `active_modes`.
+
+A menu is a mode that takes only the next key: it offers a choice of keys. Bind
+the key that opens one to `canopy.menu(mode)`:
 
 ```luau
 canopy.keymap({
-    {
-        key = "p",
-        description = "Pane commands",
-        action = function()
-            canopy.push_mode("panes", { transient = true })
-        end,
-    },
+    { key = "p", description = "Pane commands", action = canopy.menu("panes") },
 })
 
 canopy.keymap({
@@ -223,39 +294,97 @@ canopy.keymap({
 })
 ```
 
-The next key pops a transient mode. When the mode binds that key, the binding
-runs after the pop, so it can enter another mode. It runs before the focused
-widget sees the key, whatever its phase. Any other key only pops the mode, and
-does not fall through to older modes or to the default scope. Global bindings
-still apply. `Root` lists the keys of a transient mode in a small panel until
-the mode ends.
+The next key closes a menu. When the menu binds that key, the binding runs after
+the menu closes, so it can enter a mode or open another menu. It runs before the
+focused widget sees the key, whatever its phase. Any other key only closes the
+menu, and does not fall through to older modes or to the default tier. Global
+bindings still apply, and they also reach through every modal. `Root` lists the
+keys of a menu in a small panel until the menu closes, centred over the
+application and dimming it as a modal does.
 
-Native Rust uses generated typed `Widget::call_command(arguments...)` builders
-with `Canopy::bind_command`. `CommandCall::with_target` preserves exact,
-relative, or focus targeting when a Button, List, or native binding stores the
-action.
+An open menu is always the newest mode. `canopy.enter_mode` is an error while a
+menu waits for its key, and so is `canopy.leave_mode` with the menu's own name.
+A mouse binding cannot open another menu while one waits for its key.
+Opening a menu whose name is an active mode is an error, and the key that opens
+it reports the error as a notice. An empty name is an error for all three
+calls. A call that fails changes nothing, and mode hooks run only when the
+stack changes.
+
+A menu binding's action kind is `menu`, so help and the mode panel mark it
+with `...` after its description: a key that leads to another choice reads
+apart from a key that acts, and a description never spells the marker itself.
+`canopy.bindings()` reports a menu with `action = "menu"` and the mode it opens
+in `menu`.
+
+Native Rust installs bindings during setup with `Setup::bind(input, options,
+target)`. The target is a `BindingAction`: a command call built by a generated
+`Widget::call_command(arguments...)` builder, a registered intent, or a menu
+that names the mode it opens. The
+tier in the options decides the semantics: a framework tier is registered
+idempotently for the group it names, and an application tier replaces any
+binding with the same tier, input, and path. A `CommandCall` holds the command
+id, its arguments, and an optional target. `CommandCall::with_target` sets exact,
+relative, or focus targeting, and a Button, List, or native binding keeps it
+with the stored call. A call without a target resolves from its origin: the
+dispatching node, or the node where a binding wins.
 
 Set `phase = "before_widget"` to run before widget input, or `phase =
 "after_widget"` to run after the widget ignores input. Key and mouse bindings
 take either phase. The default phase is `after_widget`. Explicit phases do
-not change scope, specificity, or insertion ordering.
+not change tier, specificity, or insertion ordering.
 
 The registry keeps one flat record format for application and framework
 bindings. `canopy.bindings()` returns all records, including normalized input,
-owner, scope, path, description, source, and target kind.
+tier, path, description, source, target kind, and phase. The `tier` field is
+`framework`, `global`, `mode`, or `default`, in resolution order. A mode record
+also names its `mode`, and a framework record names its framework `group`.
 `canopy.available_bindings(node?)` returns an owned snapshot of the effective
 bindings for the specified node or current focus. The snapshot contains the
-focus path, active modes, the transient mode, the active exclusive framework
-group, one winning record per key in `bindings`, and one winning record per
-mouse input in `mouse_bindings`. Each winner includes its route path and
-whether it runs before the widget or after the widget ignores the input.
-Contextual help and automation use this same resolver as input routing.
+focus path, active modes, the transient mode, the `framework_group` that the
+open modal admits, one winning record per key in `bindings`, and one winning
+record per mouse input in `mouse_bindings`. Each winner includes its route path
+and phase. Contextual help and automation use this same resolver as input
+routing.
 
 A snapshot says what the named context would do with an input, not what the
 next event will do. The mouse route starts at the requested node, as a click on
 it would, and the pointer's own position plays no part: hit testing and mouse
-capture choose the real target. Discovery also cannot know whether a widget's
-own handler will consume an input before an `after_widget` binding sees it.
+capture choose the real target. Key discovery asks each widget's `key_outcome`
+along the route. A `Handle` prediction hides the `after_widget` bindings it
+would shadow, and `Ignore` lets the route continue. Every widget predicts its
+keys, so the key list is exact for the current state.
+
+`canopy.explain_key(key, node?)` analyzes one key without sending it. The record
+names the focus and path, and one step per examined node. A step has the
+widget prediction, `handle` or `ignore`, and an optional `binding` record with
+the selected binding's `id`, `target`, and `phase`. The `outcome` has a `kind`:
+`binding`, `transient`, `widget`, `transient_dismiss`, or `unhandled`. A
+`binding` or `transient` outcome names the winning `binding`, its `node` and
+`path`, its `target`, and its `phase`. A `widget` outcome names the consuming
+`node` and `path`. The explanation is advisory, because routing still acts one
+node at a time.
+
+`canopy.key_for(action)` returns the label of a key that reaches a
+`CommandCall` or a registered intent name from the current focus, such as
+`"ctrl+g"`, or nil when no key does. Messages and hints use it to name keys
+that follow the bindings rather than repeating them.
+
+`canopy.route_trace()` reports what routing actually did. Each entry has a
+`kind`: `start`, `before_widget_binding`, `offer_intent`, `widget`,
+`after_widget_binding`, `run_binding`, `default_action`, `bubble`, `handled`,
+`unhandled`, or `notice`. An intent offer traces as `offer_intent`. A
+`notice` entry ends a route whose binding or widget handler failed, and its
+detail is the notice's message. A `widget`
+entry that begins with "key prediction mismatch" marks a widget whose
+`key_outcome` disagreed with its result.
+
+`canopy.send_key_checked(key, expectation)` sends a key only when its analyzed
+route matches. An expectation is `{ kind = "widget", node = ... }`,
+`{ kind = "binding", binding = ... }`,
+`{ kind = "transient", binding = ... }`, `{ kind = "transient_dismiss" }`, or
+`{ kind = "unhandled" }`. A detached node or a mismatched outcome is rejected
+before delivery. During delivery a guard compares each step and stops before
+an unexpected consumer acts, without rolling back earlier steps.
 
 An `input` field is the spec a binding is written in, such as `Ctrl+LeftDown`
 or `ScrollUp`, so a reported label parses back to the record it names.
@@ -263,7 +392,8 @@ or `ScrollUp`, so a reported label parses back to the record it names.
 `canopy.unbind(id)` removes one binding. `canopy.unbind_key(key, options?)`
 removes matching application key bindings. Its optional selector has exact
 `mode` and `path` filters. `canopy.clear_bindings()` removes every application
-binding. Scripts cannot remove or replace framework-owned bindings.
+binding and clears the mode stack. Scripts cannot remove or replace
+framework-owned bindings.
 
 Registered widget default bindings appear as `owner.default_bindings()` in the
 generated API. Calling that helper installs the Rust-registered default binding
@@ -272,15 +402,20 @@ script for that owner.
 ## Persistent Modules
 
 `CanopyBuilder` makes setup order explicit. Its owned `configure` callbacks
-register commands, fixtures, and defaults before API finalization. Named
-`bindings` and `config` sources run next, in insertion order. Owned `assemble`
-callbacks then create the widget tree. `build()` consumes the builder and
-returns no application on failure. Native and database effects are not rolled
-back; retry with a fresh builder and suitable application resources.
+receive a `Setup` handle. `Setup` holds every registration that the API fixes
+when it finalizes: commands, default bindings, framework and application
+bindings, intents, startup scripts, fixtures, mode hooks, render limits,
+and the initial styles. A type registers what it needs in its `Register` impl.
+Named `bindings` and `config` sources run after finalization, in insertion
+order. Owned `assemble` callbacks then create the widget tree on the finalized
+`Canopy`. `build()` consumes the builder and returns no application on failure.
+Native and database effects are not rolled back; retry with a fresh builder and
+suitable application resources.
 
 Build does not prepare a frame or run startup. The first runtime preparation
 runs startup, calculates geometry, then invokes `on_start` before publication.
-The low-level `Canopy` setup APIs remain available.
+`CanopyBuilder` is the only way to construct an application, and the only way
+to register. Nothing registers after finalization.
 
 Builder user and project script roots default to disabled. Register each root
 with `user_script_root(path, ScriptTrust::TrustedLocal)` or
@@ -304,17 +439,10 @@ Rooted config and startup files keep one source identity through typechecking,
 compilation, loading, diagnostics, and tracebacks. `init.luau` maps to its
 mount root (`@user` or `@project`), matching directory-module resolution.
 
-`Canopy::invalidate_script_modules` refreshes one named root or every root.
-Invalidation also removes application key and mouse bindings and pending
-startup hooks because their retained function handles belong to the previous
-source epoch. Framework-owned bindings remain installed. The next script load
-prepares dependencies again, and re-running the startup scripts reinstalls the
-application bindings.
-
 ## Startup Scripts
 
 Startup scripts run once, after the app finalizes its script API. The layer
-order is: app scripts registered with `Canopy::register_startup_script`, then
+order is: app scripts registered with `Setup::register_startup_script`, then
 `@user/init.luau`, then `@project/init.luau`.
 
 Every startup root must define:
@@ -326,8 +454,7 @@ end
 
 Canopy typechecks startup roots against an obligated surface before execution.
 Missing or mismatched obligations fail startup with a diagnostic naming the
-global and required type. App code may add more obligations with
-`Canopy::require_startup_global(name, type_text)` before `finalize_api()`.
+global and required type.
 
 Keep top level startup code to imports, locals, and pure construction. Put side
 effects such as bindings, mode setup, and command calls inside `setup()`.
@@ -338,7 +465,7 @@ conformance contract; they do not need their own `setup`.
 
 Fixtures are named setup functions registered by Rust code. Automation tooling
 can apply a fixture before evaluation. The generated `.d.luau` file lists
-fixture names and descriptions as comments, and `fixtures()` returns them at
+fixture names and descriptions as comments, and `canopy.fixtures()` returns them at
 runtime.
 
 Headless MCP evaluation supports `fixture`. Live evaluation does not; live
@@ -347,6 +474,24 @@ callers must use the fixture tool before evaluating a script.
 ## Diagnostics
 
 `canopy.log(value)` appends a log line to the evaluation result.
+
+`canopy.notices()` returns the failures the application reported and survived,
+oldest first, up to the newest 32. A binding's command or callback, a widget's
+event or intent handler, or a widget's poll can fail this way. Each `Notice`
+record has a `message`, the failure's `kind` as script error payloads report
+it (`command_exec` for a failed command, `app` for an application error), a
+`source` of `binding`, `widget`, or `poll`, and the `node` when known. A key a
+script sends is input, so a failure it causes is a notice rather than a script
+error:
+
+```luau
+canopy.send_key("d")
+local notices = canopy.notices()
+canopy.assert(notices[#notices].message:find("trash failed") ~= nil)
+```
+
+A script call is not input, so `canopy.call` and the owner functions still
+raise a failing command's error in the script.
 
 `canopy.assert(condition, message?)` records an assertion result. A failed
 assertion also fails the script.
@@ -366,12 +511,11 @@ MCP evaluation returns:
 
 ## Waiting for State
 
-Use `canopy.wait_for(predicate, timeout_ms?)`,
-`canopy.wait_for_node(owner, timeout_ms?)`, or
-`canopy.wait_for_screen_text(text, timeout_ms?)` for asynchronous state changes.
-These helpers subscribe to snapshot publication and optional deadlines. They
-recheck before parking to avoid a lost publication wake. The runtime services
-input and automation between resumed segments. Wait helpers do not run their own
+Use `canopy.wait_for(predicate, timeout_ms?)` for asynchronous state changes.
+The predicate reads whatever the change shows, such as `canopy.target(owner)`
+or `canopy.screen_text()`. The wait subscribes to snapshot publication and
+optional deadlines. It rechecks before parking to avoid a lost publication wake. The runtime services
+input and automation between resumed segments. A wait does not run its own
 event loop or recursively service automation.
 
 Screen observation reads published cells. Refreshing a snapshot does not advance
@@ -389,7 +533,7 @@ Ruau associates them with a named source. Error diagnostics fail MCP evaluation
 before execution. MCP evaluation reports `ScriptCheckDiagnostic` unchanged, so
 the `source` field travels with each diagnostic in the `diagnostics` array.
 
-After `finalize_api()`, every compile typechecks the source against the
+After API finalization, every compile typechecks the source against the
 finalized surface in every build. Error diagnostics fail compilation with a
 parse error. Scripts compiled before finalization are only syntax-checked.
 
@@ -437,24 +581,46 @@ without disabling Tokio's cooperative budget.
 Use `canopy.snapshot()` to read one completed frame. It returns detached records
 for cells, focus, and every live arena node, including detached nodes. Reading a
 snapshot runs no hooks and does not advance its `frame_id`. It returns `nil`
-until a viewport has been prepared. A headless evaluation prepares its initial
+until a first frame has been prepared. A headless evaluation prepares its initial
 frame before running user source.
 
-After commands return, call `canopy.flush()` to publish pending changes. Calls
+After commands return, call `canopy.prepare()` to publish pending changes. Calls
 made while a native widget mutation callback holds its widget fail with
 `InvalidPhase`. Old snapshots retain their values after later publications and
 node removal; their node tokens do not become durable references.
 
 Node snapshots distinguish `attached`, `displayed`, and `intersects_viewport`.
-Displayed nodes have no hidden or `Display::None` ancestor. Offscreen displayed
+Displayed nodes have no hidden ancestor. Offscreen displayed
 nodes retain their computed rectangles; non-displayed nodes have no current
 screen rectangle. Intersection includes ancestor clipping but makes no claim
 about occlusion. Widget semantics expose only declared roles, labels, selection,
-action status, and explicitly enabled values. Sensitive input values are omitted.
+activation status, and explicitly enabled values. Sensitive input values are omitted.
 
-Legacy `screen`, `screen_cells`, and `screen_text` queries still prepare pending
-changes. Use a snapshot for attachment, ancestor visibility, and clipping
-decisions.
+`canopy.screen_text(target?)` prepares pending changes, then returns the
+published frame's text, one line per row. A node target crops to the node's
+content rectangle, and a `Rect` target crops to that screen rectangle.
+`canopy.snapshot().cells` holds the styled cells. Use a snapshot for
+attachment, ancestor visibility, and clipping decisions.
+
+`canopy.capture()` prepares pending changes, then returns the published frame
+as styled text: its width and height, a list of distinct styles, and the runs
+of text of each row. A run names its style by index, from 0, and counts the
+cells it covers. A capture is compact, so a script can return many of them.
+Like a snapshot, a capture shows every cell at rest: an animation shows its
+rest color, and a drifting gradient its rest position. `TermBuf::capture` makes the same
+record in Rust, and `canopy_widgets::screenshot` draws one as a PNG image.
+
+`canopy.snapshot().cursors` holds the cursors the frame painted, the primary
+cursor first. Each record has the declaring node, the screen location, the
+role, the shape, the painted color, the motion, and whether it is primary.
+Assert cursor roles and locations directly; do not infer them from cell colors.
+Snapshots show every cell at rest, so moving colors never change what a script
+reads.
+
+`canopy.set_cursor_look(role, look)` replaces parts of a cursor role's look in
+every theme, for example `{ color = "#98c379", motion = "steady" }`.
+`canopy.set_motion(options)` replaces the given motion settings: `enabled`,
+`max_fps`, and `idle_ms`.
 
 The generated API is test-covered by an exact golden tail that includes command
 enums, optional named arguments, fixtures, and default bindings.
@@ -465,7 +631,7 @@ event dispatch.
 
 ## Versioned replay
 
-`canopyctl eval --journal-out trace.json` writes a `canopy.replay/1` envelope
+`canopyctl eval --replay-out trace.json` writes a `canopy.replay/1` envelope
 from the evaluation's actual metadata. Recording requires an API digest; a
 failure before app construction still produces evaluation JSON, but cannot
 produce a complete replay envelope.
@@ -476,7 +642,7 @@ produce a complete replay envelope.
   "app": "todo",
   "api_digest": "recorded-api-digest",
   "execution": "fresh-app-per-eval",
-  "viewport": { "width": 120, "height": 40 },
+  "screen": { "width": 120, "height": 40 },
   "fixture": "with_items",
   "reset": "isolated",
   "steps": [
@@ -488,9 +654,9 @@ produce a complete replay envelope.
 }
 ```
 
-Replay checks application identity, API digest, execution mode, viewport, and
-domain reset policy before applying a fixture or evaluating source. Headless
-replay requests the recorded viewport. Live replay checks the current viewport
+Replay checks application identity, API digest, execution mode, screen size,
+and domain reset policy before applying a fixture or evaluating source. Headless
+replay requests the recorded screen size. Live replay checks the current screen
 and uses the explicitly selected socket. For example:
 
 ```sh
@@ -516,4 +682,4 @@ failure passes when evaluation fails, and fails when evaluation succeeds.
 `--fail-fast` stops at the first outcome that differs from its expectation.
 
 Source strings are durable replay steps. Live node tokens and session IDs are
-not durable node references; use semantic keys and application identifiers.
+not durable node references; use identities and application identifiers.

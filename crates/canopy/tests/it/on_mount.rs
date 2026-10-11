@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Context, ContextExt, Loader, NodeId, NodeName, TypedId, Widget, error::Result,
+        Context, ContextExt, NodeId, NodeName, TypedId, Widget, error::Result,
         testing::harness::Harness,
     };
 
@@ -30,7 +30,7 @@ mod tests {
             self.mount_calls += 1;
             self.mounted_id = Some(ctx.node_id());
             self.mounted_root = Some(ctx.root_id());
-            let child = ctx.add_child(ChildProbe::new())?;
+            let child = ctx.add_child(ctx.node_id(), ChildProbe::new())?;
             self.child_id = Some(child);
             Ok(())
         }
@@ -39,8 +39,6 @@ mod tests {
             NodeName::convert("mount_probe")
         }
     }
-
-    impl Loader for MountProbe {}
 
     struct ChildProbe {
         mount_calls: usize,

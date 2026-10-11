@@ -197,6 +197,7 @@ impl Key {
     /// `normalize` must be called explicitly when needed. Comparison is literal
     /// and straightforward and does not normalize. `parse_spec` normalizes
     /// its result.
+    #[must_use]
     pub fn normalize(&self) -> Self {
         let mut normalized = *self;
         if let KeyCode::Char(c) = normalized.key {
@@ -224,6 +225,21 @@ impl Key {
         normalized
     }
 
+    /// Return the character this key produces as plain text, if any.
+    ///
+    /// A `Char` produces text unless Ctrl or Alt turns it into a command.
+    /// Shift does not disqualify a character, because a terminal can report
+    /// the produced character and the Shift modifier together.
+    pub fn text_char(&self) -> Option<char> {
+        if self.mods.ctrl || self.mods.alt {
+            return None;
+        }
+        match self.key {
+            KeyCode::Char(character) => Some(character),
+            _ => None,
+        }
+    }
+
     /// Parse a key specification such as `ctrl-s`, `PageDown`, or `A`.
     pub fn parse_spec(spec: &str) -> Result<Self, ParseError> {
         let spec = spec.trim();
@@ -232,6 +248,32 @@ impl Key {
         }
         let (mods, key_part) = parse_spec_parts(spec, &['-', '+']).map_err(ParseError::new)?;
         Ok((mods + parse_key_code(key_part).map_err(ParseError::new)?).normalize())
+    }
+
+    /// Return the label hints and help show for this key: named keys
+    /// lowercased, arrows drawn as arrows, and the page keys shortened.
+    ///
+    /// Arrows are ambiguous-width characters, and many terminal fonts draw them
+    /// wider than their one cell. Each arrow keeps a blank cell after it for
+    /// the glyph to spill into, so it never covers the next key.
+    pub fn label(&self) -> String {
+        let code = match self.key {
+            KeyCode::Left => "← ".to_string(),
+            KeyCode::Right => "→ ".to_string(),
+            KeyCode::Up => "↑ ".to_string(),
+            KeyCode::Down => "↓ ".to_string(),
+            KeyCode::PageDown => "pgdown".to_string(),
+            KeyCode::PageUp => "pgup".to_string(),
+            KeyCode::Char(' ') => "space".to_string(),
+            // Literal keys keep their case, which distinguishes them.
+            KeyCode::Char(character) => character.to_string(),
+            code => code.to_string().to_ascii_lowercase(),
+        };
+        if self.mods == Empty {
+            code
+        } else {
+            format!("{}+{code}", self.mods.to_string().to_ascii_lowercase())
+        }
     }
 }
 
@@ -431,7 +473,7 @@ impl fmt::Display for Key {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error::Result, event::key::*};
+    use crate::{error::Result, input::key::*};
 
     #[test]
     fn normalize() -> Result<()> {
@@ -460,6 +502,20 @@ mod tests {
         assert_eq!(Key::from('\u{1F}').normalize(), Ctrl + '/');
         assert_eq!(Key::from('\u{7F}').normalize(), Ctrl + '/');
         Ok(())
+    }
+
+    #[test]
+    fn text_char_reads_plain_characters_only() {
+        assert_eq!(Key::from('a').text_char(), Some('a'));
+        assert_eq!((Shift + 'a').text_char(), Some('a'));
+        assert_eq!((Shift + 'A').text_char(), Some('A'));
+        assert_eq!(Key::from(' ').text_char(), Some(' '));
+        assert_eq!(Key::from('\u{1}').text_char(), Some('\u{1}'));
+        assert_eq!((Ctrl + 'a').text_char(), None);
+        assert_eq!((Alt + 'a').text_char(), None);
+        assert_eq!((Ctrl + Alt + 'a').text_char(), None);
+        assert_eq!(Key::from(KeyCode::Enter).text_char(), None);
+        assert_eq!(Key::from(KeyCode::F(5)).text_char(), None);
     }
 
     #[test]

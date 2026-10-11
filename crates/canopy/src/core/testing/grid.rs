@@ -1,11 +1,11 @@
 //! Grid test utility for creating configurable grid layouts.
 
 use crate::{
-    Canopy, Context, ContextExt, NodeId, ViewContext,
+    Canopy, Context, ContextExt, NodeId, NodeName, ViewContext,
     error::Result,
     geom::Size,
-    layout::{Layout, Sizing},
-    state::NodeName,
+    layout::{Layout, LayoutOverride},
+    runtime::TurnInput,
     widget::Widget,
 };
 
@@ -80,25 +80,25 @@ pub struct Grid {
 }
 
 impl Grid {
-    /// Build and prepare a grid with the root sized to hold it.
+    /// Build and prepare a grid with the screen sized to hold it.
     pub fn install(canopy: &mut Canopy, recursion: usize, divisions: usize) -> Result<Self> {
         let grid = canopy.with_root_context(|context| {
             let grid_root = build_node(context, 0, 0, recursion, divisions)?;
             let root = context.root_id();
-            context.set_children_of(root, vec![grid_root])?;
-            context.set_layout_of(root, Layout::fill())?;
-            context.with_layout_of(grid_root, &mut |layout| {
-                layout.width = Sizing::Flex(1);
-                layout.height = Sizing::Flex(1);
-            })?;
+            context.set_children(root, vec![grid_root])?;
+            context.set_layout_override(root, Layout::fill().into())?;
+            context.set_layout_override(
+                grid_root,
+                LayoutOverride::new().flex_horizontal(1).flex_vertical(1),
+            )?;
             Ok(Self {
                 root: grid_root,
                 recursion,
                 divisions,
             })
         })?;
-        canopy.set_root_size(grid.expected_size())?;
-        canopy.turn(crate::Work::Prepare)?;
+        canopy.set_screen_size(grid.expected_size())?;
+        canopy.turn(TurnInput::Prepare)?;
         Ok(grid)
     }
 
@@ -156,11 +156,11 @@ fn build_node(
             let child = build_node(core, child_x, child_y, recursion - 1, divisions)?;
             row_children.push(child);
         }
-        core.set_children_of(row_node, row_children)?;
+        core.set_children(row_node, row_children)?;
         children.push(row_node);
     }
 
-    core.set_children_of(node_id, children)?;
+    core.set_children(node_id, children)?;
 
     Ok(node_id)
 }
@@ -168,6 +168,130 @@ fn build_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Canopy, CanopyBuilder, ViewContext, core::context::CoreViewContext, geom::Point};
+
+    /// Name the deepest node under `point`, as a pointer event would find it.
+    fn locate_name(canopy: &Canopy, root: NodeId, point: Point) -> Result<Option<String>> {
+        let context = CoreViewContext::new(&canopy.core, root);
+        Ok(canopy.core.locate_node(root, point)?.map(|node| {
+            context
+                .path_of(root, node)
+                .pop()
+                .expect("node path should contain a name")
+        }))
+    }
+
+    #[test]
+    fn test_locate_single_cell_grid() -> Result<()> {
+        let mut canopy = CanopyBuilder::new().build()?;
+        let grid = Grid::install(&mut canopy, 0, 2)?;
+        let grid_size = grid.expected_size();
+        assert_eq!(grid_size, Size::new(10, 10));
+
+        let test_points = vec![
+            ((5, 5), "cell_0_0"),
+            ((0, 0), "cell_0_0"),
+            ((9, 0), "cell_0_0"),
+            ((0, 9), "cell_0_0"),
+            ((9, 9), "cell_0_0"),
+        ];
+
+        for (point, expected) in test_points {
+            let found = locate_name(
+                &canopy,
+                grid.root,
+                Point {
+                    x: point.0,
+                    y: point.1,
+                },
+            )?;
+            assert_eq!(found, Some(expected.to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_locate_2x2_grid() -> Result<()> {
+        let mut canopy = CanopyBuilder::new().build()?;
+        let grid = Grid::install(&mut canopy, 1, 2)?;
+        let grid_size = grid.expected_size();
+        assert_eq!(grid_size, Size::new(20, 20));
+
+        let test_points = vec![
+            ((5, 5), "cell_0_0"),
+            ((15, 5), "cell_1_0"),
+            ((5, 15), "cell_0_1"),
+            ((15, 15), "cell_1_1"),
+        ];
+
+        for (point, expected) in test_points {
+            let found = locate_name(
+                &canopy,
+                grid.root,
+                Point {
+                    x: point.0,
+                    y: point.1,
+                },
+            )?;
+            assert_eq!(found, Some(expected.to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_locate_3x3_grid() -> Result<()> {
+        let mut canopy = CanopyBuilder::new().build()?;
+        let grid = Grid::install(&mut canopy, 1, 3)?;
+        let grid_size = grid.expected_size();
+        assert_eq!(grid_size, Size::new(30, 30));
+
+        for row in 0..3 {
+            for col in 0..3 {
+                let x = col as u32 * 10 + 5;
+                let y = row as u32 * 10 + 5;
+                let expected = format!("cell_{col}_{row}");
+                let found = locate_name(&canopy, grid.root, Point { x, y })?;
+                assert_eq!(found, Some(expected));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_locate_nested_grid() -> Result<()> {
+        let mut canopy = CanopyBuilder::new().build()?;
+        let grid = Grid::install(&mut canopy, 2, 2)?;
+        let grid_size = grid.expected_size();
+        assert_eq!(grid_size, Size::new(40, 40));
+
+        let corner_tests = vec![
+            (Point { x: 5, y: 5 }, "cell_0_0"),
+            (Point { x: 35, y: 5 }, "cell_3_0"),
+            (Point { x: 5, y: 35 }, "cell_0_3"),
+            (Point { x: 35, y: 35 }, "cell_3_3"),
+        ];
+
+        for (point, expected) in corner_tests {
+            let found = locate_name(&canopy, grid.root, point)?;
+            assert_eq!(found, Some(expected.to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_grid_boundary_conditions() -> Result<()> {
+        let mut canopy = CanopyBuilder::new().build()?;
+        let grid = Grid::install(&mut canopy, 1, 2)?;
+
+        let result = locate_name(&canopy, grid.root, Point { x: 100, y: 100 })?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
 
     #[test]
     fn test_grid_dimensions() {
@@ -185,7 +309,9 @@ mod tests {
         ];
 
         for (recursion, divisions, expected) in test_cases {
-            let mut canopy = Canopy::new();
+            let mut canopy = crate::CanopyBuilder::new()
+                .build()
+                .expect("an empty application builds");
             let grid =
                 Grid::install(&mut canopy, recursion, divisions).expect("Failed to build grid");
             let dimensions = grid.dimensions();

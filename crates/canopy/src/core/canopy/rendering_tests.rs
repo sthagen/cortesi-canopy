@@ -1,13 +1,16 @@
 //! Published snapshots and emitted frames have separate baselines.
 
-use super::Canopy;
+use std::sync::Arc;
+
+use super::{Canopy, CanopyBuilder};
 use crate::{
-    ContextExt, TermBuf, ViewContext, Widget,
+    ContextExt, ViewContext, Widget,
     commands::ArgValue,
     error::{Error, Result},
     geom::{Line, Point, Size},
     layout::Layout,
-    render::{Render, RenderBackend},
+    render::{Render, RenderBackend, TermBuf},
+    runtime::{FrameId, FrameSnapshot},
     style::{AttrSet, Color, ResolvedStyle},
     testing::backend::TestRender,
 };
@@ -25,10 +28,9 @@ impl Widget for Paint {
 }
 
 fn app() -> Result<Canopy> {
-    let mut canopy = Canopy::new();
+    let mut canopy = CanopyBuilder::new().build()?;
     canopy.replace_root(Paint('a'))?;
-    canopy.set_root_size(Size::new(1, 1))?;
-    canopy.finalize_api()?;
+    canopy.set_screen_size(Size::new(1, 1))?;
     Ok(canopy)
 }
 
@@ -54,8 +56,11 @@ fn script_snapshot_refresh_preserves_backend_diff_baseline() -> Result<()> {
         canopy.eval_script("return canopy.screen_text()")?,
         ArgValue::String("b".into())
     );
-    assert_eq!(canopy.buf().unwrap().screen_text(), "b");
-    assert_eq!(canopy.emitted_buf.as_ref().unwrap().screen_text(), "a");
+    assert_eq!(canopy.published_buf().unwrap().screen_text(), "b");
+    assert_eq!(
+        canopy.frame.emitted_buf.as_ref().unwrap().screen_text(),
+        "a"
+    );
 
     canopy.emit_frame(&mut backend)?;
     assert_eq!(backend.text, ["b"]);
@@ -78,13 +83,14 @@ struct FailingBackend {
     capture: TestRender,
     fail_at: Option<Failure>,
     shifts: usize,
+    flushes: usize,
 }
 
 impl FailingBackend {
     fn check_failure(&mut self, operation: Failure) -> Result<()> {
         if self.fail_at == Some(operation) {
             self.fail_at = None;
-            Err(Error::RunLoop("injected backend failure".into()))
+            Err(Error::Driver("injected backend failure".into()))
         } else {
             Ok(())
         }
@@ -117,6 +123,7 @@ impl RenderBackend for FailingBackend {
     }
 
     fn flush(&mut self) -> Result<()> {
+        self.flushes += 1;
         self.check_failure(Failure::Flush)
     }
 }
@@ -133,26 +140,40 @@ fn failed_output_repaints_even_when_the_next_frame_reverts() -> Result<()> {
         let mut backend = FailingBackend::default();
         canopy.render(&mut backend)?;
         paint(&mut canopy, 'b')?;
-        canopy.flush()?;
+        canopy.prepare()?;
 
         backend.fail_at = Some(operation);
         assert!(matches!(
             canopy.emit_frame(&mut backend),
-            Err(Error::RunLoop(message)) if message == "injected backend failure"
+            Err(Error::Driver(message)) if message == "injected backend failure"
         ));
-        assert_eq!(canopy.buf().unwrap().screen_text(), "b");
+        assert_eq!(canopy.published_buf().unwrap().screen_text(), "b");
 
         // The failed output may already have painted 'b'. A diff against the
         // last successful 'a' would leave that cell unchanged on the terminal.
         paint(&mut canopy, 'a')?;
-        canopy.flush()?;
+        canopy.prepare()?;
         canopy.emit_frame(&mut backend)?;
         assert_eq!(backend.capture.text, ["a"], "failed at {operation:?}");
-        assert_eq!(canopy.emitted_buf.as_ref().unwrap().screen_text(), "a");
+        assert_eq!(
+            canopy.frame.emitted_buf.as_ref().unwrap().screen_text(),
+            "a"
+        );
         canopy.emit_frame(&mut backend)?;
         assert!(backend.capture.text.is_empty());
     }
     Ok(())
+}
+
+/// Publish `buffer` as the frame the next emit writes.
+fn publish(canopy: &mut Canopy, buffer: TermBuf) {
+    canopy.frame.snapshot = Some(Arc::new(FrameSnapshot {
+        frame_id: FrameId(0),
+        buffer: Arc::new(buffer),
+        nodes: Vec::new(),
+        focus: None,
+        cursors: Vec::new(),
+    }));
 }
 
 fn frame(text: &str) -> Result<TermBuf> {
@@ -165,11 +186,11 @@ fn frame(text: &str) -> Result<TermBuf> {
 
 #[test]
 fn failed_shift_is_not_repeated_on_retry() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = CanopyBuilder::new().build()?;
     let mut backend = FailingBackend::default();
-    canopy.termbuf = Some(frame("abcdef")?);
+    publish(&mut canopy, frame("abcdef")?);
     canopy.emit_frame(&mut backend)?;
-    canopy.termbuf = Some(frame("Zabcde")?);
+    publish(&mut canopy, frame("Zabcde")?);
 
     // A backend can apply a shift before reporting a write failure. Repeating
     // that relative operation would shift the existing content twice.
@@ -181,5 +202,19 @@ fn failed_shift_is_not_repeated_on_retry() -> Result<()> {
     assert_eq!(backend.capture.text, ["Zabcde"]);
     canopy.emit_frame(&mut backend)?;
     assert!(backend.capture.text.is_empty());
+    Ok(())
+}
+
+#[test]
+fn each_emitted_frame_flushes_once() -> Result<()> {
+    let mut canopy = CanopyBuilder::new().build()?;
+    let mut backend = FailingBackend::default();
+    // A full paint, a shifted diff, and an unchanged diff.
+    for (count, text) in ["abcdef", "Zabcde", "Zabcde"].into_iter().enumerate() {
+        publish(&mut canopy, frame(text)?);
+        canopy.emit_frame(&mut backend)?;
+        assert_eq!(backend.flushes, count + 1, "frame {text}");
+    }
+    assert_eq!(backend.shifts, 1);
     Ok(())
 }

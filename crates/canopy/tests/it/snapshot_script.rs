@@ -4,12 +4,14 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Canopy, Render, ViewContext, Widget, WidgetSemantics,
+        CanopyBuilder, ViewContext, Widget,
         commands::ArgValue,
         derive_commands,
         error::Result,
         geom::{Line, Size},
         layout::Layout,
+        render::Render,
+        runtime::WidgetSemantics,
     };
 
     struct Label {
@@ -43,11 +45,12 @@ mod tests {
 
     #[test]
     fn snapshot_records_stay_detached_across_mutation_and_flush() -> Result<()> {
-        let mut canopy = Canopy::new();
-        canopy.add_commands::<Label>()?;
+        let mut canopy = CanopyBuilder::new()
+            .configure(|setup| setup.add_commands::<Label>())
+            .build()?;
         canopy.replace_root(Label { text: "old".into() })?;
         assert!(canopy.snapshot().is_none());
-        canopy.set_root_size(Size::new(8, 2))?;
+        canopy.set_screen_size(Size::new(8, 2))?;
         assert_eq!(
             canopy.eval_script(
                 r#"
@@ -59,7 +62,7 @@ mod tests {
             if pending == nil then error("publication disappeared") end
             canopy.assert(pending.frame_id == old.frame_id)
             canopy.assert(pending.nodes[1].semantics.label == "old")
-            canopy.flush()
+            canopy.prepare()
             local fresh = canopy.snapshot()
             if fresh == nil then error("flush must publish") end
             canopy.assert(fresh.frame_id > old.frame_id)
@@ -82,7 +85,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_nil_until_a_viewport_can_be_published() -> Result<()> {
-        let mut canopy = Canopy::new();
+        let mut canopy = CanopyBuilder::new().build()?;
         assert_eq!(
             canopy.eval_script("return canopy.snapshot() == nil")?,
             ArgValue::Bool(true)

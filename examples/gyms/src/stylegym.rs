@@ -1,0 +1,1118 @@
+//! Stylegym: a viewer for Canopy themes and styles.
+//!
+//! A sidebar titled Styles picks the theme and the effects. The untitled main
+//! pane shows the theme through tabbed pages: resolved palette swatches, every
+//! rule in the theme, stock widgets, syntax highlighting, and text samples. A
+//! modal overlay shows how the pane dims.
+
+use canopy::{
+    CanopyBuilder, Context, ContextExt, NodeId, NodeName, Register, Setup, TypedId, ViewContext,
+    ViewContextExt, Widget,
+    commands::{CommandStatus, CommandTarget},
+    derive_commands,
+    error::Result,
+    geom::{Line, Point, Rect, Size},
+    layout::{CanvasContext, Direction, Edges, Layout, View},
+    render::Render,
+    style::{
+        AttrSet, Color, PartialStyle, ResolvedStyle, StyleMap, effects,
+        effects::Effect,
+        themes::{self, Palette},
+    },
+    text,
+    tree::ChildSlot,
+};
+use canopy_widgets::{
+    BoxGlyphs, Button, ButtonLook, Container, Dropdown, Frame, Input, ItemLabel, Root, Scroll,
+    Selector, Tabs,
+    editor::{Editor, EditorConfig, Interaction, LineNumbers, WrapMode},
+    highlight::SyntectHighlighter,
+};
+
+/// Default bindings for the style gym demo.
+const DEFAULT_BINDINGS: &str = r#"
+root.default_bindings()
+
+canopy.keymap({
+    path = "stylegym/",
+    phase = "before_widget",
+    { key = "Tab", description = "Next focus", action = command.root.focus("next") },
+    { key = "BackTab", description = "Previous focus", action = command.root.focus("prev") },
+})
+
+canopy.keymap({
+    path = "stylegym/",
+    { key = "m", description = "Show modal", action = command.stylegym.show_modal() },
+    { key = "Esc", description = "Hide modal", action = command.stylegym.hide_modal() },
+    { key = { "l", "Right", "]" }, description = "Next tab", action = command.stylegym.next_tab(1) },
+    {
+        key = { "h", "Left", "[" },
+        description = "Previous tab",
+        action = command.stylegym.next_tab(-1),
+    },
+    { key = "1", description = "Palette tab", action = command.stylegym.show_tab(0) },
+    { key = "2", description = "Rules tab", action = command.stylegym.show_tab(1) },
+    { key = "3", description = "Widgets tab", action = command.stylegym.show_tab(2) },
+    { key = "4", description = "Syntax tab", action = command.stylegym.show_tab(3) },
+    { key = "5", description = "Text tab", action = command.stylegym.show_tab(4) },
+})
+
+canopy.keymap({
+    path = "style_sheet",
+    { key = { "j", "Down" }, description = "Scroll down", action = "canopy.nav.down" },
+    { key = { "k", "Up" }, description = "Scroll up", action = "canopy.nav.up" },
+    { key = { "H", "shift-Left" }, description = "Scroll left", action = "canopy.nav.left" },
+    { key = { "L", "shift-Right" }, description = "Scroll right", action = "canopy.nav.right" },
+    { key = { "PageDown", "Space" }, description = "Page down", action = "canopy.nav.page_down" },
+    { key = "PageUp", description = "Page up", action = "canopy.nav.page_up" },
+})
+
+canopy.keymap({
+    path = "text_samples",
+    { key = { "j", "Down" }, description = "Scroll down", action = "canopy.nav.down" },
+    { key = { "k", "Up" }, description = "Scroll up", action = "canopy.nav.up" },
+    { key = { "PageDown", "Space" }, description = "Page down", action = "canopy.nav.page_down" },
+    { key = "PageUp", description = "Page up", action = "canopy.nav.page_up" },
+})
+
+canopy.keymap({
+    path = "dropdown",
+    phase = "before_widget",
+    {
+        key = "Enter",
+        description = "Apply theme",
+        action = function()
+            dropdown.confirm()
+            stylegym.apply_theme()
+        end,
+    },
+    { key = "Space", description = "Toggle dropdown", action = command.dropdown.toggle() },
+    { key = { "j", "Down" }, description = "Next option", action = command.dropdown.select_by(1) },
+    { key = { "k", "Up" }, description = "Previous option", action = command.dropdown.select_by(-1) },
+})
+canopy.keymap({
+    path = "dropdown",
+    { mouse = "LeftDown", description = "Apply theme", action = function() stylegym.apply_theme() end },
+})
+
+canopy.keymap({
+    path = "selector",
+    phase = "before_widget",
+    {
+        key = { "Space", "Enter" },
+        description = "Choose effect",
+        action = function()
+            selector.choose()
+            stylegym.apply_effects()
+        end,
+    },
+    { key = { "j", "Down" }, description = "Next effect", action = command.selector.select_by(1) },
+    { key = { "k", "Up" }, description = "Previous effect", action = command.selector.select_by(-1) },
+})
+canopy.keymap({
+    path = "selector",
+    { mouse = "LeftDown", description = "Apply effects", action = function() stylegym.apply_effects() end },
+})
+"#;
+
+/// Style paths the palette page shows, grouped under headings.
+const PALETTE: &[(&str, &[&str])] = &[
+    (
+        "Surfaces",
+        &["", "help/panel", "editor/prompt", "editor/selection"],
+    ),
+    (
+        "Chrome",
+        &[
+            "frame",
+            "frame/focused",
+            "frame/thumb",
+            "frame/thumb/active",
+            "frame/title",
+            "columns/divider",
+            "columns/thumb",
+            "columns/thumb/active",
+            "tabs/bar",
+            "tabs/tab",
+            "tabs/tab/active",
+            "tabs/tab/active/focused",
+        ],
+    ),
+    (
+        "Selection",
+        &[
+            "selection",
+            "selection/dimmed",
+            "selector/chosen",
+            "dropdown/chosen",
+        ],
+    ),
+    (
+        "Editor",
+        &[
+            "editor/text",
+            "editor/line-number",
+            "editor/line-number/current",
+            "editor/search/match",
+            "editor/search/current",
+        ],
+    ),
+    ("Help", &["help/key", "help/label"]),
+    (
+        "Named colors",
+        &[
+            "red", "orange", "yellow", "green", "cyan", "blue", "violet", "magenta",
+        ],
+    ),
+];
+
+/// Columns taken by the foreground and background swatches.
+const SWATCH_WIDTH: u32 = 8;
+/// Columns between the path and the values that follow it.
+const PATH_GAP: u32 = 2;
+/// Columns taken by a hex value and its trailing gap.
+const HEX_WIDTH: u32 = 9;
+/// Text painted with each style.
+const SAMPLE: &str = "Aa 123";
+/// Columns taken by the sample and its trailing gap.
+const SAMPLE_WIDTH: u32 = 8;
+/// Columns taken by the attribute names.
+const ATTR_WIDTH: u32 = 20;
+
+/// Rust source shown on the syntax page.
+const RUST_SAMPLE: &str = r#"/// A point on the canvas.
+#[derive(Debug, Clone, Copy)]
+pub struct Point {
+    x: u32,
+    y: u32,
+}
+
+impl Point {
+    /// Offset the point, saturating at the edges.
+    pub fn offset(self, dx: i32, dy: i32) -> Self {
+        let x = self.x.saturating_add_signed(dx);
+        let y = self.y.saturating_add_signed(dy);
+        println!("moved to ({x}, {y})\n");
+        Self { x, y }
+    }
+}
+"#;
+
+/// Luau source shown on the syntax page.
+const LUAU_SAMPLE: &str = r#"-- Bind a key for each tab.
+local tabs = { "Palette", "Rules", "Widgets" }
+
+function setup()
+    for index, name in ipairs(tabs) do
+        canopy.bind(tostring(index), { description = name }, function()
+            stylegym.show_tab(index - 1)
+        end)
+    end
+    return #tabs > 0
+end
+"#;
+
+/// Theme option for the dropdown.
+#[derive(Clone)]
+pub struct ThemeOption {
+    /// Theme display name.
+    pub name: &'static str,
+    /// Function returning the theme's palette.
+    pub builder: fn() -> Palette,
+}
+
+impl ItemLabel for ThemeOption {
+    fn label(&self) -> &str {
+        self.name
+    }
+}
+
+/// Effect option for the selector.
+#[derive(Clone)]
+pub struct EffectOption {
+    /// Effect display name.
+    pub name: &'static str,
+    /// Style effect applied when this option is chosen, if any.
+    pub effect: Option<Effect>,
+}
+
+impl ItemLabel for EffectOption {
+    fn label(&self) -> &str {
+        self.name
+    }
+}
+
+/// Available themes.
+fn available_themes() -> Vec<ThemeOption> {
+    vec![
+        ThemeOption {
+            name: "Default Dark",
+            builder: themes::default_dark,
+        },
+        ThemeOption {
+            name: "Solarized Dark",
+            builder: themes::solarized_dark,
+        },
+        ThemeOption {
+            name: "Solarized Light",
+            builder: themes::solarized_light,
+        },
+        ThemeOption {
+            name: "Gruvbox Dark",
+            builder: themes::gruvbox_dark,
+        },
+        ThemeOption {
+            name: "Dracula",
+            builder: themes::dracula,
+        },
+    ]
+}
+
+/// Available effects.
+fn available_effects() -> Vec<EffectOption> {
+    vec![
+        EffectOption {
+            name: "None",
+            effect: None,
+        },
+        EffectOption {
+            name: "Dim",
+            effect: Some(effects::brightness(0.5)),
+        },
+        EffectOption {
+            name: "Brighten",
+            effect: Some(effects::brightness(1.5)),
+        },
+        EffectOption {
+            name: "Grayscale",
+            effect: Some(effects::saturation(0.0)),
+        },
+        EffectOption {
+            name: "Invert",
+            effect: Some(effects::invert_rgb()),
+        },
+        EffectOption {
+            name: "Hue Shift",
+            effect: Some(effects::hue_shift(180.0)),
+        },
+        EffectOption {
+            name: "Bold",
+            effect: Some(effects::bold()),
+        },
+        EffectOption {
+            name: "Italic",
+            effect: Some(effects::italic()),
+        },
+    ]
+}
+
+// Typed keys for slots
+canopy::slot!(ControlsSlot: Frame);
+canopy::slot!(ThemeFrameSlot: Frame);
+canopy::slot!(ThemeDropdownSlot: Dropdown<ThemeOption>);
+canopy::slot!(EffectsFrameSlot: Frame);
+canopy::slot!(EffectsSelectorSlot: Selector<EffectOption>);
+canopy::slot!(RightContainerSlot: Container);
+canopy::slot!(MainFrameSlot: Frame);
+canopy::slot!(TabsSlot: Tabs);
+canopy::slot!(ModalSlot: Container);
+
+/// Which style components a rule sets itself rather than inheriting.
+#[derive(Clone, Copy)]
+struct Components {
+    /// The rule sets a foreground.
+    fg: bool,
+    /// The rule sets a background.
+    bg: bool,
+    /// The rule sets attributes.
+    attrs: bool,
+}
+
+impl Components {
+    /// Every component, for rows that show resolved values only.
+    const ALL: Self = Self {
+        fg: true,
+        bg: true,
+        attrs: true,
+    };
+
+    /// Return the components `style` sets.
+    fn of(style: &PartialStyle) -> Self {
+        Self {
+            fg: style.fg.is_some(),
+            bg: style.bg.is_some(),
+            attrs: style.attrs.is_some(),
+        }
+    }
+}
+
+/// One row of a style sheet.
+enum SheetRow {
+    /// Column titles.
+    Columns,
+    /// A section heading.
+    Heading(String),
+    /// A style path, resolved when painted.
+    Path {
+        /// Canonical style path.
+        path: String,
+        /// Components the path's rule sets itself.
+        sets: Components,
+    },
+    /// A blank separator.
+    Blank,
+}
+
+/// A scrollable table of style paths and their resolved styles.
+///
+/// Each path row shows a foreground swatch, a background swatch, the path, the
+/// resolved foreground and background, a sample painted with the style, and
+/// the resolved attributes. Values the rule inherits are muted.
+pub struct StyleSheet {
+    /// Rows in display order.
+    rows: Vec<SheetRow>,
+}
+
+#[derive_commands]
+impl StyleSheet {
+    /// Build the palette page: curated paths grouped by role.
+    fn palette() -> Self {
+        let mut rows = vec![SheetRow::Columns];
+        for (title, paths) in PALETTE {
+            rows.push(SheetRow::Blank);
+            rows.push(SheetRow::Heading((*title).to_string()));
+            rows.extend(paths.iter().map(|path| SheetRow::Path {
+                path: (*path).to_string(),
+                sets: Components::ALL,
+            }));
+        }
+        Self { rows }
+    }
+
+    /// Build an empty rules page, filled by [`StyleSheet::set_rules`].
+    fn rules() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    /// List every rule in `map`, sorted by path.
+    fn set_rules(&mut self, map: &StyleMap) {
+        let mut rules = map.entries().collect::<Vec<_>>();
+        rules.sort_by_key(|(path, _)| *path);
+        self.rows = vec![
+            SheetRow::Heading("Rules in the active theme. Muted values are inherited.".into()),
+            SheetRow::Columns,
+        ];
+        self.rows
+            .extend(rules.into_iter().map(|(path, style)| SheetRow::Path {
+                path: path.to_string(),
+                sets: Components::of(style),
+            }));
+    }
+
+    /// Return the width of the path column.
+    fn path_width(&self) -> u32 {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                SheetRow::Path { path, .. } => Some(path.chars().count() + 1),
+                _ => None,
+            })
+            .max()
+            .map_or(0, |width| width as u32)
+            .max("path".len() as u32)
+    }
+
+    /// Return the column where each value starts: fg, bg, sample, attrs.
+    fn value_columns(path_width: u32) -> [u32; 4] {
+        let fg = SWATCH_WIDTH + path_width + PATH_GAP;
+        [
+            fg,
+            fg + HEX_WIDTH,
+            fg + 2 * HEX_WIDTH,
+            fg + 2 * HEX_WIDTH + SAMPLE_WIDTH,
+        ]
+    }
+
+    /// Paint one path row at canvas row `y`.
+    fn paint_path(
+        rndr: &mut Render,
+        place: Placement,
+        muted: ResolvedStyle,
+        y: u32,
+        path: &str,
+        sets: Components,
+    ) -> Result<()> {
+        let style = rndr.resolve_style(path);
+        let solid = style.resolve_solid();
+        if let Some(solid) = solid {
+            for (x, color) in [(1, solid.fg), (4, solid.bg)] {
+                let swatch = ResolvedStyle::new(color, color, AttrSet::default());
+                put_text(rndr, place, swatch, x, y, "  ")?;
+            }
+        }
+        put_styled(rndr, place, "", SWATCH_WIDTH, y, &format!("/{path}"))?;
+
+        let path_width = place.path_width;
+        let [fg_x, bg_x, sample_x, attrs_x] = Self::value_columns(path_width);
+        let (fg, bg) = solid.map_or_else(
+            || ("gradient".to_string(), "gradient".to_string()),
+            |solid| (hex(solid.fg), hex(solid.bg)),
+        );
+        put_value(rndr, place, muted, fg_x, y, &fg, sets.fg)?;
+        put_value(rndr, place, muted, bg_x, y, &bg, sets.bg)?;
+        put_styled(rndr, place, path, sample_x, y, SAMPLE)?;
+        put_value(
+            rndr,
+            place,
+            muted,
+            attrs_x,
+            y,
+            &attr_names(style.attrs),
+            sets.attrs,
+        )
+    }
+}
+
+impl Widget for StyleSheet {
+    fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
+        let view = ctx.view();
+        rndr.fill("", view.view_rect_local(), ' ')?;
+        let muted = muted_style(rndr);
+        let place = Placement::of(&view, self.path_width());
+        let visible = view.view_rect();
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .skip(visible.tl.y as usize)
+            .take(visible.h as usize);
+        for (y, row) in rows {
+            let y = y as u32;
+            match row {
+                SheetRow::Blank => {}
+                SheetRow::Columns => {
+                    put_text(rndr, place, muted, SWATCH_WIDTH, y, "path")?;
+                    let titles = ["fg", "bg", "sample", "attrs"];
+                    for (x, title) in Self::value_columns(place.path_width)
+                        .into_iter()
+                        .zip(titles)
+                    {
+                        put_text(rndr, place, muted, x, y, title)?;
+                    }
+                }
+                SheetRow::Heading(title) => {
+                    put_styled(rndr, place, "frame/title", 1, y, title)?;
+                }
+                SheetRow::Path { path, sets } => {
+                    Self::paint_path(rndr, place, muted, y, path, *sets)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn canvas(&self, view: Size, _ctx: &CanvasContext<'_>) -> Size {
+        let width = Self::value_columns(self.path_width())[3] + ATTR_WIDTH;
+        Size::new(width.max(view.w), (self.rows.len() as u32).max(view.h))
+    }
+
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("style_sheet")
+    }
+}
+
+/// Maps canvas cells of a scrolling page to the page's render coordinates.
+#[derive(Clone, Copy)]
+struct Placement {
+    /// Canvas rectangle the view shows.
+    visible: Rect,
+    /// Render position of the visible rectangle's top-left cell.
+    origin: Point,
+    /// Width of a style sheet's path column.
+    path_width: u32,
+}
+
+impl Placement {
+    /// Return the placement for a view.
+    fn of(view: &View, path_width: u32) -> Self {
+        Self {
+            visible: view.view_rect(),
+            origin: view.content_origin(),
+            path_width,
+        }
+    }
+
+    /// Return the render cell for a canvas cell, or `None` off screen.
+    fn cell(self, x: u32, y: u32) -> Option<Point> {
+        self.visible.contains_point(Point { x, y }).then(|| Point {
+            x: x - self.visible.tl.x + self.origin.x,
+            y: y - self.visible.tl.y + self.origin.y,
+        })
+    }
+
+    /// Return the render line for `width` canvas columns from (`x`, `y`) and
+    /// the leading columns the view hides.
+    fn line(self, x: u32, y: u32, width: u32) -> Option<(Line, usize)> {
+        let hidden = self.visible.tl.x.saturating_sub(x);
+        let start = self.cell(x.saturating_add(hidden), y)?;
+        (hidden < width).then(|| (Line::new(start.x, start.y, width - hidden), hidden as usize))
+    }
+}
+
+/// Return a color as `#rrggbb`.
+fn hex(color: Color) -> String {
+    let (r, g, b) = color.rgb();
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Return the names of the active attributes, or `-` when none are.
+fn attr_names(attrs: AttrSet) -> String {
+    let names = [
+        (attrs.bold, "bold"),
+        (attrs.dim, "dim"),
+        (attrs.italic, "italic"),
+        (attrs.underline, "underline"),
+        (attrs.overline, "overline"),
+        (attrs.crossedout, "crossed"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect::<Vec<_>>();
+    if names.is_empty() {
+        "-".into()
+    } else {
+        names.join(" ")
+    }
+}
+
+/// Return the style for inherited values and column titles: the gutter
+/// foreground on the page background.
+fn muted_style(rndr: &Render) -> ResolvedStyle {
+    let fg = rndr
+        .resolve_style("editor/line-number")
+        .fg
+        .solid_color()
+        .unwrap_or(Color::DarkGrey);
+    let bg = rndr
+        .resolve_style("")
+        .bg
+        .solid_color()
+        .unwrap_or(Color::Black);
+    ResolvedStyle::new(fg, bg, AttrSet::default())
+}
+
+/// Paint ASCII `text` with an explicit style from canvas cell (`x`, `y`).
+fn put_text(
+    rndr: &mut Render,
+    place: Placement,
+    style: ResolvedStyle,
+    x: u32,
+    y: u32,
+    text: &str,
+) -> Result<()> {
+    for (offset, ch) in (0u32..).zip(text.chars()) {
+        if let Some(cell) = place.cell(x.saturating_add(offset), y) {
+            rndr.put_cell(style, cell, ch)?;
+        }
+    }
+    Ok(())
+}
+
+/// Paint `content` with a style path from canvas cell (`x`, `y`).
+fn put_styled(
+    rndr: &mut Render,
+    place: Placement,
+    style: &str,
+    x: u32,
+    y: u32,
+    content: &str,
+) -> Result<()> {
+    let width = text::width(content);
+    let Some((line, hidden)) = place.line(x, y, width) else {
+        return Ok(());
+    };
+    let (shown, _) = text::slice_by_columns(content, hidden, line.w as usize);
+    rndr.text(style, line, shown)
+}
+
+/// Paint a value in the default style when its rule sets it, muted otherwise.
+fn put_value(
+    rndr: &mut Render,
+    place: Placement,
+    muted: ResolvedStyle,
+    x: u32,
+    y: u32,
+    value: &str,
+    set: bool,
+) -> Result<()> {
+    if set {
+        put_styled(rndr, place, "", x, y, value)
+    } else {
+        put_text(rndr, place, muted, x, y, value)
+    }
+}
+
+/// Rows of the text samples page: a style path and the text it paints.
+const TEXT_ROWS: &[(&str, &str)] = &[
+    ("frame/title", "Color Palette"),
+    ("red", "████ Red"),
+    ("orange", "████ Orange"),
+    ("yellow", "████ Yellow"),
+    ("green", "████ Green"),
+    ("cyan", "████ Cyan"),
+    ("blue", "████ Blue"),
+    ("violet", "████ Violet"),
+    ("magenta", "████ Magenta"),
+    ("", ""),
+    ("frame/title", "Text Styles"),
+    ("", "Normal text sample"),
+    ("text/bold", "Bold text sample"),
+    ("text/italic", "Italic text sample"),
+    ("text/underline", "Underlined text sample"),
+];
+
+/// The text samples page: named colors and text attributes.
+pub struct TextSamples;
+
+#[derive_commands]
+impl TextSamples {}
+
+impl Widget for TextSamples {
+    fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
+        let view = ctx.view();
+        // Fill background with root style so effects apply to empty space
+        rndr.fill("", view.view_rect_local(), ' ')?;
+        let place = Placement::of(&view, 0);
+        for (y, (style, content)) in (0u32..).zip(TEXT_ROWS) {
+            put_styled(rndr, place, style, 0, y, content)?;
+        }
+        Ok(())
+    }
+
+    fn canvas(&self, view: Size, _ctx: &CanvasContext<'_>) -> Size {
+        let width = TEXT_ROWS
+            .iter()
+            .map(|(_, content)| text::width(content))
+            .max()
+            .unwrap_or(0);
+        Size::new(width.max(view.w), (TEXT_ROWS.len() as u32).max(view.h))
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::fill()
+    }
+
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("text_samples")
+    }
+}
+
+/// Modal content widget.
+struct ModalContent;
+
+impl Widget for ModalContent {
+    fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
+        let view = ctx.view();
+        let rect = view.view_rect_local();
+
+        // Fill background so dimmed content doesn't show through
+        rndr.fill("", rect, ' ')?;
+
+        rndr.text("", rect.line(0)?, "This is a modal overlay.")?;
+        rndr.text("", rect.line(1)?, "Press Esc to dismiss.")?;
+
+        Ok(())
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::fill()
+    }
+}
+
+/// The looks of the button samples, one row each.
+const BUTTON_LOOKS: [(&str, ButtonLook); 4] = [
+    ("Solid", ButtonLook::Solid),
+    ("Inset", ButtonLook::Inset),
+    ("Bevel", ButtonLook::Bevel),
+    ("Bordered", ButtonLook::Bordered(BoxGlyphs::ROUND)),
+];
+
+/// Add stock widgets under `parent`, one titled frame each. The buttons run
+/// commands of `owner`: one that does nothing, and one that is disabled.
+fn add_widget_samples(c: &mut dyn Context, parent: NodeId, owner: NodeId) -> Result<()> {
+    let buttons = c.add_child(parent, Frame::new().with_title("Buttons"))?;
+    let rows: u32 = BUTTON_LOOKS.iter().map(|(_, look)| look.rows()).sum();
+    let gaps = u32::try_from(BUTTON_LOOKS.len())
+        .unwrap_or(0)
+        .saturating_sub(1);
+    c.set_layout_override(
+        buttons.into(),
+        Layout::column()
+            .fixed_height(rows + gaps + 2)
+            .flex_horizontal(1)
+            .gap(1)
+            .padding(Edges::all(1))
+            .into(),
+    )?;
+    let target = CommandTarget::Exact(owner);
+    for (name, look) in BUTTON_LOOKS {
+        let row = c.add_child(buttons, Container::row())?;
+        c.set_layout_override(
+            row.into(),
+            Layout::fill()
+                .direction(Direction::Row)
+                .gap(2)
+                .fixed_height(look.rows())
+                .into(),
+        )?;
+        for (label, state) in [
+            (name, "normal"),
+            ("Pressed", "active"),
+            ("Disabled", "disabled"),
+        ] {
+            let command = if state == "disabled" {
+                Stylegym::call_unavailable()
+            } else {
+                Stylegym::call_sample()
+            };
+            let mut button = Button::new(label)
+                .with_look(look)
+                .with_command(command.with_target(target));
+            button.set_active(state == "active");
+            c.add_child(row, button)?;
+        }
+    }
+
+    for (title, value) in [
+        ("Input", "Focus me and type"),
+        ("Another input", "Unfocused"),
+    ] {
+        let frame = c.add_child(parent, Frame::new().with_title(title))?;
+        c.add_child(frame, Input::new(value))?;
+        c.set_layout_override(
+            frame.into(),
+            Layout::column()
+                .fixed_height(3)
+                .flex_horizontal(1)
+                .padding(Edges::all(1))
+                .into(),
+        )?;
+    }
+
+    let frame = c.add_child(parent, Frame::new().with_title("Selector"))?;
+    let items = ["Chosen", "Also offered", "Unchosen"].map(String::from);
+    c.add_child(frame, Selector::new(items.to_vec()).with_chosen(0))?;
+    c.set_layout_override(
+        frame.into(),
+        Layout::column()
+            .fixed_height(5)
+            .flex_horizontal(1)
+            .padding(Edges::all(1))
+            .into(),
+    )?;
+    Ok(())
+}
+
+/// Add highlighted, searched editors under `parent`.
+fn add_syntax_samples(c: &mut dyn Context, parent: NodeId) -> Result<()> {
+    let samples = [
+        ("Rust", "rs", RUST_SAMPLE, "self"),
+        ("Luau", "luau", LUAU_SAMPLE, "tabs"),
+    ];
+    for (title, extension, source, query) in samples {
+        let config = EditorConfig::new()
+            .with_interaction(Interaction::View)
+            .with_line_numbers(LineNumbers::Absolute)
+            .with_wrap(WrapMode::None);
+        let mut editor = Editor::with_config(source, config);
+        editor.set_highlighter(Some(Box::new(SyntectHighlighter::new(extension))));
+        let frame = c.add_child(parent, Frame::new().with_title(title))?;
+        let editor = c.add_child(frame, editor)?;
+        c.set_layout_override(editor.into(), Layout::fill().into())?;
+        c.with_widget_mut(editor, |editor: &mut Editor, ctx| {
+            editor.search(ctx, query.to_string());
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Root widget for the stylegym demo.
+pub struct Stylegym {
+    /// Whether the modal is currently shown.
+    modal_visible: bool,
+    /// Current theme index.
+    current_theme: usize,
+    /// The rules page, once mounted.
+    rules: Option<TypedId<StyleSheet>>,
+}
+
+impl Default for Stylegym {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive_commands]
+impl Stylegym {
+    /// Create a new stylegym instance.
+    pub fn new() -> Self {
+        Self {
+            modal_visible: false,
+            current_theme: 0,
+            rules: None,
+        }
+    }
+
+    /// Do nothing: the action of the enabled button samples.
+    #[command]
+    pub fn sample(&self) {}
+
+    /// Never run: the action of the disabled button samples.
+    #[command(enabled = "never")]
+    pub fn unavailable(&self) {}
+
+    /// Report the sample action that is never available.
+    fn never(&self, _ctx: &dyn ViewContext) -> Result<CommandStatus> {
+        Ok(CommandStatus::Disabled(
+            "a sample of a disabled button".into(),
+        ))
+    }
+
+    /// Execute a closure with the right container widget.
+    fn with_right_container<F, R>(&self, c: &mut dyn Context, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Container, &mut dyn Context) -> Result<R>,
+    {
+        c.with_slot::<RightContainerSlot, _>(c.node_id(), f)
+    }
+
+    /// Execute a closure with the tabs that hold the style pages.
+    fn with_tabs<F, R>(&self, c: &mut dyn Context, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Tabs, &mut dyn Context) -> Result<R>,
+    {
+        self.with_right_container(c, |_, ctx| {
+            ctx.with_slot::<MainFrameSlot, _>(ctx.node_id(), |_, ctx| {
+                ctx.with_slot::<TabsSlot, _>(ctx.node_id(), f)
+            })
+        })
+    }
+
+    /// Install a theme and list its rules.
+    fn install_theme(&self, c: &mut dyn Context, builder: fn() -> Palette) -> Result<()> {
+        let palette = builder();
+        let map = palette.style_map();
+        if let Some(rules) = self.rules {
+            c.with_widget_mut(rules, |sheet: &mut StyleSheet, _ctx| {
+                sheet.set_rules(&map);
+                Ok(())
+            })?;
+        }
+        c.set_theme(palette);
+        Ok(())
+    }
+
+    /// Show the tab at `index`.
+    #[command]
+    pub(crate) fn show_tab(&self, c: &mut dyn Context, index: usize) -> Result<()> {
+        self.with_tabs(c, |tabs, ctx| tabs.select(ctx, index))
+    }
+
+    /// Move to another tab by a signed offset, wrapping around.
+    #[command]
+    pub(crate) fn next_tab(&self, c: &mut dyn Context, delta: i32) -> Result<()> {
+        self.with_tabs(c, |tabs, ctx| tabs.cycle(ctx, delta))
+    }
+
+    /// Show the modal overlay.
+    #[command]
+    pub(crate) fn show_modal(&mut self, c: &mut dyn Context) -> Result<()> {
+        if self.modal_visible {
+            return Ok(());
+        }
+        self.modal_visible = true;
+
+        self.with_right_container(c, |_, ctx| {
+            if ctx.child_slot_of(ctx.node_id(), ModalSlot::KEY).is_some() {
+                return Ok(());
+            }
+            let modal_id = ctx.add_slot::<ModalSlot>(ctx.node_id(), Container::center())?;
+            let frame_id = ctx.add_child(modal_id, Frame::new().with_title("Demo Modal"))?;
+            ctx.add_child(frame_id, ModalContent)?;
+
+            let mut layout = Layout::fill().padding(Edges::all(1));
+            layout.min_width = Some(35);
+            layout.max_width = Some(40);
+            layout.min_height = Some(5);
+            layout.max_height = Some(7);
+            ctx.set_layout_override(frame_id.into(), layout.into())?;
+            Ok(())
+        })?;
+
+        // Dim the style pages
+        self.with_tabs(c, |_tabs, ctx| {
+            ctx.push_effect(ctx.node_id(), effects::brightness(0.5))
+        })?;
+
+        Ok(())
+    }
+
+    /// Hide the modal overlay.
+    #[command]
+    pub(crate) fn hide_modal(&mut self, c: &mut dyn Context) -> Result<()> {
+        if !self.modal_visible {
+            return Ok(());
+        }
+        self.modal_visible = false;
+
+        self.with_right_container(c, |_, ctx| {
+            if let Some(modal_id) = ctx.child_slot_of(ctx.node_id(), ModalSlot::KEY) {
+                ctx.remove_subtree(modal_id)?;
+            }
+            Ok(())
+        })?;
+
+        // Re-apply user effects (clears dim, applies selected effects)
+        self.apply_effects(c)?;
+
+        Ok(())
+    }
+
+    /// Apply the selected theme from the dropdown.
+    #[command]
+    pub(crate) fn apply_theme(&mut self, c: &mut dyn Context) -> Result<()> {
+        let Some(dropdown) = c.unique_descendant::<Dropdown<ThemeOption>>(c.node_id())? else {
+            return Ok(());
+        };
+        let (index, builder) = c.with_widget(dropdown, |dropdown: &Dropdown<ThemeOption>| {
+            Ok((dropdown.selected_index(), dropdown.selected().builder))
+        })?;
+
+        if index != self.current_theme {
+            self.current_theme = index;
+            self.install_theme(c, builder)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the chosen effect from the selector to the style pages.
+    #[command]
+    pub(crate) fn apply_effects(&self, c: &mut dyn Context) -> Result<()> {
+        let chosen = match c.unique_descendant::<Selector<EffectOption>>(c.node_id())? {
+            Some(selector) => c.with_widget(selector, |selector: &Selector<EffectOption>| {
+                Ok(selector.chosen().and_then(|option| option.effect.clone()))
+            })?,
+            None => None,
+        };
+
+        self.with_tabs(c, |_tabs, ctx| {
+            ctx.clear_effects(ctx.node_id())?;
+            if let Some(effect) = chosen {
+                ctx.push_effect(ctx.node_id(), effect)?;
+            }
+            if self.modal_visible {
+                ctx.push_effect(ctx.node_id(), effects::brightness(0.5))?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+impl Widget for Stylegym {
+    fn layout(&self) -> Layout {
+        Layout::fill().direction(Direction::Row)
+    }
+
+    fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
+        // Create left frame (controls) - preserve Frame's padding for border
+        let left_frame_id =
+            c.add_slot::<ControlsSlot>(c.node_id(), Frame::new().with_title("Styles"))?;
+        c.set_layout_override(
+            left_frame_id.into(),
+            Layout::column()
+                .fixed_width(32)
+                .flex_vertical(1)
+                .padding(Edges::all(1))
+                .into(),
+        )?;
+
+        // Create theme dropdown with its own frame - no fixed height so it can
+        // expand
+        let theme_frame_id =
+            c.add_slot::<ThemeFrameSlot>(left_frame_id, Frame::new().with_title("Theme"))?;
+        c.add_slot::<ThemeDropdownSlot>(theme_frame_id, Dropdown::new(available_themes())?)?;
+        c.set_layout_override(
+            theme_frame_id.into(),
+            Layout::column()
+                .flex_horizontal(1)
+                .padding(Edges::all(1))
+                .into(),
+        )?;
+
+        // Create effects selector with its own frame
+        let effects_frame_id =
+            c.add_slot::<EffectsFrameSlot>(left_frame_id, Frame::new().with_title("Effects"))?;
+        c.add_slot::<EffectsSelectorSlot>(
+            effects_frame_id,
+            Selector::new(available_effects()).with_chosen(0),
+        )?;
+        c.set_layout_override(
+            effects_frame_id.into(),
+            Layout::fill().padding(Edges::all(1)).into(),
+        )?;
+
+        // Create right container with Stack layout for modal overlay
+        let right_container_id =
+            c.add_slot::<RightContainerSlot>(c.node_id(), Container::stack())?;
+
+        // Create the styles frame and its tabbed pages
+        let styles_frame_id = c.add_slot::<MainFrameSlot>(right_container_id, Frame::new())?;
+        let tabs_id = c.add_slot::<TabsSlot>(styles_frame_id, Tabs::new())?;
+        let owner = c.node_id();
+        let (palette, rules) = c.with_widget_mut(tabs_id, |tabs: &mut Tabs, ctx| {
+            let palette = tabs.add_tab(ctx, "Palette", StyleSheet::palette())?;
+            let rules = tabs.add_tab(ctx, "Rules", StyleSheet::rules())?;
+            let widgets = tabs.add_tab(ctx, "Widgets", Scroll::vertical())?;
+            add_widget_samples(ctx, widgets.into(), owner)?;
+            let syntax = tabs.add_tab(ctx, "Syntax", Container::row())?;
+            add_syntax_samples(ctx, syntax.into())?;
+            tabs.add_tab(ctx, "Text", TextSamples)?;
+            Ok((palette, rules))
+        })?;
+        self.rules = Some(rules);
+        // Start in the main pane so the scroll keys reach the palette.
+        c.set_focus(palette.into())?;
+        self.install_theme(c, available_themes()[self.current_theme].builder)
+    }
+}
+
+impl Register for Stylegym {
+    fn register(setup: &mut Setup) -> Result<()> {
+        Root::register(setup)?;
+        setup.add_commands::<Self>()?;
+        setup.add_commands::<Dropdown<ThemeOption>>()?;
+        setup.add_commands::<Selector<EffectOption>>()?;
+        setup.add_commands::<Tabs>()?;
+        setup.add_commands::<StyleSheet>()?;
+        setup.add_commands::<TextSamples>()?;
+        Input::register(setup)?;
+        setup.add_commands::<Editor>()?;
+        Ok(())
+    }
+}
+
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.script("stylegym", DEFAULT_BINDINGS)
+}

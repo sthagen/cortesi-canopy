@@ -135,6 +135,7 @@ impl Color {
 
     /// Scale brightness by a factor. 0.0 = black, 1.0 = unchanged, 2.0 = double
     /// brightness.
+    #[must_use]
     pub fn scale_brightness(self, factor: f32) -> Self {
         let (r, g, b) = self.rgb();
         let scale = |v: u8| ((v as f32 * factor).clamp(0.0, 255.0)) as u8;
@@ -147,6 +148,7 @@ impl Color {
 
     /// Adjust saturation. 0.0 = grayscale, 1.0 = unchanged, 2.0 = double
     /// saturation.
+    #[must_use]
     pub fn saturation(self, factor: f32) -> Self {
         let (r, g, b) = self.rgb();
         let (hue, sat, light) = rgb_to_hsl(r, g, b);
@@ -158,23 +160,125 @@ impl Color {
         }
     }
 
-    /// Blend this color with another. ratio 0.0 = self, 1.0 = other.
-    pub fn blend(self, other: Self, ratio: f32) -> Self {
-        let (r1, g1, b1) = self.rgb();
-        let (r2, g2, b2) = other.rgb();
-        let mix = |a: u8, b: u8| {
-            let a = a as f32;
-            let b = b as f32;
-            ((a + (b - a) * ratio).clamp(0.0, 255.0)) as u8
-        };
-        Self::Rgb {
-            r: mix(r1, r2),
-            g: mix(g1, g2),
-            b: mix(b1, b2),
+    /// Mix this color with another in a color space. `t` 0.0 is `self`, and
+    /// 1.0 is `other`.
+    ///
+    /// `Mix::Rgb` mixes the sRGB channels. `Mix::Oklab` mixes in the
+    /// perceptual OKLab space, so equal steps look equal. `Mix::Oklch` also
+    /// takes the shorter way around the hue circle.
+    #[must_use]
+    pub fn mix(self, other: Self, t: f32, space: Mix) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        match space {
+            Mix::Rgb => {
+                let (r1, g1, b1) = self.rgb();
+                let (r2, g2, b2) = other.rgb();
+                let mix = |a: u8, b: u8| {
+                    let a = f32::from(a);
+                    let b = f32::from(b);
+                    (a + (b - a) * t).clamp(0.0, 255.0) as u8
+                };
+                Self::Rgb {
+                    r: mix(r1, r2),
+                    g: mix(g1, g2),
+                    b: mix(b1, b2),
+                }
+            }
+            Mix::Oklab => {
+                let a = Oklab::from_color(self);
+                let b = Oklab::from_color(other);
+                Oklab {
+                    l: lerp(a.l, b.l, t),
+                    a: lerp(a.a, b.a, t),
+                    b: lerp(a.b, b.b, t),
+                }
+                .to_color()
+            }
+            Mix::Oklch => {
+                let a = Oklab::from_color(self).to_lch();
+                let b = Oklab::from_color(other).to_lch();
+                // An achromatic end has no hue, so it takes the other's.
+                let (ha, hb) = match (a.c < ACHROMATIC, b.c < ACHROMATIC) {
+                    (true, false) => (b.h, b.h),
+                    (false, true) => (a.h, a.h),
+                    _ => (a.h, b.h),
+                };
+                let mut dh = (hb - ha).rem_euclid(360.0);
+                if dh > 180.0 {
+                    dh -= 360.0;
+                }
+                Oklch {
+                    l: lerp(a.l, b.l, t),
+                    c: lerp(a.c, b.c, t),
+                    h: ha + dh * t,
+                }
+                .to_oklab()
+                .to_color()
+            }
         }
     }
 
+    /// Return the WCAG relative luminance, from 0.0 for black to 1.0 for
+    /// white.
+    pub fn relative_luminance(self) -> f32 {
+        let (r, g, b) = self.rgb();
+        0.2126 * srgb_to_linear(r) + 0.7152 * srgb_to_linear(g) + 0.0722 * srgb_to_linear(b)
+    }
+
+    /// Return the WCAG contrast ratio with another color, from 1.0 for equal
+    /// luminance to 21.0 for black on white.
+    pub fn contrast_ratio(self, other: Self) -> f32 {
+        let a = self.relative_luminance();
+        let b = other.relative_luminance();
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Return this color moved away from `others` in OKLCH lightness, just far
+    /// enough that its WCAG contrast ratio with each of them reaches `ratio`.
+    ///
+    /// The hue stays, and the chroma shrinks only as far as sRGB requires at
+    /// the new lightness. The color gets lighter when its luminance is above
+    /// the mean luminance of `others`, and darker otherwise, so it never
+    /// crosses them. A color that already reaches `ratio` returns as it is.
+    /// When even white or black falls short, the end of that direction
+    /// returns, which is the best contrast the direction allows.
+    #[must_use]
+    pub fn with_contrast(self, others: &[Self], ratio: f32) -> Self {
+        /// Steps between the color and the end of its direction, which is
+        /// finer than one step of 8-bit color.
+        const STEPS: u16 = 512;
+        let reaches = |color: Self| {
+            others
+                .iter()
+                .all(|other| color.contrast_ratio(*other) >= ratio)
+        };
+        if others.is_empty() || reaches(self) {
+            return self;
+        }
+        let mean = others
+            .iter()
+            .map(|other| other.relative_luminance())
+            .sum::<f32>()
+            / others.len() as f32;
+        let lch = Oklab::from_color(self).to_lch();
+        let end = if self.relative_luminance() > mean {
+            1.0
+        } else {
+            0.0
+        };
+        let mut moved = self;
+        for step in 1..=STEPS {
+            let l = lch.l + (end - lch.l) * f32::from(step) / f32::from(STEPS);
+            moved = Oklch { l, ..lch }.fit();
+            if reaches(moved) {
+                break;
+            }
+        }
+        moved
+    }
+
     /// Invert RGB channels (255 - value for each channel).
+    #[must_use]
     pub fn invert_rgb(self) -> Self {
         let (r, g, b) = self.rgb();
         Self::Rgb {
@@ -184,7 +288,28 @@ impl Color {
         }
     }
 
+    /// Rotate the hue by `degrees` in OKLCH, and keep the perceived
+    /// lightness and as much chroma as sRGB can show.
+    ///
+    /// Rotation changes the hue while preserving OKLab lightness. A color
+    /// that leaves the sRGB gamut loses chroma until it fits, so opposite
+    /// rotations can have different chroma. A gray has no hue and stays as
+    /// it is.
+    #[must_use]
+    pub fn rotate_hue_oklch(self, degrees: f32) -> Self {
+        let lch = Oklab::from_color(self).to_lch();
+        if lch.c < ACHROMATIC {
+            return self;
+        }
+        Oklch {
+            h: (lch.h + degrees).rem_euclid(360.0),
+            ..lch
+        }
+        .fit()
+    }
+
     /// Shift hue by degrees (0-360).
+    #[must_use]
     pub fn shift_hue(self, degrees: f32) -> Self {
         let (r, g, b) = self.rgb();
         let (hue, sat, light) = rgb_to_hsl(r, g, b);
@@ -193,6 +318,161 @@ impl Color {
             r: nr,
             g: ng,
             b: nb,
+        }
+    }
+}
+
+/// The space in which two colors mix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Mix {
+    /// The sRGB channels.
+    Rgb,
+    /// The perceptual OKLab space, where equal steps look equal.
+    #[default]
+    Oklab,
+    /// OKLab in polar form, which takes the shorter way around the hue circle.
+    Oklch,
+}
+
+/// Chroma below which an OKLCH color has no meaningful hue.
+const ACHROMATIC: f32 = 1e-4;
+
+/// Interpolate linearly between two values.
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Convert one sRGB channel to linear light.
+fn srgb_to_linear(v: u8) -> f32 {
+    let c = f32::from(v) / 255.0;
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Convert linear light to one sRGB channel.
+fn linear_to_srgb(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let v = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (v * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// A color in the OKLab space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Oklab {
+    /// Perceived lightness.
+    l: f32,
+    /// Green to red axis.
+    a: f32,
+    /// Blue to yellow axis.
+    b: f32,
+}
+
+/// A color in OKLCH, the polar form of OKLab.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Oklch {
+    /// Perceived lightness.
+    l: f32,
+    /// Chroma.
+    c: f32,
+    /// Hue in degrees.
+    h: f32,
+}
+
+impl Oklab {
+    /// Convert an sRGB color.
+    #[allow(clippy::many_single_char_names)]
+    fn from_color(color: Color) -> Self {
+        let (r, g, b) = color.rgb();
+        let (r, g, b) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+        let l = 0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b;
+        let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
+        let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
+        let (l, m, s) = (l.cbrt(), m.cbrt(), s.cbrt());
+        Self {
+            l: 0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+            a: 1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+            b: 0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+        }
+    }
+
+    /// Return the linear sRGB channels, which can fall outside 0 to 1.
+    #[allow(clippy::many_single_char_names)]
+    fn linear(self) -> [f32; 3] {
+        let l = self.l + 0.396_337_78 * self.a + 0.215_803_76 * self.b;
+        let m = self.l - 0.105_561_346 * self.a - 0.063_854_17 * self.b;
+        let s = self.l - 0.089_484_18 * self.a - 1.291_485_5 * self.b;
+        let (l, m, s) = (l * l * l, m * m * m, s * s * s);
+        [
+            4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s,
+            -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s,
+            -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s,
+        ]
+    }
+
+    /// Return whether sRGB shows the color without clipping.
+    fn in_gamut(self) -> bool {
+        /// Slack for rounding at the edge of the gamut.
+        const EDGE: f32 = 1e-4;
+        self.linear()
+            .iter()
+            .all(|channel| (-EDGE..=1.0 + EDGE).contains(channel))
+    }
+
+    /// Convert to the nearest sRGB color.
+    fn to_color(self) -> Color {
+        let [r, g, b] = self.linear();
+        Color::Rgb {
+            r: linear_to_srgb(r),
+            g: linear_to_srgb(g),
+            b: linear_to_srgb(b),
+        }
+    }
+
+    /// Convert to polar form.
+    fn to_lch(self) -> Oklch {
+        Oklch {
+            l: self.l,
+            c: self.a.hypot(self.b),
+            h: self.b.atan2(self.a).to_degrees().rem_euclid(360.0),
+        }
+    }
+}
+
+impl Oklch {
+    /// Return the nearest sRGB color that keeps this lightness and hue,
+    /// giving up chroma until it fits.
+    fn fit(self) -> Color {
+        if self.to_oklab().in_gamut() {
+            return self.to_oklab().to_color();
+        }
+        // Halve the interval between a chroma that fits and one that does
+        // not, which settles well within one step of 8-bit color.
+        let (mut fits, mut over) = (0.0, self.c);
+        for _ in 0..16 {
+            let c = (fits + over) / 2.0;
+            if (Self { c, ..self }).to_oklab().in_gamut() {
+                fits = c;
+            } else {
+                over = c;
+            }
+        }
+        Self { c: fits, ..self }.to_oklab().to_color()
+    }
+
+    /// Convert to rectangular form.
+    fn to_oklab(self) -> Oklab {
+        let h = self.h.to_radians();
+        Oklab {
+            l: self.l,
+            a: self.c * h.cos(),
+            b: self.c * h.sin(),
         }
     }
 }
@@ -373,26 +653,187 @@ mod tests {
     }
 
     #[test]
-    fn test_blend() {
+    fn rgb_mixes_keep_the_channel_blend() {
         let black = Color::Rgb { r: 0, g: 0, b: 0 };
         let white = Color::Rgb {
             r: 255,
             g: 255,
             b: 255,
         };
-        // Blend 50/50 should give gray (127 or 128 due to rounding)
-        let gray = black.blend(white, 0.5);
-        if let Color::Rgb { r, g, b } = gray {
-            assert!((127..=128).contains(&r));
-            assert!((127..=128).contains(&g));
-            assert!((127..=128).contains(&b));
-        } else {
-            panic!("Expected RGB");
+        assert_eq!(
+            black.mix(white, 0.5, Mix::Rgb),
+            Color::Rgb {
+                r: 127,
+                g: 127,
+                b: 127
+            }
+        );
+        assert_eq!(black.mix(white, 0.0, Mix::Rgb), black);
+        assert_eq!(black.mix(white, 1.0, Mix::Rgb), white);
+    }
+
+    #[test]
+    fn oklab_round_trips_every_named_color() {
+        let named = [
+            Color::Black,
+            Color::White,
+            Color::Red,
+            Color::Green,
+            Color::Blue,
+            Color::Grey,
+            Color::DarkYellow,
+            Color::AnsiValue(208),
+            Color::Rgb {
+                r: 18,
+                g: 52,
+                b: 86,
+            },
+        ];
+        for color in named {
+            let (r, g, b) = color.rgb();
+            assert_eq!(Oklab::from_color(color).to_color(), Color::Rgb { r, g, b });
+            assert_eq!(
+                Oklab::from_color(color).to_lch().to_oklab().to_color(),
+                Color::Rgb { r, g, b }
+            );
         }
-        // Blend 0 should keep first color
-        assert_eq!(black.blend(white, 0.0), black);
-        // Blend 1 should give second color
-        assert_eq!(black.blend(white, 1.0), white);
+    }
+
+    #[test]
+    fn oklab_mixes_match_reference_values() {
+        let black = Color::Black;
+        let white = Color::White;
+        // OKLab lightness 0.5 is sRGB 99, not the channel midpoint 127.
+        assert_eq!(
+            black.mix(white, 0.5, Mix::Oklab),
+            Color::Rgb {
+                r: 99,
+                g: 99,
+                b: 99
+            }
+        );
+        assert_eq!(
+            black.mix(white, 0.0, Mix::Oklab),
+            Color::Rgb { r: 0, g: 0, b: 0 }
+        );
+        assert_eq!(
+            black.mix(white, 1.0, Mix::Oklab),
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
+    }
+
+    #[test]
+    fn oklch_takes_the_shorter_hue_path() {
+        // Red (hue 29) to blue (hue 264) goes through magenta, not green.
+        let (r, g, b) = Color::Red.mix(Color::Blue, 0.5, Mix::Oklch).rgb();
+        assert!(r > g && b > g, "expected a magenta, got ({r}, {g}, {b})");
+        // An achromatic end keeps the hue of the other end.
+        let (r, g, b) = Color::Grey.mix(Color::Red, 0.5, Mix::Oklch).rgb();
+        assert!(r > g && r > b, "expected a red, got ({r}, {g}, {b})");
+    }
+
+    #[test]
+    fn an_oklch_rotation_keeps_lightness_and_turns_the_hue() {
+        let lch = |color: Color| Oklab::from_color(color).to_lch();
+        let base = Color::Rgb {
+            r: 0x5f,
+            g: 0x87,
+            b: 0xd7,
+        };
+        let before = lch(base);
+        for degrees in [28.0, -28.0, 180.0] {
+            let after = lch(base.rotate_hue_oklch(degrees));
+            assert!((after.l - before.l).abs() < 0.01, "{degrees}: lightness");
+            let turned = (after.h - before.h - degrees).rem_euclid(360.0);
+            assert!(
+                turned < 1.0 || turned > 359.0,
+                "{degrees}: turned by {}",
+                (after.h - before.h).rem_euclid(360.0)
+            );
+        }
+        assert_eq!(base.rotate_hue_oklch(0.0), base);
+        assert_eq!(base.rotate_hue_oklch(360.0), base);
+    }
+
+    #[test]
+    fn an_oklch_rotation_stays_in_gamut_and_keeps_grays() {
+        // Saturated primaries leave sRGB when they turn, and lose chroma.
+        for color in [
+            Color::Rgb { r: 255, g: 0, b: 0 },
+            Color::Rgb { r: 0, g: 0, b: 255 },
+        ] {
+            for degrees in [-90.0, -28.0, 28.0, 90.0] {
+                let turned = color.rotate_hue_oklch(degrees);
+                let lab = Oklab::from_color(turned);
+                assert!(lab.in_gamut(), "{color:?} {degrees}");
+                assert!(
+                    (lab.l - Oklab::from_color(color).l).abs() < 0.02,
+                    "{color:?} {degrees}: lightness"
+                );
+            }
+        }
+        let gray = Color::Rgb {
+            r: 128,
+            g: 128,
+            b: 128,
+        };
+        assert_eq!(gray.rotate_hue_oklch(45.0), gray);
+    }
+
+    #[test]
+    fn contrast_follows_the_wcag_formula() {
+        assert!((Color::Black.contrast_ratio(Color::White) - 21.0).abs() < 0.01);
+        assert!((Color::White.contrast_ratio(Color::White) - 1.0).abs() < f32::EPSILON);
+        assert!(Color::Black.relative_luminance().abs() < f32::EPSILON);
+        assert!((Color::White.relative_luminance() - 1.0).abs() < 1e-6);
+        let grey = Color::Rgb {
+            r: 119,
+            g: 119,
+            b: 119,
+        };
+        // #777 on white is the textbook 4.48:1.
+        assert!((grey.contrast_ratio(Color::White) - 4.48).abs() < 0.01);
+    }
+
+    #[test]
+    fn contrast_moves_a_color_away_just_far_enough_and_keeps_its_hue() {
+        let lch = |color: Color| Oklab::from_color(color).to_lch();
+        let blue = rgb!("#8aadf4");
+        let text = rgb!("#eeeeee");
+        // Darker than the text, so the blue darkens until the text reads.
+        let face = blue.with_contrast(&[text], 4.5);
+        assert!(face.contrast_ratio(text) >= 4.5);
+        assert!(lch(face).l < lch(blue).l);
+        assert!((lch(face).h - lch(blue).h).abs() < 2.0, "the hue stays");
+        // One step less would fall short, so the move is the least that
+        // reaches the ratio.
+        let nearer = Oklch {
+            l: lch(face).l + 0.01,
+            ..lch(face)
+        }
+        .fit();
+        assert!(nearer.contrast_ratio(text) < 4.5);
+        // Lighter than a dark ground, so the blue lightens.
+        let ground = rgb!("#333333");
+        let key = blue.with_contrast(&[ground], 7.0);
+        assert!(key.contrast_ratio(ground) >= 7.0);
+        assert!(lch(key).l > lch(blue).l);
+        // A color that already reaches the ratio stays, and a ratio that no
+        // lightness reaches gives the end of the direction.
+        assert_eq!(blue.with_contrast(&[ground], 3.0), blue);
+        assert_eq!(blue.with_contrast(&[], 21.0), blue);
+        assert_eq!(
+            blue.with_contrast(&[ground], 21.0),
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
     }
 
     #[test]

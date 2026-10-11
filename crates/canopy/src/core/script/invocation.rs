@@ -31,9 +31,9 @@ pub struct ScriptInvocation {
     /// Present only while Ruau still owns a pending invocation.
     handle: Option<InvocationHandle>,
     /// Original dispatch origin restored for each VM segment.
-    anchor: NodeId,
+    origin: NodeId,
     /// Incarnation captured at admission or the first direct test poll.
-    anchor_incarnation: Option<u64>,
+    origin_incarnation: Option<u64>,
     /// Error context retained across polls.
     label: String,
     /// Options retain their print-quota state across VM segments.
@@ -55,16 +55,16 @@ impl fmt::Debug for ScriptInvocation {
         formatter
             .debug_struct("ScriptInvocation")
             .field("handle", &self.handle)
-            .field("anchor", &self.anchor)
+            .field("origin", &self.origin)
             .field("label", &self.label)
             .finish_non_exhaustive()
     }
 }
 
 impl ScriptInvocation {
-    /// Bind this task to the anchor widget that existed at admission.
-    pub(crate) fn set_anchor_incarnation(&mut self, incarnation: u64) {
-        self.anchor_incarnation = Some(incarnation);
+    /// Bind this task to the origin widget that existed at admission.
+    pub(crate) fn set_origin_incarnation(&mut self, incarnation: u64) {
+        self.origin_incarnation = Some(incarnation);
     }
 
     /// Preserve the requested budget while individual polls use the remaining
@@ -145,16 +145,16 @@ struct SegmentAnchor<'a> {
 
 impl<'a> SegmentAnchor<'a> {
     /// Push the admitted task origin until this segment releases its borrow.
-    fn enter(canopy: &'a mut Canopy, anchor: NodeId) -> Self {
-        let depth = canopy.script_context_stack.len();
-        canopy.script_context_stack.push(anchor);
+    fn enter(canopy: &'a mut Canopy, origin: NodeId) -> Self {
+        let depth = canopy.script.context_stack.len();
+        canopy.script.context_stack.push(origin);
         Self { canopy, depth }
     }
 }
 
 impl Drop for SegmentAnchor<'_> {
     fn drop(&mut self) {
-        self.canopy.script_context_stack.truncate(self.depth);
+        self.canopy.script.context_stack.truncate(self.depth);
     }
 }
 
@@ -162,9 +162,8 @@ impl LuauHost {
     /// Check admission before compilation, reload, or diagnostics mutation.
     pub(crate) fn ensure_eval_idle(&self) -> Result<()> {
         if self.is_eval_active() {
-            return Err(error::Error::script_structured(
-                error::ScriptErrorKind::ScriptBusy,
-                "a script evaluation is already active",
+            return Err(error::Error::ScriptBusy(
+                "a script evaluation is already active".into(),
             ));
         }
         Ok(())
@@ -178,12 +177,12 @@ impl LuauHost {
     /// Begin a compiled root without borrowing Canopy or retaining a VM borrow.
     pub(crate) fn start_invocation(
         &self,
-        anchor: NodeId,
+        origin: NodeId,
         script: ScriptId,
     ) -> Result<ScriptInvocation> {
         let active = self.begin_active_eval()?;
         let root = self.loaded_root(script)?;
-        let label = format!("script {script} on node {anchor:?}");
+        let label = format!("script {script} on node {origin:?}");
         let handle = self
             .runtime_mut("script VM re-entered without a live scope")?
             .create_root_invocation(&root)
@@ -192,8 +191,8 @@ impl LuauHost {
         Ok(ScriptInvocation {
             host: self.clone(),
             handle: Some(handle),
-            anchor,
-            anchor_incarnation: None,
+            origin,
+            origin_incarnation: None,
             label,
             options: invocation_options(None, &print_lines),
             reporting_timeout: None,
@@ -236,34 +235,30 @@ impl LuauHost {
         remaining_gas: u64,
         remaining_timeout: Option<Duration>,
     ) -> Result<ScriptPoll> {
-        let anchor = invocation.anchor;
-        let entry = canopy.core.nodes.get(anchor).ok_or_else(|| {
+        let origin = invocation.origin;
+        let entry = canopy.core.nodes.get(origin).ok_or_else(|| {
             error::Error::script_structured(
                 error::ScriptErrorKind::InvalidNode,
-                "script anchor no longer exists",
+                "script origin no longer exists",
             )
-            .with_owner(format!("{anchor:?}"))
+            .with_owner(format!("{origin:?}"))
         })?;
         if invocation
-            .anchor_incarnation
+            .origin_incarnation
             .is_some_and(|incarnation| incarnation != entry.incarnation)
         {
             return Err(error::Error::script_structured(
                 error::ScriptErrorKind::InvalidNode,
-                "script anchor widget was replaced",
+                "script origin widget was replaced",
             )
-            .with_owner(format!("{anchor:?}")));
+            .with_owner(format!("{origin:?}")));
         }
-        if !canopy.core.is_attached_to_root(anchor) {
-            return Err(error::Error::script_structured(
-                error::ScriptErrorKind::NodeDetached,
-                "script anchor is detached",
-            )
-            .with_owner(format!("{anchor:?}")));
+        if !canopy.core.is_attached_to_root(origin) {
+            return Err(error::Error::NodeDetached(origin));
         }
-        invocation.anchor_incarnation = Some(entry.incarnation);
+        invocation.origin_incarnation = Some(entry.incarnation);
         let handle = invocation.handle.ok_or_else(|| {
-            error::Error::InvalidOperation("script invocation is already complete".to_string())
+            error::Error::Invalid("script invocation is already complete".to_string())
         })?;
         let mut runtime = self.runtime_mut("script VM re-entered without a live scope")?;
         invocation.options = mem::take(&mut invocation.options).limits(Limits {
@@ -273,15 +268,15 @@ impl LuauHost {
         });
         let diagnostics =
             SegmentDiagnostics::enter(self, &mut invocation.logs, &mut invocation.assertions);
-        let anchor = SegmentAnchor::enter(canopy, invocation.anchor);
+        let origin = SegmentAnchor::enter(canopy, invocation.origin);
         let step = runtime.poll_invocation_with_context_and_result(
             handle,
-            &mut *anchor.canopy,
+            &mut *origin.canopy,
             &invocation.options,
             cx,
             |scope, values| scope.marshal_values(values),
         );
-        drop(anchor);
+        drop(origin);
         if step.poll.is_ready() {
             invocation.handle = None;
         }
@@ -370,7 +365,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        core::inputmap::BindingTarget,
+        input::BindingAction,
         testing::ttree::{R, run_ttree},
     };
 
@@ -411,8 +406,7 @@ mod tests {
     #[test]
     fn parked_script_releases_borrows_and_isolates_callback_diagnostics() -> Result<()> {
         run_ttree(|canopy, _, tree| {
-            canopy.finalize_api()?;
-            let host = canopy.script_host.clone();
+            let host = canopy.script.host.clone();
             let script = host.compile(r#"
                 canopy.bind("x", {description = "Independent callback", phase = "before_widget"}, function()
                     canopy.log("binding output")
@@ -426,7 +420,7 @@ mod tests {
             let mut gas = SCRIPT_GAS_LIMIT;
             assert!(drive_ready(&host, canopy, &mut invocation, &mut gas).is_pending());
             assert!(gas < SCRIPT_GAS_LIMIT);
-            assert!(canopy.script_context_stack.is_empty());
+            assert!(canopy.script.context_stack.is_empty());
             assert!(host.runtime.try_borrow_mut().is_ok());
             assert_eq!(host.logs(), vec!["ambient output"]);
             assert_eq!(invocation.logs, vec!["root output"]);
@@ -446,7 +440,7 @@ mod tests {
                 .bindings()
                 .iter()
                 .find_map(|binding| {
-                    if let BindingTarget::Script(id) = &binding.target {
+                    if let BindingAction::Script(id) = &binding.action {
                         Some(*id)
                     } else {
                         None
@@ -459,31 +453,19 @@ mod tests {
             assert_eq!(invocation.logs, vec!["root output"]);
             assert!(matches!(
                 host.compile("return 1"),
-                Err(error::Error::ScriptStructured {
-                    kind: error::ScriptErrorKind::ScriptBusy,
-                    ..
-                })
+                Err(error::Error::ScriptBusy(_))
             ));
             assert!(matches!(
                 host.compile_startup_named("invalid Luau", "busy_startup"),
-                Err(error::Error::ScriptStructured {
-                    kind: error::ScriptErrorKind::ScriptBusy,
-                    ..
-                })
+                Err(error::Error::ScriptBusy(_))
             ));
             assert!(matches!(
                 canopy.invalidate_script_modules(None),
-                Err(error::Error::ScriptStructured {
-                    kind: error::ScriptErrorKind::ScriptBusy,
-                    ..
-                })
+                Err(error::Error::ScriptBusy(_))
             ));
             assert!(matches!(
                 host.start_invocation(tree.root, script),
-                Err(error::Error::ScriptStructured {
-                    kind: error::ScriptErrorKind::ScriptBusy,
-                    ..
-                })
+                Err(error::Error::ScriptBusy(_))
             ));
             assert_eq!(host.logs(), vec!["ambient output", "binding output"]);
             assert!(host.state.borrow().closures.functions.contains_key(&target));
@@ -500,8 +482,7 @@ mod tests {
     #[test]
     fn detached_print_quota_and_result_survive_multiple_segments() -> Result<()> {
         run_ttree(|canopy, _, tree| {
-            canopy.finalize_api()?;
-            let host = canopy.script_host.clone();
+            let host = canopy.script.host.clone();
             let script = host.compile(
                 r#"
                 for i = 1, 4100 do print("before") end
@@ -532,10 +513,9 @@ mod tests {
     }
 
     #[test]
-    fn resumed_script_rejects_replaced_anchor_before_returning() -> Result<()> {
+    fn resumed_script_rejects_replaced_origin_before_returning() -> Result<()> {
         run_ttree(|canopy, _, tree| {
-            canopy.finalize_api()?;
-            let host = canopy.script_host.clone();
+            let host = canopy.script.host.clone();
             let script = host.compile("canopy.wait_for(function() return false end); return 42")?;
             let mut invocation = host.start_invocation(tree.root, script)?;
             let waker = Waker::from(Arc::new(TestWake(AtomicBool::new(true))));
@@ -565,7 +545,7 @@ mod tests {
             ));
             assert!(invocation.handle.is_none());
             assert!(!host.is_eval_active());
-            assert!(canopy.script_context_stack.is_empty());
+            assert!(canopy.script.context_stack.is_empty());
             Ok(())
         })
     }
@@ -573,8 +553,7 @@ mod tests {
     #[test]
     fn detached_vm_timeout_reports_the_original_budget() -> Result<()> {
         run_ttree(|canopy, _, tree| {
-            canopy.finalize_api()?;
-            let host = canopy.script_host.clone();
+            let host = canopy.script.host.clone();
             let script = host.compile("while true do end")?;
             let mut invocation = host.start_invocation(tree.root, script)?;
             invocation.set_reporting_timeout(Some(Duration::from_millis(125)));
@@ -599,8 +578,7 @@ mod tests {
     #[test]
     fn detached_segments_share_a_total_gas_budget() -> Result<()> {
         run_ttree(|canopy, _, tree| {
-            canopy.finalize_api()?;
-            let host = canopy.script_host.clone();
+            let host = canopy.script.host.clone();
             let script = host.compile(
                 r#"
                 for i = 1, 10000 do
@@ -619,7 +597,7 @@ mod tests {
                 "{error}"
             );
             assert!(invocation.handle.is_none());
-            assert!(canopy.script_context_stack.is_empty());
+            assert!(canopy.script.context_stack.is_empty());
             Ok(())
         })
     }

@@ -1,0 +1,193 @@
+use canopy::{
+    Register,
+    error::Result,
+    geom::{Point, Size},
+    input::{RouteTraceKind, key::Key},
+    testing::harness::Harness,
+};
+
+use super::{Mount, root_harness};
+use crate::{demo_canopy, termgym, widget_editor};
+
+#[test]
+fn demo_api_build_does_not_assemble_or_publish() -> Result<()> {
+    let canopy =
+        termgym::binding_setup(demo_canopy().configure(termgym::TermGym::register)).build()?;
+    assert!(canopy.snapshot().is_none());
+    assert!(
+        canopy
+            .with_root_view(|context| context.find_nodes("root/termgym"))?
+            .is_empty()
+    );
+    Ok(())
+}
+
+fn add_scroll_rows(canopy: &mut canopy::Canopy) -> Result<()> {
+    let mut source = ('a'..='t')
+        .map(|key| {
+            format!(
+                "canopy.bind(\"alt-{key}\", {{ phase = \"after_widget\", description = \"Extra help row {key}\" }}, function() end)\n"
+            )
+        })
+        .collect::<String>();
+    source.push_str(
+        r#"canopy.bind("ctrl-x", { phase = "before_widget",
+            description = "Acceptance sentinel",
+            path = "/root/**/",
+            tier = "global",
+        }, function()
+            canopy.enter_mode("accepted")
+        end)
+        "#,
+    );
+    canopy.eval_script(&source).map(|_| ())
+}
+
+fn prove_help_flow(mut harness: Harness, hidden: &[&str], shown: &[&str]) -> Result<()> {
+    harness.canopy.eval_script(
+        r#"
+        local count = 0
+        for _, binding in canopy.bindings() do
+            if binding.input == "Ctrl+g" and binding.tier == "global" then
+                count += 1
+            end
+        end
+        canopy.assert(count == 1, "the launcher must install one global help trigger")
+        "#,
+    )?;
+    add_scroll_rows(&mut harness.canopy)?;
+    let origin = harness
+        .canopy
+        .with_root_view(|context| context.focused_node())
+        .expect("demo should focus its consuming widget");
+
+    harness.key(Key::parse_spec("ctrl-g").expect("valid key"))?;
+    harness.render()?;
+
+    let list = harness
+        .find_nodes("root/help/**/binding_list")?
+        .into_iter()
+        .next()
+        .expect("help binding list");
+    assert_eq!(
+        harness
+            .canopy
+            .with_root_view(|context| context.focused_node()),
+        Some(list)
+    );
+    assert_eq!(
+        harness
+            .canopy
+            .available_bindings(None)?
+            .framework_group
+            .map(|group| group.as_str()),
+        Some("root.help")
+    );
+    assert!(harness.tbuf().contains_text("Keyboard shortcuts"));
+    assert!(!harness.tbuf().contains_text("Context:"));
+    // A binding that the focused widget shadows, or one that opts out of
+    // help, such as the help trigger itself, is not listed. A global binding
+    // that runs before the widget stays listed over any widget.
+    for text in hidden {
+        assert!(
+            !harness.tbuf().contains_text(text),
+            "{text} should not be listed"
+        );
+    }
+    for text in shown {
+        assert!(
+            harness.tbuf().contains_text(text),
+            "{text} should stay reachable"
+        );
+    }
+    let frame = harness.canopy.snapshot().expect("published help");
+    let panel = frame
+        .nodes
+        .iter()
+        .find(|node| node.name == "binding_list")
+        .and_then(|node| node.view)
+        .map(|view| view.outer)
+        .expect("visible help panel");
+    let cell = |x, y| frame.buffer.get(Point { x, y }).expect("cell on screen");
+    // Binding rows are one panel band each. The footer below them is a raised
+    // bar inset by the panel's side padding, so it is checked separately.
+    for y in panel.tl.y as u32..panel.tl.y as u32 + panel.h.saturating_sub(1) {
+        let background = cell(panel.tl.x as u32, y).style.bg;
+        for x in panel.tl.x as u32..panel.tl.x as u32 + panel.w {
+            assert_eq!(
+                cell(x, y).style.bg,
+                background,
+                "help background gap at {x},{y}"
+            );
+        }
+    }
+
+    harness.key(Key::parse_spec("Down").expect("valid key"))?;
+    // A help panel that fits cannot scroll, so the navigation intent
+    // declines; the key stays inside the modal and runs nothing behind it.
+    assert!(
+        !harness
+            .canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.kind == RouteTraceKind::RunBinding)
+    );
+    harness.key(Key::parse_spec("ctrl-g").expect("valid key"))?;
+
+    assert_eq!(
+        harness
+            .canopy
+            .with_root_view(|context| context.focused_node()),
+        Some(origin)
+    );
+    harness.key(Key::parse_spec("ctrl-x").expect("valid key"))?;
+    assert_eq!(
+        harness
+            .canopy
+            .route_trace()
+            .first()
+            .and_then(|entry| entry.node),
+        Some(origin)
+    );
+    assert!(
+        harness
+            .canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.kind == RouteTraceKind::Handled)
+    );
+    assert_eq!(harness.canopy.mode(), "accepted");
+    Ok(())
+}
+
+#[test]
+fn termgym_help_opens_over_a_consuming_terminal_and_restores_input() -> Result<()> {
+    let harness = root_harness(
+        termgym::TermGym::new(),
+        |builder| termgym::binding_setup(builder.configure(termgym::TermGym::register)),
+        Size::new(80, 24),
+        Mount::Wrap,
+    )?;
+    prove_help_flow(
+        harness,
+        &["Quit", "Extra help row a", "Show key bindings"],
+        &["Acceptance sentinel"],
+    )
+}
+
+#[test]
+fn widget_editor_help_opens_over_a_consuming_editor_and_restores_input() -> Result<()> {
+    let harness = root_harness(
+        widget_editor::WidgetEditor::new("fn main() {}\n", "rs", "test.rs"),
+        |builder| {
+            widget_editor::binding_setup(builder.configure(widget_editor::WidgetEditor::register))
+        },
+        Size::new(80, 40),
+        Mount::Wrap,
+    )?;
+    prove_help_flow(
+        harness,
+        &["Show key bindings"],
+        &["Quit", "Extra help row a", "Acceptance sentinel"],
+    )
+}

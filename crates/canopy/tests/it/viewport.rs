@@ -3,12 +3,13 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Canopy, Context, ContextExt, EventOutcome, Loader, ModalBindings, ModalOptions, NodeId,
-        NodeName, Render, RoutePhase, ViewContext, Widget, derive_commands,
+        Context, ContextExt, EventOutcome, NodeId, NodeName, Register, Setup, ViewContext, Widget,
+        derive_commands,
         error::Result,
-        event::{Event, key, mouse},
         geom::{Line, Point, PointI32, Size},
-        layout::{CanvasContext, Layout},
+        input::{Event, ModalBindings, ModalOptions, RouteTraceKind, key, mouse},
+        layout::{CanvasContext, Layout, ScrollDirection, ScrollOp},
+        render::Render,
         testing::harness::Harness,
     };
 
@@ -23,7 +24,7 @@ mod tests {
 
         #[command]
         fn scroll_down(&self, c: &mut dyn Context) {
-            let _ = c.scroll_down();
+            let _ = c.scroll(ScrollOp::Lines(ScrollDirection::Down, 1));
         }
     }
 
@@ -63,16 +64,19 @@ mod tests {
         }
     }
 
-    impl Loader for ScrollTest {
-        fn load(c: &mut Canopy) -> Result<()> {
-            c.add_commands::<Self>()?;
+    impl Register for ScrollTest {
+        fn register(setup: &mut Setup) -> Result<()> {
+            setup.add_commands::<Self>()?;
             Ok(())
         }
     }
 
     #[test]
     fn test_scroll_behavior() -> Result<()> {
-        let mut harness = Harness::builder(ScrollTest::new()).size(30, 10).build()?;
+        let mut harness = Harness::builder(ScrollTest::new())
+            .register::<ScrollTest>()
+            .size(30, 10)
+            .build()?;
         harness.canopy.eval_script(
             r#"
 canopy.bind("Down", { description = "Scroll down" }, function()
@@ -135,19 +139,23 @@ end)
         }
 
         fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
-            let inner = c.add_child(Pane {
-                canvas: Size::new(30, 30),
-                consume_wheel: false,
-            })?;
-            c.set_layout_of(inner, Layout::column().fixed_width(10).fixed_height(4))
+            let inner = c.add_child(
+                c.node_id(),
+                Pane {
+                    canvas: Size::new(30, 30),
+                    consume_wheel: false,
+                },
+            )?;
+            c.set_layout_override(
+                inner.into(),
+                Layout::column().fixed_width(10).fixed_height(4).into(),
+            )
         }
 
         fn name(&self) -> NodeName {
             NodeName::convert("outer")
         }
     }
-
-    impl Loader for Outer {}
 
     /// Build a 20 by 10 cell harness around [`Outer`] and return the inner
     /// pane.
@@ -177,12 +185,12 @@ end)
     }
 
     /// Return the phases of the last input route.
-    fn phases(harness: &Harness) -> Vec<RoutePhase> {
+    fn phases(harness: &Harness) -> Vec<RouteTraceKind> {
         harness
             .canopy
             .route_trace()
             .iter()
-            .map(|entry| entry.phase)
+            .map(|entry| entry.kind)
             .collect()
     }
 
@@ -198,7 +206,7 @@ end)
         ] {
             wheel(&mut harness, action, 1, 1)?;
             assert_eq!(scroll(&harness, inner), expected, "{action:?}");
-            assert!(phases(&harness).contains(&RoutePhase::DefaultAction));
+            assert!(phases(&harness).contains(&RouteTraceKind::DefaultAction));
         }
         assert_eq!(scroll(&harness, outer), Point::ZERO);
         Ok(())
@@ -210,12 +218,12 @@ end)
         let outer = harness.root;
 
         wheel(&mut harness, mouse::Action::ScrollUp, 1, 1)?;
-        assert!(!phases(&harness).contains(&RoutePhase::DefaultAction));
-        assert!(phases(&harness).contains(&RoutePhase::Unhandled));
+        assert!(!phases(&harness).contains(&RouteTraceKind::DefaultAction));
+        assert!(phases(&harness).contains(&RouteTraceKind::Unhandled));
 
-        harness
-            .canopy
-            .with_root_context(|context| context.scroll_to_of(inner, 0, u32::MAX))?;
+        harness.canopy.with_root_context(|context| {
+            context.scroll_node(inner, ScrollOp::To(Point { x: 0, y: u32::MAX }))
+        })?;
         harness.render()?;
         assert_eq!(scroll(&harness, inner), Point { x: 0, y: 26 });
         wheel(&mut harness, mouse::Action::ScrollDown, 1, 1)?;
@@ -232,36 +240,38 @@ end)
         harness.with_widget(inner, |pane: &mut Pane| pane.consume_wheel = true);
         wheel(&mut harness, mouse::Action::ScrollDown, 1, 1)?;
         assert_eq!(scroll(&harness, inner), Point::ZERO);
-        assert!(!phases(&harness).contains(&RoutePhase::DefaultAction));
+        assert!(!phases(&harness).contains(&RouteTraceKind::DefaultAction));
         harness.with_widget(inner, |pane: &mut Pane| pane.consume_wheel = false);
 
         harness.script(
             r#"
-canopy.bind_mouse("ScrollDown", { path = "inner/", description = "Inner" }, function()
-    canopy.set_mode("inner")
-end)
-canopy.bind_mouse("ScrollUp", { path = "outer/", description = "Outer" }, function()
-    canopy.set_mode("outer")
-end)
+canopy.keymap({
+    path = "inner/",
+    { mouse = "ScrollDown", description = "Inner", action = function() canopy.enter_mode("inner") end },
+})
+canopy.keymap({
+    path = "outer/",
+    { mouse = "ScrollUp", description = "Outer", action = function() canopy.enter_mode("outer") end },
+})
 "#,
         )?;
         wheel(&mut harness, mouse::Action::ScrollDown, 1, 1)?;
-        assert_eq!(harness.canopy.input_mode(), "inner");
+        assert_eq!(harness.canopy.mode(), "inner");
         assert_eq!(scroll(&harness, inner), Point::ZERO);
 
         // The outer binding waits until the inner pane declines.
-        harness.canopy.set_input_mode("");
-        harness
-            .canopy
-            .with_root_context(|context| context.scroll_to_of(inner, 0, 9))?;
+        harness.canopy.leave_mode("inner")?;
+        harness.canopy.with_root_context(|context| {
+            context.scroll_node(inner, ScrollOp::To(Point { x: 0, y: 9 }))
+        })?;
         wheel(&mut harness, mouse::Action::ScrollUp, 1, 1)?;
-        assert_eq!(harness.canopy.input_mode(), "");
+        assert_eq!(harness.canopy.mode(), "");
         assert_eq!(scroll(&harness, inner), Point { x: 0, y: 6 });
-        harness
-            .canopy
-            .with_root_context(|context| context.scroll_to_of(inner, 0, 0))?;
+        harness.canopy.with_root_context(|context| {
+            context.scroll_node(inner, ScrollOp::To(Point { x: 0, y: 0 }))
+        })?;
         wheel(&mut harness, mouse::Action::ScrollUp, 1, 1)?;
-        assert_eq!(harness.canopy.input_mode(), "outer");
+        assert_eq!(harness.canopy.mode(), "outer");
         assert_eq!(scroll(&harness, outer), Point::ZERO);
         Ok(())
     }
@@ -271,7 +281,7 @@ end)
         let (mut harness, inner) = nested()?;
         let outer = harness.root;
         harness.canopy.with_root_context(|context| {
-            context.scroll_to_of(inner, 0, u32::MAX)?;
+            context.scroll_node(inner, ScrollOp::To(Point { x: 0, y: u32::MAX }))?;
             context.open_modal(ModalOptions {
                 owner: outer,
                 modal: inner,

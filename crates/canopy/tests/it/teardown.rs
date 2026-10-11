@@ -5,7 +5,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use canopy::{
-        Canopy, Context, ContextExt, NodeId, NodeName, Widget, derive_commands,
+        CanopyBuilder, Context, ContextExt, NodeId, NodeName, Widget, derive_commands,
         error::{Error, Result},
     };
 
@@ -28,7 +28,7 @@ mod tests {
         }
 
         fn pre_remove(&mut self, ctx: &mut dyn Context) -> Result<()> {
-            for child in ctx.children() {
+            for child in ctx.children_of(ctx.node_id()) {
                 ctx.with_widget_dyn(child, &mut |_| Ok(()))?;
             }
             self.log.borrow_mut().push("pre_remove");
@@ -50,7 +50,7 @@ mod tests {
     impl Trigger {
         #[command]
         fn press(&self, ctx: &mut dyn Context) -> Result<()> {
-            ctx.dispatch_exact(self.dialog, &Dialog::call_close().invocation())?;
+            ctx.dispatch_exact(self.dialog, &Dialog::call_close())?;
             assert!(ctx.type_id_of(self.dialog).is_some());
             self.log.borrow_mut().push("press returned");
             if self.fail {
@@ -72,14 +72,20 @@ mod tests {
         for script in [false, true] {
             for fail in [false, true] {
                 let log = Rc::new(RefCell::new(Vec::new()));
-                let mut canopy = Canopy::new();
-                canopy.add_commands::<Dialog>()?;
-                canopy.add_commands::<Trigger>()?;
+                let mut canopy = CanopyBuilder::new()
+                    .configure(|setup| {
+                        setup.add_commands::<Dialog>()?;
+                        setup.add_commands::<Trigger>()
+                    })
+                    .build()?;
                 let (dialog, trigger) = canopy.with_root_context(|ctx| {
-                    let dialog = ctx.add_child(Dialog {
-                        log: Rc::clone(&log),
-                    })?;
-                    let trigger = ctx.add_child_to(
+                    let dialog = ctx.add_child(
+                        ctx.node_id(),
+                        Dialog {
+                            log: Rc::clone(&log),
+                        },
+                    )?;
+                    let trigger = ctx.add_child(
                         dialog,
                         Trigger {
                             dialog: dialog.into(),
@@ -89,12 +95,11 @@ mod tests {
                     )?;
                     Ok((dialog, trigger))
                 })?;
-                canopy.finalize_api()?;
                 let outcome = if script {
                     canopy.eval_script("trigger.press()").map(|_| ())
                 } else {
                     canopy.with_root_context(|ctx| {
-                        ctx.dispatch_exact(trigger.into(), &Trigger::call_press().invocation())?;
+                        ctx.dispatch_exact(trigger.into(), &Trigger::call_press())?;
                         Ok(())
                     })
                 };

@@ -4,11 +4,8 @@ use std::path::PathBuf;
 
 use ruau::source::{ModuleId, Source};
 
-use super::{Canopy, ScriptOrigin};
-use crate::{
-    error::{Error, Result},
-    script::ScriptModuleRoots,
-};
+use super::{Canopy, ScriptOrigin, Setup};
+use crate::error::{Error, Result};
 
 /// Authority granted to scripts loaded from an application-declared root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,29 +17,32 @@ pub enum ScriptTrust {
     TrustedLocal,
 }
 
-/// An owned setup callback consumed exactly once by its phase.
-type SetupCallback = Box<dyn FnOnce(&mut Canopy) -> Result<()>>;
+/// An owned registration callback consumed exactly once.
+type ConfigureCallback = Box<dyn FnOnce(&mut Setup) -> Result<()>>;
+
+/// An owned assembly callback consumed exactly once.
+type AssembleCallback = Box<dyn FnOnce(&mut Canopy) -> Result<()>>;
 
 /// Script work retained in insertion order until after API finalization.
 enum SetupSource {
-    /// Inline bindings with a stable diagnostic name.
-    Bindings {
+    /// A named Luau script, such as a keymap.
+    Script {
         /// Diagnostic and journal identity supplied by the application.
         name: String,
         /// Owned Luau source evaluated before assembly.
         source: String,
     },
-    /// Explicitly requested local configuration file.
-    Config(PathBuf),
+    /// An explicitly requested local script file.
+    ScriptFile(PathBuf),
 }
 
 /// Assemble one application through registration, scripts, and widget creation.
 ///
-/// Configuration callbacks run first, then the API is finalized. Binding and
-/// config sources run next in their shared insertion order, followed by
-/// assembly callbacks. Callbacks are owned and need not be `Send`. The first
-/// runtime preparation performs startup and publishes geometry; `build` does
-/// neither.
+/// Configuration callbacks run first against a [`Setup`] handle, then the API
+/// is finalized. Binding and config sources run next in their shared insertion
+/// order, followed by assembly callbacks against the finalized [`Canopy`].
+/// Callbacks are owned and need not be `Send`. The first runtime preparation
+/// performs startup and publishes geometry; `build` does neither.
 ///
 /// A failed build returns no application. Native or database effects performed
 /// by callbacks are not rolled back. Retrying requires a fresh builder and
@@ -55,11 +55,11 @@ enum SetupSource {
 #[derive(Default)]
 pub struct CanopyBuilder {
     /// Registration callbacks in configuration-phase order.
-    configure: Vec<SetupCallback>,
+    configure: Vec<ConfigureCallback>,
     /// Explicit binding and config sources in evaluation order.
     sources: Vec<SetupSource>,
     /// Widget assembly callbacks in assembly-phase order.
-    assemble: Vec<SetupCallback>,
+    assemble: Vec<AssembleCallback>,
     /// Last declared user-root path and trust decision.
     user_root: Option<(PathBuf, ScriptTrust)>,
     /// Last declared project-root path and trust decision.
@@ -73,30 +73,29 @@ impl CanopyBuilder {
         Self::default()
     }
 
-    /// Register commands, fixtures, defaults, and other pre-finalization state.
+    /// Register commands, bindings, fixtures, styles, and other state that the
+    /// API fixes when it finalizes.
     #[must_use]
-    pub fn configure(
-        mut self,
-        configure: impl FnOnce(&mut Canopy) -> Result<()> + 'static,
-    ) -> Self {
+    pub fn configure(mut self, configure: impl FnOnce(&mut Setup) -> Result<()> + 'static) -> Self {
         self.configure.push(Box::new(configure));
         self
     }
 
-    /// Evaluate named binding source after finalization and before assembly.
+    /// Evaluate a named Luau script after finalization and before assembly.
+    /// A script can run any Luau; keymaps are the common case.
     #[must_use]
-    pub fn bindings(mut self, name: impl Into<String>, source: impl Into<String>) -> Self {
-        self.sources.push(SetupSource::Bindings {
+    pub fn script(mut self, name: impl Into<String>, source: impl Into<String>) -> Self {
+        self.sources.push(SetupSource::Script {
             name: name.into(),
             source: source.into(),
         });
         self
     }
 
-    /// Evaluate an explicitly trusted local config file before assembly.
+    /// Evaluate an explicitly trusted local script file before assembly.
     #[must_use]
-    pub fn config(mut self, path: impl Into<PathBuf>) -> Self {
-        self.sources.push(SetupSource::Config(path.into()));
+    pub fn script_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.sources.push(SetupSource::ScriptFile(path.into()));
         self
     }
 
@@ -130,27 +129,19 @@ impl CanopyBuilder {
 
     /// Consume all setup phases, returning the application only on success.
     pub fn build(self) -> Result<Canopy> {
-        let mut canopy = Canopy::empty();
+        let mut setup = Setup::new();
         for configure in self.configure {
-            configure(&mut canopy)?;
+            configure(&mut setup)?;
         }
-        canopy.ensure_api_unfinalized("builder registration phase")?;
-        // Builder root declarations are authoritative, including disabled
-        // defaults.
-        canopy.script_module_roots = ScriptModuleRoots::default();
-        if let Some((path, ScriptTrust::TrustedLocal)) = self.user_root {
-            canopy.set_user_script_root_inner(path)?;
-        }
-        if let Some((path, ScriptTrust::TrustedLocal)) = self.project_root {
-            canopy.set_project_script_root_inner(path)?;
-        }
-        canopy.finalize_api_inner()?;
+        let trusted = |root: Option<(PathBuf, ScriptTrust)>| match root {
+            Some((path, ScriptTrust::TrustedLocal)) => Some(path),
+            _ => None,
+        };
+        let mut canopy = setup.finalize(trusted(self.user_root), trusted(self.project_root))?;
         for source in self.sources {
             match source {
-                SetupSource::Bindings { name, source } => {
-                    canopy.evaluate_bindings(&name, &source)?
-                }
-                SetupSource::Config(path) => canopy.run_config_inner(&path)?,
+                SetupSource::Script { name, source } => canopy.evaluate_bindings(&name, &source)?,
+                SetupSource::ScriptFile(path) => canopy.run_config(&path)?,
             }
         }
         for assemble in self.assemble {
@@ -171,12 +162,12 @@ impl Canopy {
         let baseline = self.begin_script_journal();
         let source = Source::text(ModuleId::new(name.as_bytes().to_vec()), text);
         let result = (|| {
-            let host = self.script_host.clone();
+            let host = self.script.host.clone();
             let script = host.compile_source(&source)?;
-            host.execute(self, self.root_id(), script, None).map(|_| ())
+            host.execute(self, self.root_id(), script).map(|_| ())
         })();
         self.record_script_journal(
-            ScriptOrigin::Bindings(name.to_owned()),
+            ScriptOrigin::Build(name.to_owned()),
             text,
             baseline,
             &result,
@@ -192,13 +183,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{Work, geom::Size};
+    use crate::{geom::Size, runtime::TurnInput};
 
     #[test]
     fn build_preserves_phase_order_without_preparing_or_running_startup() -> Result<()> {
         let directory = tempdir().expect("create test directory");
         let config = directory.path().join("config.luau");
-        fs::write(&config, "canopy.set_mode(\"config\")").expect("write test script");
+        fs::write(&config, "canopy.enter_mode(\"config\")").expect("write test script");
         let phases = Rc::new(RefCell::new(Vec::new()));
         let configure_first = Rc::clone(&phases);
         let configure_second = Rc::clone(&phases);
@@ -206,30 +197,28 @@ mod tests {
         let assemble_second = Rc::clone(&phases);
         let mut canopy = CanopyBuilder::new()
             .assemble(move |canopy| {
-                assert!(canopy.script_host.is_finalized());
-                assert_eq!(canopy.input_mode(), "last");
+                assert!(canopy.script.host.is_finalized());
+                assert_eq!(canopy.mode(), "last");
                 assert!(canopy.snapshot().is_none());
                 assemble_first.borrow_mut().push("assemble first");
                 Ok(())
             })
-            .configure(move |canopy| {
-                assert!(!canopy.script_host.is_finalized());
+            .configure(move |setup| {
                 configure_first.borrow_mut().push("configure first");
-                canopy.register_startup_script(
+                setup.register_startup_script(
                     "deferred",
-                    "function setup() canopy.set_mode(\"startup\") end",
+                    "function setup() canopy.enter_mode(\"startup\") end",
                 )
             })
-            .bindings("first", "canopy.set_mode(\"first\")")
-            .config(config)
-            .configure(move |canopy| {
-                assert!(!canopy.script_host.is_finalized());
+            .script("first", "canopy.enter_mode(\"first\")")
+            .script_file(config)
+            .configure(move |_| {
                 configure_second.borrow_mut().push("configure second");
                 Ok(())
             })
-            .bindings(
+            .script(
                 "last",
-                "canopy.assert(canopy.input_mode() == \"config\"); canopy.set_mode(\"last\")",
+                "canopy.assert(canopy.mode() == \"config\"); canopy.enter_mode(\"last\")",
             )
             .assemble(move |_| {
                 assemble_second.borrow_mut().push("assemble second");
@@ -248,12 +237,12 @@ mod tests {
         assert!(canopy.snapshot().is_none());
         let journal = canopy.script_journal();
         assert_eq!(journal.len(), 3);
-        assert_eq!(journal[0].origin.to_string(), "bindings:first");
-        assert!(journal[1].origin.to_string().starts_with("config:"));
-        assert_eq!(journal[2].origin.to_string(), "bindings:last");
-        canopy.set_root_size(Size::new(10, 3))?;
-        canopy.turn(Work::Prepare)?;
-        assert_eq!(canopy.input_mode(), "startup");
+        assert_eq!(journal[0].origin.to_string(), "build:first");
+        assert!(journal[1].origin.to_string().starts_with("script-file:"));
+        assert_eq!(journal[2].origin.to_string(), "build:last");
+        canopy.set_screen_size(Size::new(10, 3))?;
+        canopy.turn(TurnInput::Prepare)?;
+        assert_eq!(canopy.mode(), "startup");
         Ok(())
     }
 
@@ -271,11 +260,11 @@ mod tests {
                 Ok(())
             });
             if phase == "bindings" {
-                builder = builder.bindings("bad", "error(\"bindings failed\")");
+                builder = builder.script("bad", "error(\"bindings failed\")");
             }
             if phase == "config" {
                 let directory = tempdir().expect("create test directory");
-                builder = builder.config(directory.path().join("missing.luau"));
+                builder = builder.script_file(directory.path().join("missing.luau"));
             }
             builder = builder.assemble(move |_| {
                 last.borrow_mut().push("assemble");
@@ -299,8 +288,8 @@ mod tests {
         let assembled = Rc::new(RefCell::new(false));
         let observed = Rc::clone(&assembled);
         let result = CanopyBuilder::new()
-            .configure(|canopy| canopy.register_startup_script("invalid", "function setup("))
-            .bindings("unreachable", "error(\"binding should not run\")")
+            .configure(|setup| setup.register_startup_script("invalid", "function setup("))
+            .script("unreachable", "error(\"binding should not run\")")
             .assemble(move |_| {
                 *observed.borrow_mut() = true;
                 Ok(())
@@ -321,11 +310,7 @@ mod tests {
         .expect("write test script");
         fs::write(directory.path().join("payload.luau"), "return 9").expect("write test script");
         for namespace in ["user", "project"] {
-            let configured_path = directory.path().to_owned();
-            let mut builder = CanopyBuilder::new().configure(move |canopy| {
-                canopy.set_user_script_root(&configured_path)?;
-                canopy.set_project_script_root(&configured_path)
-            });
+            let mut builder = CanopyBuilder::new();
             if namespace == "user" {
                 builder = builder
                     .user_script_root(directory.path().to_owned(), ScriptTrust::TrustedLocal)
@@ -335,9 +320,9 @@ mod tests {
                     builder.project_script_root(directory.path().to_owned(), ScriptTrust::Disabled);
             }
             let mut canopy = builder.build()?;
-            assert!(canopy.script_module_source.is_none());
-            canopy.set_root_size(Size::new(10, 3))?;
-            canopy.turn(Work::Prepare)?;
+            assert!(canopy.script.module_source.is_none());
+            canopy.set_screen_size(Size::new(10, 3))?;
+            canopy.turn(TurnInput::Prepare)?;
             assert!(
                 canopy
                     .eval_script(&format!("return require(\"@{namespace}/payload\")"))
@@ -360,17 +345,17 @@ mod tests {
         let directory = tempdir().expect("create test directory");
         fs::write(
             directory.path().join("init.luau"),
-            "function setup() canopy.set_mode(\"trusted\") end",
+            "function setup() canopy.enter_mode(\"trusted\") end",
         )
         .expect("write test script");
         let mut canopy = CanopyBuilder::new()
             .project_script_root(directory.path().to_owned(), ScriptTrust::TrustedLocal)
             .build()?;
-        assert_eq!(canopy.input_mode(), "");
+        assert_eq!(canopy.mode(), "");
         assert!(canopy.snapshot().is_none());
-        canopy.set_root_size(Size::new(10, 3))?;
-        canopy.turn(Work::Prepare)?;
-        assert_eq!(canopy.input_mode(), "trusted");
+        canopy.set_screen_size(Size::new(10, 3))?;
+        canopy.turn(TurnInput::Prepare)?;
+        assert_eq!(canopy.mode(), "trusted");
         Ok(())
     }
 }

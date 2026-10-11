@@ -1,19 +1,14 @@
 //! Contextual binding discovery.
 
 use crate::{
-    commands::{
-        CommandAction, CommandRequirement, CommandResolution, CommandResolver, CommandStatus,
-        CommandTarget,
-    },
-    core::{
-        Core, NodeId,
-        inputmap::{
-            BindingId, BindingOwner, BindingPhase, BindingScope, BindingTarget,
-            FrameworkBindingGroup, InputSpec,
-        },
-    },
+    NodeId,
+    commands::{CommandAvailability, CommandCall, CommandResolver},
+    core::Core,
     error::Result,
-    event::{key::Key, mouse::Mouse},
+    input::{
+        BindingAction, BindingActionKind, BindingId, BindingPhase, BindingTier,
+        FrameworkBindingGroup, InputSpec, IntentName, key::Key, mouse::Mouse,
+    },
     path::Path,
 };
 
@@ -21,9 +16,9 @@ use crate::{
 ///
 /// The snapshot answers what one context would do with an input, not what the
 /// next event will do. A route is only hypothetical here: hit testing and mouse
-/// capture pick the real mouse target, and discovery cannot know whether a
-/// widget's `on_event` will consume an input before an after-widget binding
-/// sees it.
+/// capture pick the real mouse target. Key discovery asks each widget along the
+/// route through [`crate::Widget::key_outcome`], so a key a widget consumes
+/// hides the after-widget bindings it would shadow.
 #[derive(Clone, Debug)]
 pub struct BindingSnapshot {
     /// Node used as the discovery focus.
@@ -32,11 +27,16 @@ pub struct BindingSnapshot {
     pub focus_path: Path,
     /// Active non-default modes in resolution order.
     pub active_modes: Vec<String>,
-    /// Newest active mode when it is transient.
+    /// Transient mode that takes the next key.
+    ///
+    /// This is the newest active mode when it is transient. It is absent
+    /// while a framework-group modal suspends transient modes.
     pub transient_mode: Option<String>,
-    /// Newest active exclusive binding group.
-    pub exclusive_group: Option<FrameworkBindingGroup>,
-    /// Effective key bindings, with one winner per normalized key.
+    /// Framework group the open modal admits.
+    pub framework_group: Option<FrameworkBindingGroup>,
+    /// Effective key bindings, each with a route to the node where it acts.
+    ///
+    /// An intent binding appears only when a widget on the route accepts it.
     pub bindings: Vec<AvailableBinding<Key>>,
     /// Effective mouse bindings, with one winner per normalized mouse input.
     ///
@@ -57,17 +57,22 @@ pub struct AvailableBinding<I> {
     pub input: I,
     /// Required user-facing description.
     pub description: String,
-    /// Binding owner.
-    pub owner: BindingOwner,
-    /// Resolution scope.
-    pub scope: BindingScope,
+    /// Whether shortcut help displays the binding. Discovery still includes it.
+    pub show_in_help: bool,
+    /// Resolution tier.
+    pub tier: BindingTier,
     /// Original path filter.
     pub path_filter: String,
     /// Route path at which this binding wins.
     pub route_path: Path,
+    /// Kind of action this binding runs.
+    pub action: BindingActionKind,
+    /// Intent name, present when the action is an intent.
+    pub intent: Option<IntentName>,
     /// Phase relative to widget input handling.
     pub phase: BindingPhase,
-    /// Declarative command details, absent for opaque script callbacks.
+    /// Declarative command details, absent for opaque script callbacks and
+    /// intents.
     pub command: Option<BindingCommand>,
     /// Optional diagnostic source.
     pub source: Option<String>,
@@ -76,37 +81,94 @@ pub struct AvailableBinding<I> {
 /// Owned command details captured with an effective key binding.
 #[derive(Clone, Debug)]
 pub struct BindingCommand {
-    /// Stored invocation, arguments, and target policy.
-    pub action: CommandAction,
-    /// Resolved owner at capture time, absent for an unavailable command.
-    pub resolution: Option<CommandResolution>,
-    /// Eligibility at capture time, separate from target resolution.
-    pub status: Option<CommandStatus>,
-    /// Required context absent at capture time.
-    pub missing_requirements: Vec<CommandRequirement>,
+    /// Stored command call, with its arguments and target policy.
+    pub call: CommandCall,
+    /// Availability at capture time, absent when the command is not
+    /// registered.
+    pub availability: Option<CommandAvailability>,
+}
+
+/// The action a key hint names: a command call or a registered intent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BindingTarget {
+    /// A command call, matched by command and arguments.
+    Command(CommandCall),
+    /// A registered intent, matched by name.
+    Intent(IntentName),
+}
+
+impl BindingTarget {
+    /// Return whether a binding running `action` reaches this target.
+    fn matches(&self, action: &BindingAction) -> bool {
+        match (self, action) {
+            (Self::Command(call), BindingAction::Command(bound)) => {
+                call.id == bound.id && call.args == bound.args
+            }
+            (Self::Intent(name), _) => action.intent() == Some(name),
+            _ => false,
+        }
+    }
+}
+
+impl From<CommandCall> for BindingTarget {
+    fn from(call: CommandCall) -> Self {
+        Self::Command(call)
+    }
+}
+
+impl From<IntentName> for BindingTarget {
+    fn from(name: IntentName) -> Self {
+        Self::Intent(name)
+    }
 }
 
 impl Core {
+    /// Return a key that reaches `target` from the current focus.
+    ///
+    /// Discovery explains each candidate key as [`Core::available_bindings`]
+    /// does, so a key another binding or a widget shadows is not offered.
+    pub(crate) fn key_for(&self, target: &BindingTarget) -> Result<Option<Key>> {
+        for key in self.input_map.candidate_keys() {
+            let explanation = self.explain_key(None, key)?;
+            let Some(winner) = explanation.outcome.winner() else {
+                continue;
+            };
+            if self
+                .input_map
+                .binding(winner.binding)
+                .is_some_and(|record| target.matches(&record.action))
+            {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the effective bindings for a node or the current focus.
+    ///
+    /// Key discovery explains each candidate key, so it cannot disagree with
+    /// [`Core::explain_key`] about which binding a key reaches.
     pub(crate) fn available_bindings(&self, requested: Option<NodeId>) -> Result<BindingSnapshot> {
         let focus = requested.or(self.focus).unwrap_or(self.root);
         self.validate_attached_node(focus)?;
         let focus_path = self.path_of(self.root, focus);
 
         let mut bindings = Vec::new();
-        for key in self.input_map.eligible_keys() {
-            bindings.extend(self.winner_along_route(
-                focus,
-                &focus_path,
-                key,
-                InputSpec::Key(key),
-            )?);
+        for key in self.input_map.candidate_keys() {
+            let explanation = self.explain_key(Some(focus), key)?;
+            if let Some(winner) = explanation.outcome.winner() {
+                bindings.push(self.available_binding(
+                    winner.node,
+                    key,
+                    winner.path.clone(),
+                    winner.binding,
+                )?);
+            }
         }
         let mut mouse_bindings = Vec::new();
         for mouse in self.input_map.eligible_mouse_inputs() {
             mouse_bindings.extend(self.winner_along_route(
                 focus,
-                &focus_path,
                 mouse,
                 InputSpec::Mouse(mouse),
             )?);
@@ -121,8 +183,8 @@ impl Core {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            transient_mode: self.input_map.transient_mode().map(str::to_string),
-            exclusive_group: self.input_map.active_exclusive_group(),
+            transient_mode: self.effective_transient_mode().map(str::to_string),
+            framework_group: self.input_map.active_framework_group(),
             bindings,
             mouse_bindings,
         })
@@ -130,68 +192,67 @@ impl Core {
 
     /// Return the binding that wins `spec` along the route from `focus`.
     ///
-    /// The walk is the one routing takes, through the same resolver, so
-    /// discovery and dispatch cannot disagree about which record wins.
+    /// Mouse discovery has no widget prediction, so this walk selects at each
+    /// route node as mouse routing does. Key discovery uses
+    /// [`Core::explain_key`].
     fn winner_along_route<I>(
         &self,
         focus: NodeId,
-        focus_path: &Path,
         input: I,
         spec: InputSpec,
     ) -> Result<Option<AvailableBinding<I>>> {
-        let mut route_node = self.interaction_admits(focus).then_some(focus);
-        let mut route_path = focus_path.clone();
-        while let Some(node) = route_node {
-            let Some(resolved) = self.input_map.resolve_match(&route_path, spec) else {
-                route_node = if self.modal_owner() == Some(node) {
-                    None
-                } else {
-                    self.nodes.get(node).and_then(|entry| entry.parent)
-                };
-                route_path.pop();
-                continue;
-            };
-            let record = self
-                .input_map
-                .binding(resolved.id)
-                .expect("resolved binding record must remain registered");
-            let command = match &record.target {
-                BindingTarget::Script(_) => None,
-                BindingTarget::Command(action) => {
-                    let availability = self
-                        .commands
-                        .get(action.invocation.id.0)
-                        .map(|spec| {
-                            CommandResolver::for_target(
-                                self,
-                                action.target.unwrap_or(CommandTarget::From(node)),
-                            )
+        let winner = self.route(focus).find_map(|(node, path)| {
+            self.select_binding(node, &path, spec, focus, &[])
+                .map(|record| (node, path, record.id))
+        });
+        winner
+            .map(|(node, path, id)| self.available_binding(node, input, path, id))
+            .transpose()
+    }
+
+    /// Build one effective binding record from a resolved winner.
+    fn available_binding<I>(
+        &self,
+        node: NodeId,
+        input: I,
+        route_path: Path,
+        id: BindingId,
+    ) -> Result<AvailableBinding<I>> {
+        let record = self
+            .input_map
+            .binding(id)
+            .expect("resolved binding record must remain registered");
+        let command = match &record.action {
+            BindingAction::Script(_) | BindingAction::Intent(_) | BindingAction::Menu(_) => None,
+            BindingAction::Command(call) => {
+                let availability = self
+                    .commands
+                    .get(call.id.0)
+                    .map(|spec| {
+                        CommandResolver::for_target(self, call.target_or(node))
                             .availability_for(spec)
-                        })
-                        .transpose()?;
-                    Some(BindingCommand {
-                        action: action.clone(),
-                        resolution: availability.as_ref().and_then(|item| item.resolution),
-                        status: availability.as_ref().and_then(|item| item.status.clone()),
-                        missing_requirements: availability
-                            .map_or_else(Vec::new, |item| item.missing_requirements),
                     })
-                }
-            };
-            return Ok(Some(AvailableBinding {
-                id: record.id,
-                input,
-                description: record.description.clone(),
-                owner: record.owner,
-                scope: record.scope.clone(),
-                path_filter: record.path_filter().to_string(),
-                route_path,
-                phase: resolved.phase,
-                command,
-                source: record.source.clone(),
-            }));
-        }
-        Ok(None)
+                    .transpose()?;
+                Some(BindingCommand {
+                    call: call.clone(),
+                    availability,
+                })
+            }
+        };
+        Ok(AvailableBinding {
+            id: record.id,
+            input,
+            description: record.description.clone(),
+            show_in_help: record.show_in_help,
+            tier: record.tier.clone(),
+            path_filter: record.path_filter().to_string(),
+            route_path,
+            action: BindingActionKind::of(&record.action),
+            intent: record.action.intent().cloned(),
+            phase: record.phase,
+            command,
+            source: record.source.clone(),
+        })
     }
 }
 
@@ -201,12 +262,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        commands::{CommandAction, CommandArgs, CommandId, CommandInvocation, CommandNode},
-        core::inputmap::{BindingOptions, BindingTarget, InputSpec},
+        NodeName, ViewContext,
+        commands::{
+            CommandArgs, CommandCall, CommandId, CommandNode, CommandResolution, CommandStatus,
+            CommandTarget,
+        },
         error::Error,
+        input::{BindingAction, BindingOptions, InputSpec, ModalBindings, key::KeyCode},
         script::LuauFunctionId,
-        state::NodeName,
-        widget::Widget,
+        widget::{EventOutcome, Widget},
     };
 
     struct Leaf;
@@ -217,24 +281,64 @@ mod tests {
         }
     }
 
+    /// A leaf that consumes one key and ignores every other, as a terminal or
+    /// text field would.
+    struct CapturingLeaf;
+
+    impl Widget for CapturingLeaf {
+        fn key_outcome(&self, key: Key, _context: &dyn ViewContext) -> EventOutcome {
+            if key.key == KeyCode::Char('x') {
+                EventOutcome::Handle
+            } else {
+                EventOutcome::Ignore
+            }
+        }
+
+        fn name(&self) -> NodeName {
+            NodeName::convert("capturing_leaf")
+        }
+    }
+
     fn bind(
         core: &mut Core,
-        scope: BindingScope,
+        tier: BindingTier,
         key: char,
         path: &str,
         description: &str,
         target: u64,
     ) -> Result<()> {
-        core.input_map.replace_application_action(
+        bind_phase(
+            core,
+            tier,
+            key,
+            path,
+            description,
+            target,
+            BindingPhase::AfterWidget,
+        )
+    }
+
+    /// Bind one key with an explicit phase.
+    fn bind_phase(
+        core: &mut Core,
+        tier: BindingTier,
+        key: char,
+        path: &str,
+        description: &str,
+        target: u64,
+        phase: BindingPhase,
+    ) -> Result<()> {
+        core.input_map.bind(
             InputSpec::Key(key.into()),
-            crate::BindingOptions {
-                scope,
+            BindingOptions {
+                show_in_help: true,
+                tier,
                 path: Some(path.parse()?),
                 description: description.into(),
                 source: Some("test".to_string()),
-                phase: BindingPhase::AfterWidget,
+                phase: Some(phase),
             },
-            BindingTarget::Script(LuauFunctionId::for_test(target)),
+            BindingAction::Script(LuauFunctionId::for_test(target)),
         )?;
         Ok(())
     }
@@ -242,23 +346,24 @@ mod tests {
     /// Bind one mouse spec, returning its normalized input.
     fn bind_mouse(
         core: &mut Core,
-        scope: BindingScope,
+        tier: BindingTier,
         spec: &str,
         path: &str,
         description: &str,
         target: u64,
     ) -> Result<Mouse> {
         let mouse = Mouse::parse_spec(spec)?;
-        core.input_map.replace_application_action(
+        core.input_map.bind(
             InputSpec::Mouse(mouse),
-            crate::BindingOptions {
-                scope,
+            BindingOptions {
+                show_in_help: true,
+                tier,
                 path: Some(path.parse()?),
                 description: description.into(),
                 source: Some("test".to_string()),
-                phase: BindingPhase::AfterWidget,
+                phase: Some(BindingPhase::AfterWidget),
             },
-            BindingTarget::Script(LuauFunctionId::for_test(target)),
+            BindingAction::Script(LuauFunctionId::for_test(target)),
         )?;
         Ok(mouse)
     }
@@ -273,7 +378,7 @@ mod tests {
         // Two records for one input: the route reports the winner alone.
         bind_mouse(
             &mut core,
-            BindingScope::Default,
+            BindingTier::Default,
             "LeftDown",
             "",
             "Anywhere",
@@ -281,7 +386,7 @@ mod tests {
         )?;
         bind_mouse(
             &mut core,
-            BindingScope::Default,
+            BindingTier::Default,
             "LeftDown",
             "leaf/",
             "On the leaf",
@@ -289,7 +394,7 @@ mod tests {
         )?;
         bind_mouse(
             &mut core,
-            BindingScope::Default,
+            BindingTier::Default,
             "ScrollUp",
             "leaf/",
             "Scroll up",
@@ -297,13 +402,13 @@ mod tests {
         )?;
         bind_mouse(
             &mut core,
-            BindingScope::Mode("insert".to_string()),
+            BindingTier::Mode("insert".to_string()),
             "ctrl-RightDown",
             "leaf/",
             "Only in insert",
             4,
         )?;
-        bind(&mut core, BindingScope::Default, 'a', "leaf/", "A key", 5)?;
+        bind(&mut core, BindingTier::Default, 'a', "leaf/", "A key", 5)?;
 
         let snapshot = core.available_bindings(None)?;
         assert_eq!(
@@ -333,13 +438,13 @@ mod tests {
         assert_eq!(winner.path_filter, "leaf/");
         assert_eq!(winner.route_path, Path::from("/root/leaf"));
         assert_eq!(winner.phase, BindingPhase::AfterWidget);
-        assert_eq!(winner.owner, BindingOwner::Application);
+        assert_eq!(winner.tier, BindingTier::Default);
         assert_eq!(winner.source.as_deref(), Some("test"));
         assert!(winner.command.is_none(), "a script callback stays opaque");
 
         // A mode contributes its own winner once it is active. Order follows
         // the label, so presentation is stable whatever the insertion order.
-        core.input_map.push_mode("insert");
+        core.input_map.enter_mode("insert")?;
         let snapshot = core.available_bindings(None)?;
         assert_eq!(
             snapshot
@@ -353,39 +458,41 @@ mod tests {
     }
 
     #[test]
-    fn an_exclusive_group_admits_only_its_own_mouse_records() -> Result<()> {
+    fn a_framework_group_admits_only_its_own_mouse_records() -> Result<()> {
+        const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("root.help");
         let mut core = Core::new();
         let leaf = core.create_detached(Leaf)?;
         core.attach(core.root, leaf)?;
         bind_mouse(
             &mut core,
-            BindingScope::Default,
+            BindingTier::Default,
             "LeftDown",
             "",
             "Application click",
             1,
         )?;
-        let group = FrameworkBindingGroup::new("root.help");
-        core.input_map.bind_framework(
-            group,
-            Mouse::parse_spec("LeftDown")?,
+        let group = GROUP;
+        core.input_map.bind(
+            Mouse::parse_spec("LeftDown")?.into(),
             BindingOptions {
+                show_in_help: true,
                 path: Some("/root/**/".parse()?),
-                scope: BindingScope::Exclusive(group),
+                tier: BindingTier::Framework(group),
                 description: "Dialog click".to_string(),
                 source: None,
-                phase: BindingPhase::AfterWidget,
+                phase: Some(BindingPhase::AfterWidget),
             },
-            CommandAction {
-                invocation: CommandInvocation {
-                    id: CommandId("binding_list::scroll_down"),
-                    args: CommandArgs::default(),
-                },
+            BindingAction::Command(CommandCall {
+                id: CommandId("binding_list::scroll_down"),
+                args: CommandArgs::default(),
                 target: None,
-            },
+            }),
         )?;
         core.input_map
-            .set_modal_bindings(Some(crate::ModalBindings::Framework(group)));
+            .set_modal_bindings(Some(ModalBindings::Framework {
+                groups: &[GROUP],
+                intents: &[],
+            }));
 
         let snapshot = core.available_bindings(Some(leaf))?;
         assert_eq!(snapshot.mouse_bindings.len(), 1);
@@ -402,26 +509,33 @@ mod tests {
         })?;
         core.attach(core.root, leaf)?;
         core.commands.add(EligibleLeaf::commands())?;
-        let action = EligibleLeaf::call_update(7)
-            .with_target(CommandTarget::Exact(leaf))
-            .action();
-        core.input_map.replace_application_action(
+        let call = EligibleLeaf::call_update(7).with_target(CommandTarget::Exact(leaf));
+        core.input_map.bind(
             InputSpec::Mouse(Mouse::parse_spec("LeftDown")?),
             BindingOptions {
+                show_in_help: true,
                 path: Some("eligible_leaf/".parse()?),
-                scope: BindingScope::Default,
+                tier: BindingTier::Default,
                 description: "Update selection".into(),
                 source: None,
-                phase: BindingPhase::AfterWidget,
+                phase: Some(BindingPhase::AfterWidget),
             },
-            BindingTarget::Command(action),
+            BindingAction::Command(call),
         )?;
         let status = |core: &Core| {
             core.available_bindings(Some(leaf))
                 .expect("snapshot")
                 .mouse_bindings
                 .first()
-                .and_then(|binding| binding.command.as_ref()?.status.clone())
+                .and_then(|binding| {
+                    binding
+                        .command
+                        .as_ref()?
+                        .availability
+                        .as_ref()?
+                        .status
+                        .clone()
+                })
         };
         assert_eq!(
             status(&core),
@@ -438,10 +552,10 @@ mod tests {
         let leaf = core.create_detached(Leaf)?;
         core.attach(core.root, leaf)?;
         core.set_focus(leaf)?;
-        bind(&mut core, BindingScope::Default, 'a', "root", "Fallback", 1)?;
+        bind(&mut core, BindingTier::Default, 'a', "root", "Fallback", 1)?;
         bind(
             &mut core,
-            BindingScope::Mode("insert".to_string()),
+            BindingTier::Mode("insert".to_string()),
             'b',
             "leaf/",
             "Mode",
@@ -449,13 +563,13 @@ mod tests {
         )?;
         bind(
             &mut core,
-            BindingScope::Global,
+            BindingTier::Global,
             'b',
             "/root/**/",
             "Global",
             3,
         )?;
-        core.input_map.push_mode("insert");
+        core.input_map.enter_mode("insert")?;
 
         let snapshot = core.available_bindings(None)?;
 
@@ -475,7 +589,7 @@ mod tests {
             .find(|binding| binding.input == 'b')
             .expect("global binding");
         assert_eq!(global.description, "Global");
-        assert_eq!(global.scope, BindingScope::Global);
+        assert_eq!(global.tier, BindingTier::Global);
         Ok(())
     }
 
@@ -507,7 +621,7 @@ mod tests {
 
     #[test]
     fn command_binding_snapshot_captures_intent_and_current_status() -> Result<()> {
-        use crate::{commands::CommandNode, core::inputmap::BindingOptions};
+        use crate::{commands::CommandNode, input::BindingOptions};
 
         let mut core = Core::new();
         let enabled = Rc::new(Cell::new(false));
@@ -516,44 +630,43 @@ mod tests {
         })?;
         core.attach(core.root, leaf)?;
         core.commands.add(EligibleLeaf::commands())?;
-        let action = EligibleLeaf::call_update(7)
-            .with_target(CommandTarget::Exact(leaf))
-            .action();
-        core.input_map.replace_application_action(
+        let call = EligibleLeaf::call_update(7).with_target(CommandTarget::Exact(leaf));
+        core.input_map.bind(
             InputSpec::Key('u'.into()),
             BindingOptions {
+                show_in_help: true,
                 path: Some("eligible_leaf/".parse()?),
-                scope: BindingScope::Default,
+                tier: BindingTier::Default,
                 description: "Update selection".into(),
                 source: None,
-                phase: BindingPhase::AfterWidget,
+                phase: Some(BindingPhase::AfterWidget),
             },
-            BindingTarget::Command(action.clone()),
+            BindingAction::Command(call.clone()),
         )?;
         let snapshot = core.available_bindings(Some(leaf))?;
         let binding = &snapshot.bindings[0];
         assert_eq!(binding.phase, BindingPhase::AfterWidget);
         let command = binding.command.as_ref().expect("command details");
-        assert_eq!(command.action, action);
+        assert_eq!(command.call, call);
+        let availability = command.availability.as_ref().expect("registered command");
         assert_eq!(
-            command.resolution,
+            availability.resolution,
             Some(CommandResolution::Exact { target: leaf })
         );
         assert_eq!(
-            command.status,
+            availability.status,
             Some(CommandStatus::Disabled("no selection".into()))
         );
         enabled.set(true);
+        let refreshed = core.available_bindings(Some(leaf))?;
+        let refreshed = refreshed.bindings[0]
+            .command
+            .as_ref()
+            .and_then(|command| command.availability.as_ref())
+            .expect("registered command");
+        assert_eq!(refreshed.status, Some(CommandStatus::Enabled));
         assert_eq!(
-            core.available_bindings(Some(leaf))?.bindings[0]
-                .command
-                .as_ref()
-                .unwrap()
-                .status,
-            Some(CommandStatus::Enabled)
-        );
-        assert_eq!(
-            command.status,
+            availability.status,
             Some(CommandStatus::Disabled("no selection".into()))
         );
         Ok(())
@@ -576,42 +689,185 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_context_blocks_application_tiers() -> Result<()> {
+    fn a_widget_that_handles_a_key_hides_after_widget_bindings() -> Result<()> {
+        let mut core = Core::new();
+        let leaf = core.create_detached(CapturingLeaf)?;
+        core.attach(core.root, leaf)?;
+        core.set_focus(leaf)?;
+        bind(
+            &mut core,
+            BindingTier::Default,
+            'x',
+            "capturing_leaf/",
+            "Shadowed",
+            1,
+        )?;
+        bind(
+            &mut core,
+            BindingTier::Default,
+            'y',
+            "capturing_leaf/",
+            "Available",
+            2,
+        )?;
+        bind_phase(
+            &mut core,
+            BindingTier::Default,
+            'z',
+            "capturing_leaf/",
+            "Before widget",
+            3,
+            BindingPhase::BeforeWidget,
+        )?;
+        bind(
+            &mut core,
+            BindingTier::Default,
+            'x',
+            "root",
+            "Ancestor shadowed",
+            4,
+        )?;
+
+        let snapshot = core.available_bindings(None)?;
+        let mut rows = snapshot
+            .bindings
+            .iter()
+            .map(|binding| (binding.input.to_string(), binding.description.clone()))
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                ("y".to_string(), "Available".to_string()),
+                ("z".to_string(), "Before widget".to_string()),
+            ],
+            "a handled key hides after-widget bindings at the widget and above, \
+             and leaves before-widget bindings alone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_transient_mode_keeps_its_bindings_despite_widget_capture() -> Result<()> {
+        let mut core = Core::new();
+        let leaf = core.create_detached(CapturingLeaf)?;
+        core.attach(core.root, leaf)?;
+        core.set_focus(leaf)?;
+        bind(
+            &mut core,
+            BindingTier::Mode("go".to_string()),
+            'x',
+            "capturing_leaf/",
+            "Mode key",
+            1,
+        )?;
+        core.input_map.open_menu("go")?;
+
+        let snapshot = core.available_bindings(None)?;
+        assert_eq!(
+            snapshot
+                .bindings
+                .iter()
+                .map(|binding| binding.description.clone())
+                .collect::<Vec<_>>(),
+            ["Mode key"],
+            "a transient mode takes the key before the widget sees it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_probes_canonical_keys_while_dispatch_uses_raw_keys() -> Result<()> {
+        /// Consumes the raw Ctrl+A control code as text.
+        struct ControlCodeLeaf;
+
+        impl Widget for ControlCodeLeaf {
+            fn key_outcome(&self, key: Key, _context: &dyn ViewContext) -> EventOutcome {
+                if key.key == KeyCode::Char('\u{1}') {
+                    EventOutcome::Handle
+                } else {
+                    EventOutcome::Ignore
+                }
+            }
+
+            fn name(&self) -> NodeName {
+                NodeName::convert("control_code_leaf")
+            }
+        }
+
+        let mut core = Core::new();
+        let leaf = core.create_detached(ControlCodeLeaf)?;
+        core.attach(core.root, leaf)?;
+        core.set_focus(leaf)?;
+        core.input_map.bind(
+            InputSpec::Key(Key::parse_spec("ctrl-a")?),
+            BindingOptions {
+                show_in_help: true,
+                path: Some("control_code_leaf/".parse()?),
+                tier: BindingTier::Default,
+                description: "Canonical binding".to_string(),
+                source: None,
+                phase: Some(BindingPhase::AfterWidget),
+            },
+            BindingAction::Script(LuauFunctionId::for_test(1)),
+        )?;
+
+        let raw = Key::from('\u{1}');
+        assert_eq!(
+            core.node_key_outcome(leaf, raw, leaf)?,
+            EventOutcome::Handle,
+            "dispatch passes the raw control code"
+        );
+        assert_eq!(
+            core.node_key_outcome(leaf, Key::parse_spec("ctrl-a")?, leaf)?,
+            EventOutcome::Ignore,
+            "discovery probes the canonical key"
+        );
+        let snapshot = core.available_bindings(None)?;
+        assert_eq!(snapshot.bindings.len(), 1);
+        assert_eq!(snapshot.bindings[0].input.to_string(), "Ctrl+a");
+        Ok(())
+    }
+
+    #[test]
+    fn a_framework_group_blocks_application_tiers() -> Result<()> {
+        const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("root.help");
         let mut core = Core::new();
         let leaf = core.create_detached(Leaf)?;
         core.attach(core.root, leaf)?;
-        bind(&mut core, BindingScope::Default, 'a', "", "Application", 1)?;
-        let group = FrameworkBindingGroup::new("root.help");
-        core.input_map.bind_framework(
-            group,
-            'j',
+        bind(&mut core, BindingTier::Default, 'a', "", "Application", 1)?;
+        let group = GROUP;
+        core.input_map.bind(
+            'j'.into(),
             BindingOptions {
+                show_in_help: true,
                 path: Some("/root/help/**/".parse()?),
-                scope: BindingScope::Exclusive(group),
+                tier: BindingTier::Framework(group),
                 description: "Scroll down".to_string(),
                 source: None,
-                phase: BindingPhase::AfterWidget,
+                phase: Some(BindingPhase::AfterWidget),
             },
-            CommandAction {
-                invocation: CommandInvocation {
-                    id: CommandId("binding_list::scroll_down"),
-                    args: CommandArgs::default(),
-                },
+            BindingAction::Command(CommandCall {
+                id: CommandId("binding_list::scroll_down"),
+                args: CommandArgs::default(),
                 target: None,
-            },
+            }),
         )?;
         core.input_map
-            .set_modal_bindings(Some(crate::ModalBindings::Framework(group)));
+            .set_modal_bindings(Some(ModalBindings::Framework {
+                groups: &[GROUP],
+                intents: &[],
+            }));
 
         let snapshot = core.available_bindings(Some(leaf))?;
 
-        assert_eq!(snapshot.exclusive_group, Some(group));
+        assert_eq!(snapshot.framework_group, Some(group));
         assert!(snapshot.bindings.is_empty());
         assert!(
             core.input_map
                 .bindings()
                 .iter()
-                .any(|record| { matches!(record.target, BindingTarget::Command(_)) })
+                .any(|record| { matches!(record.action, BindingAction::Command(_)) })
         );
         Ok(())
     }

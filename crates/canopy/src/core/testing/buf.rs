@@ -108,12 +108,12 @@ impl<'a> BufTest<'a> {
                         let fg_matches = match &style.fg {
                             None => true,
                             Some(Paint::Solid(color)) => *color == cell.style.fg,
-                            Some(Paint::Gradient(_)) => false,
+                            Some(Paint::Gradient(_) | Paint::Animated(_)) => false,
                         };
                         let bg_matches = match &style.bg {
                             None => true,
                             Some(Paint::Solid(color)) => *color == cell.style.bg,
-                            Some(Paint::Gradient(_)) => false,
+                            Some(Paint::Gradient(_) | Paint::Animated(_)) => false,
                         };
                         let attr_matches =
                             style.attrs.is_none() || style.attrs == Some(cell.style.attrs);
@@ -146,7 +146,7 @@ mod tests {
     use super::*;
     use crate::{
         geom::{Line, Size},
-        style::{Attr, AttrSet, Color, ResolvedStyle, StyleBuilder},
+        style::{Attr, AttrSet, Color, PartialStyle, ResolvedStyle},
     };
 
     #[test]
@@ -193,8 +193,8 @@ mod tests {
         assert!(!bt.contains_text("goodbye"));
 
         // Test contains_text_style
-        assert!(bt.contains_text_style("world", &PartialStyle::fg(Color::Red)));
-        assert!(bt.contains_text_style("hello", &PartialStyle::fg(Color::White)));
+        assert!(bt.contains_text_style("world", &PartialStyle::new().fg(Color::Red)));
+        assert!(bt.contains_text_style("hello", &PartialStyle::new().fg(Color::White)));
 
         // Test lines
         let lines = bt.lines();
@@ -220,27 +220,29 @@ mod tests {
             .expect("test buffer mutation should succeed");
 
         let bt = BufTest::new(&buf);
-        assert!(bt.contains_text_style("bold", &PartialStyle::attrs(AttrSet::new(Attr::Bold))));
-        assert!(bt.contains_text_style("italic", &PartialStyle::attrs(AttrSet::new(Attr::Italic))));
+        assert!(
+            bt.contains_text_style("bold", &PartialStyle::new().attrs(AttrSet::new(Attr::Bold)))
+        );
         assert!(bt.contains_text_style(
-            "bold",
-            &PartialStyle::from(StyleBuilder::new().fg(Color::Red).attr(Attr::Bold))
+            "italic",
+            &PartialStyle::new().attrs(AttrSet::new(Attr::Italic))
         ));
+        assert!(
+            bt.contains_text_style("bold", &PartialStyle::new().fg(Color::Red).attr(Attr::Bold))
+        );
         assert!(!bt.contains_text_style(
             "bold",
-            &PartialStyle::from(StyleBuilder::new().fg(Color::Red).attr(Attr::Italic))
+            &PartialStyle::new().fg(Color::Red).attr(Attr::Italic)
         ));
     }
     #[test]
     fn contains_text_style_requires_every_character_and_component() {
         let base = test_style();
         let red = ResolvedStyle::new(Color::Red, Color::Blue, AttrSet::new(Attr::Bold));
-        let requested = PartialStyle::from(
-            StyleBuilder::new()
-                .fg(Color::Red)
-                .bg(Color::Blue)
-                .attr(Attr::Bold),
-        );
+        let requested = PartialStyle::new()
+            .fg(Color::Red)
+            .bg(Color::Blue)
+            .attr(Attr::Bold);
         for red_column in 0..3 {
             let mut buf = TermBuf::new((3, 1), 'x', base).unwrap();
             buf.put(

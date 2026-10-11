@@ -5,6 +5,13 @@ use std::result::Result;
 use thiserror::Error;
 
 use crate::geom::{Rect, Size};
+pub use crate::{
+    core::{
+        context::{RevealAlign, ScrollDirection, ScrollOp},
+        view::View,
+    },
+    widget::{ScrollAxis, ScrollMark},
+};
 
 /// Stack direction for children.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,15 +36,6 @@ pub enum Align {
     Center,
     /// Align to the end of the axis.
     End,
-}
-
-/// Display mode for layout participation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Display {
-    /// Node participates in layout and rendering.
-    Block,
-    /// Node is removed from layout and not rendered.
-    None,
 }
 
 /// Sizing strategy for a single axis.
@@ -221,9 +219,6 @@ impl Direction {
 /// Layout configuration for a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
-    /// Whether this node participates in layout/render.
-    pub display: Display,
-
     /// Stack direction for children.
     pub direction: Direction,
 
@@ -277,8 +272,6 @@ pub struct Layout {
 /// `None` inherits a field. For optional bounds, `Some(None)` clears the bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutOverride {
-    /// Override for [`Layout::display`].
-    pub display: Option<Display>,
     /// Override for [`Layout::direction`].
     pub direction: Option<Direction>,
     /// Override for [`Layout::width`].
@@ -315,34 +308,10 @@ impl LayoutOverride {
         Self::default()
     }
 
-    /// Override every field of a complete layout.
-    pub fn full(layout: Layout) -> Self {
-        Self {
-            display: Some(layout.display),
-            direction: Some(layout.direction),
-            width: Some(layout.width),
-            height: Some(layout.height),
-            min_width: Some(layout.min_width),
-            max_width: Some(layout.max_width),
-            max_width_fraction: Some(layout.max_width_fraction),
-            min_height: Some(layout.min_height),
-            max_height: Some(layout.max_height),
-            overflow_x: Some(layout.overflow_x),
-            overflow_y: Some(layout.overflow_y),
-            padding: Some(layout.padding),
-            gap: Some(layout.gap),
-            align_horizontal: Some(layout.align_horizontal),
-            align_vertical: Some(layout.align_vertical),
-        }
-    }
-
     /// Apply constraints and validate both the widget and resulting layout.
     pub fn apply(self, base: Layout) -> Result<Layout, LayoutValidationError> {
         base.validate()?;
         let mut layout = base;
-        if let Some(value) = self.display {
-            layout.display = value;
-        }
         if let Some(value) = self.direction {
             layout.direction = value;
         }
@@ -389,57 +358,10 @@ impl LayoutOverride {
         Ok(layout)
     }
 
-    /// Persist only fields changed by a layout callback.
-    pub(crate) fn record_changes(&mut self, before: Layout, after: Layout) {
-        if before.display != after.display {
-            self.display = Some(after.display);
-        }
-        if before.direction != after.direction {
-            self.direction = Some(after.direction);
-        }
-        if before.width != after.width {
-            self.width = Some(after.width);
-        }
-        if before.height != after.height {
-            self.height = Some(after.height);
-        }
-        if before.min_width != after.min_width {
-            self.min_width = Some(after.min_width);
-        }
-        if before.max_width != after.max_width {
-            self.max_width = Some(after.max_width);
-        }
-        if before.max_width_fraction != after.max_width_fraction {
-            self.max_width_fraction = Some(after.max_width_fraction);
-        }
-        if before.min_height != after.min_height {
-            self.min_height = Some(after.min_height);
-        }
-        if before.max_height != after.max_height {
-            self.max_height = Some(after.max_height);
-        }
-        if before.overflow_x != after.overflow_x {
-            self.overflow_x = Some(after.overflow_x);
-        }
-        if before.overflow_y != after.overflow_y {
-            self.overflow_y = Some(after.overflow_y);
-        }
-        if before.padding != after.padding {
-            self.padding = Some(after.padding);
-        }
-        if before.gap != after.gap {
-            self.gap = Some(after.gap);
-        }
-        if before.align_horizontal != after.align_horizontal {
-            self.align_horizontal = Some(after.align_horizontal);
-        }
-        if before.align_vertical != after.align_vertical {
-            self.align_vertical = Some(after.align_vertical);
-        }
-    }
     /// Set width to flex with the provided weight.
     ///
     /// A zero weight is rejected when the override is applied.
+    #[must_use]
     pub fn flex_horizontal(mut self, weight: u32) -> Self {
         self.width = Some(Sizing::Flex(weight));
         self
@@ -447,21 +369,46 @@ impl LayoutOverride {
     /// Set height to flex with the provided weight.
     ///
     /// A zero weight is rejected when the override is applied.
+    #[must_use]
     pub fn flex_vertical(mut self, weight: u32) -> Self {
         self.height = Some(Sizing::Flex(weight));
         self
     }
     /// Set both outer width bounds.
+    #[must_use]
     pub fn fixed_width(mut self, value: u32) -> Self {
         self.min_width = Some(Some(value));
         self.max_width = Some(Some(value));
         self
     }
     /// Set both outer height bounds.
+    #[must_use]
     pub fn fixed_height(mut self, value: u32) -> Self {
         self.min_height = Some(Some(value));
         self.max_height = Some(Some(value));
         self
+    }
+}
+
+impl From<Layout> for LayoutOverride {
+    /// Override every field of a complete layout.
+    fn from(layout: Layout) -> Self {
+        Self {
+            direction: Some(layout.direction),
+            width: Some(layout.width),
+            height: Some(layout.height),
+            min_width: Some(layout.min_width),
+            max_width: Some(layout.max_width),
+            max_width_fraction: Some(layout.max_width_fraction),
+            min_height: Some(layout.min_height),
+            max_height: Some(layout.max_height),
+            overflow_x: Some(layout.overflow_x),
+            overflow_y: Some(layout.overflow_y),
+            padding: Some(layout.padding),
+            gap: Some(layout.gap),
+            align_horizontal: Some(layout.align_horizontal),
+            align_vertical: Some(layout.align_vertical),
+        }
     }
 }
 
@@ -475,7 +422,6 @@ impl Layout {
     /// Column layout with measured sizing on both axes.
     pub fn column() -> Self {
         Self {
-            display: Display::Block,
             direction: Direction::Column,
             width: Sizing::Measure,
             height: Sizing::Measure,
@@ -510,15 +456,10 @@ impl Layout {
         }
     }
 
-    /// Remove this node from layout and rendering.
-    pub fn hidden(mut self) -> Self {
-        self.display = Display::None;
-        self
-    }
-
     /// Set width to flex with the provided weight.
     ///
     /// A zero weight is rejected when the layout is applied.
+    #[must_use]
     pub fn flex_horizontal(mut self, weight: u32) -> Self {
         self.width = Sizing::Flex(weight);
         self
@@ -527,56 +468,58 @@ impl Layout {
     /// Set height to flex with the provided weight.
     ///
     /// A zero weight is rejected when the layout is applied.
+    #[must_use]
     pub fn flex_vertical(mut self, weight: u32) -> Self {
         self.height = Sizing::Flex(weight);
         self
     }
 
     /// Set the minimum outer width.
+    #[must_use]
     pub fn min_width(mut self, n: u32) -> Self {
         self.min_width = Some(n);
         self
     }
 
     /// Set the maximum outer width.
+    #[must_use]
     pub fn max_width(mut self, n: u32) -> Self {
         self.max_width = Some(n);
         self
     }
 
     /// Bound the outer width by a fraction of the parent's width budget.
+    #[must_use]
     pub fn max_width_fraction(mut self, fraction: Fraction) -> Self {
         self.max_width_fraction = Some(fraction);
         self
     }
 
     /// Set the minimum outer height.
+    #[must_use]
     pub fn min_height(mut self, n: u32) -> Self {
         self.min_height = Some(n);
         self
     }
 
     /// Set the maximum outer height.
+    #[must_use]
     pub fn max_height(mut self, n: u32) -> Self {
         self.max_height = Some(n);
         self
     }
 
     /// Set the horizontal measurement overflow policy.
+    #[must_use]
     pub fn overflow_x(mut self, policy: MeasureOverflow) -> Self {
         self.overflow_x = policy;
         self
     }
 
     /// Set the vertical measurement overflow policy.
+    #[must_use]
     pub fn overflow_y(mut self, policy: MeasureOverflow) -> Self {
         self.overflow_y = policy;
-        self
-    }
-
-    /// Set whether this node participates in layout and rendering.
-    pub fn display(mut self, display: Display) -> Self {
-        self.display = display;
         self
     }
 
@@ -587,58 +530,68 @@ impl Layout {
     }
 
     /// Convenience: fixed outer width without a `Fixed` enum.
+    #[must_use]
     pub fn fixed_width(self, n: u32) -> Self {
         self.min_width(n).max_width(n)
     }
 
     /// Convenience: fixed outer height without a `Fixed` enum.
+    #[must_use]
     pub fn fixed_height(self, n: u32) -> Self {
         self.min_height(n).max_height(n)
     }
 
     /// Set padding edges.
+    #[must_use]
     pub fn padding(mut self, edges: Edges) -> Self {
         self.padding = edges;
         self
     }
 
     /// Set the main-axis gap between children.
+    #[must_use]
     pub fn gap(mut self, n: u32) -> Self {
         self.gap = n;
         self
     }
 
     /// Set horizontal alignment of children within content area.
+    #[must_use]
     pub fn align_horizontal(mut self, align: Align) -> Self {
         self.align_horizontal = align;
         self
     }
 
     /// Set vertical alignment of children within content area.
+    #[must_use]
     pub fn align_vertical(mut self, align: Align) -> Self {
         self.align_vertical = align;
         self
     }
 
     /// Center children both horizontally and vertically.
+    #[must_use]
     pub fn align_center(self) -> Self {
         self.align_horizontal(Align::Center)
             .align_vertical(Align::Center)
     }
 
     /// Set the layout direction.
+    #[must_use]
     pub fn direction(mut self, direction: Direction) -> Self {
         self.direction = direction;
         self
     }
 
     /// Set width sizing strategy directly.
+    #[must_use]
     pub fn width(mut self, sizing: Sizing) -> Self {
         self.width = sizing;
         self
     }
 
     /// Set height sizing strategy directly.
+    #[must_use]
     pub fn height(mut self, sizing: Sizing) -> Self {
         self.height = sizing;
         self
@@ -970,9 +923,6 @@ mod tests {
             }),
             None
         );
-        let mut recorded = LayoutOverride::new();
-        recorded.record_changes(base, Layout::column());
-        assert_eq!(recorded.max_width_fraction, Some(None));
     }
 
     #[test]

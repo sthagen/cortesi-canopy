@@ -1,45 +1,43 @@
-/// Canopy theme, the default.
-pub mod canopy;
+pub mod animation;
 /// Color helpers.
 mod color;
-/// Dracula theme.
-pub mod dracula;
 /// Style effects system.
 pub mod effects;
-/// Gruvbox theme.
-pub mod gruvbox;
-/// Shared theme palette and rule set.
-mod palette;
-/// Solarized theme.
-pub mod solarized;
+pub mod themes;
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    f64::consts::TAU,
+    iter,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-pub use color::{Color, hex_byte};
-pub(crate) use palette::{Palette, theme};
+pub(crate) use animation::MotionClocks;
+pub use animation::{Animation, AnimationStart, Easing, Pause, Repeat};
+pub use color::{Color, Mix, hex_byte};
 
 use crate::geom;
 
-/// Stable paint roles used by stock widgets, independent of child node names.
+/// Shared part names that widgets paint beneath their own layer.
+///
+/// A widget pushes its node name as a layer and paints these bare roles, so
+/// `button/text` and `input/text` are both the `TEXT` part.
 pub mod roles {
-    /// Button component layer.
-    pub const BUTTON: &str = "button";
-    /// Button label paint path beneath its component and state layers.
-    pub const BUTTON_LABEL: &str = "text";
-    /// Button border paint path beneath its component and state layers.
-    pub const BUTTON_BORDER: &str = "border";
-    /// Button accelerator cell path, for the one label character a key names.
-    pub const BUTTON_KEY: &str = "key";
-    /// Input component layer.
-    pub const INPUT: &str = "input";
-    /// Input row background, including the space after its value.
-    pub const INPUT_BACKGROUND: &str = "background";
-    /// Optional visible input prompt.
-    pub const INPUT_PROMPT: &str = "prompt";
-    /// Input text paint path.
-    pub const INPUT_TEXT: &str = "text";
-    /// Input cursor cell path, falling back to the text role.
-    pub const INPUT_CURSOR: &str = "text/cursor";
+    /// Ordinary text.
+    pub const TEXT: &str = "text";
+    /// The ground a widget fills before painting its parts.
+    pub const BACKGROUND: &str = "background";
+    /// Box chrome drawn around a widget.
+    pub const BORDER: &str = "border";
+    /// A key name, such as an accelerator or a binding hint.
+    pub const KEY: &str = "key";
+    /// A fixed prompt before editable text.
+    pub const PROMPT: &str = "prompt";
+    /// A title in a widget's chrome.
+    pub const TITLE: &str = "title";
+    /// A scrollbar thumb.
+    pub const THUMB: &str = "thumb";
 
     /// Paint a retained selection according to which control takes the keys.
     /// Pass actual focus, or the composite widget's active part. Inactive
@@ -53,6 +51,19 @@ pub mod roles {
     }
 }
 
+/// A style replacement requested during a turn and applied before the next
+/// render.
+#[derive(Clone, Debug)]
+pub(crate) enum StyleChange {
+    /// Switch to a theme, reapplying every widget style rule set.
+    Theme(themes::Palette),
+    /// Replace the whole style map.
+    Map(StyleMap),
+}
+
+/// Style rules a widget crate or application derives from the palette.
+pub(crate) type WidgetStyles = Box<dyn Fn(&themes::Palette, StyleRules<'_>)>;
+
 /// Independent widget states mapped onto the existing style layer stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WidgetState {
@@ -60,7 +71,7 @@ pub enum WidgetState {
     Focused,
     /// The widget is selected independently of focus.
     Selected,
-    /// The configured action is disabled.
+    /// The widget's command is disabled.
     Disabled,
     /// The widget is pressed or explicitly active.
     Pressed,
@@ -132,6 +143,7 @@ impl AttrSet {
         Self::default().with(attr)
     }
     /// A helper for progressive construction of attribute sets.
+    #[must_use]
     pub fn with(mut self, attr: Attr) -> Self {
         match attr {
             Attr::Bold => self.bold = true,
@@ -142,6 +154,35 @@ impl AttrSet {
             Attr::Overline => self.overline = true,
         };
         self
+    }
+
+    /// Return the lowercase name of each attribute, as scripts, snapshots,
+    /// and captures name it, with whether it is on.
+    pub(crate) fn named(self) -> [(&'static str, bool); 6] {
+        [
+            ("bold", self.bold),
+            ("crossedout", self.crossedout),
+            ("dim", self.dim),
+            ("italic", self.italic),
+            ("overline", self.overline),
+            ("underline", self.underline),
+        ]
+    }
+
+    /// Turn on the attribute that `name` names, and return whether it names
+    /// one.
+    pub(crate) fn set_named(&mut self, name: &str) -> bool {
+        let attr = match name {
+            "bold" => Attr::Bold,
+            "crossedout" => Attr::CrossedOut,
+            "dim" => Attr::Dim,
+            "italic" => Attr::Italic,
+            "overline" => Attr::Overline,
+            "underline" => Attr::Underline,
+            _ => return false,
+        };
+        *self = self.with(attr);
+        true
     }
 }
 
@@ -164,6 +205,39 @@ impl GradientStop {
     }
 }
 
+/// How a gradient moves across its rectangle. Every drift keeps step with the
+/// motion epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Drift {
+    /// Slide across the rectangle once in each period, wrapping around.
+    Slide(Duration),
+    /// Swing to and fro: in each period the middle of the gradient travels
+    /// to one edge of the rectangle, to the other edge, and back. The swing
+    /// slows at each edge, like a pendulum, and a gradient whose ends match
+    /// shows a crest that runs back and forth.
+    Sweep(Duration),
+}
+
+impl Drift {
+    /// Return the period of the drift.
+    fn period(self) -> Duration {
+        match self {
+            Self::Slide(period) | Self::Sweep(period) => period,
+        }
+    }
+
+    /// Return the gradient position that shows at `ratio` after `phase` of
+    /// a period, both 0.0 to 1.0.
+    fn shift(self, ratio: f64, phase: f64) -> f64 {
+        match self {
+            Self::Slide(_) => (ratio - phase).rem_euclid(1.0),
+            // The offset starts at rest, swings half the rectangle to the
+            // right, then half to the left, and returns.
+            Self::Sweep(_) => ratio - (phase * TAU).sin() / 2.0,
+        }
+    }
+}
+
 /// A gradient paint specification.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradientSpec {
@@ -171,6 +245,12 @@ pub struct GradientSpec {
     pub angle_deg: f32,
     /// Ordered list of gradient stops.
     pub stops: Vec<GradientStop>,
+    /// The space that mixes colors between stops.
+    pub mix: Mix,
+    /// How the gradient moves across its rectangle. `None` holds it still.
+    pub drift: Option<Drift>,
+    /// When a drifting gradient holds at rest.
+    pub pause: Pause,
 }
 
 impl GradientSpec {
@@ -181,10 +261,38 @@ impl GradientSpec {
             stops.push(GradientStop::new(1.0, Color::White));
         }
         stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
-        Self { angle_deg, stops }
+        Self {
+            angle_deg,
+            stops,
+            mix: Mix::Oklab,
+            drift: None,
+            pause: Pause::Idle,
+        }
+    }
+
+    /// Replace the mixing space.
+    #[must_use]
+    pub fn with_mix(mut self, mix: Mix) -> Self {
+        self.mix = mix;
+        self
+    }
+
+    /// Move the gradient across its rectangle.
+    #[must_use]
+    pub fn with_drift(mut self, drift: Drift) -> Self {
+        self.drift = Some(drift);
+        self
+    }
+
+    /// Replace the pause.
+    #[must_use]
+    pub fn with_pause(mut self, pause: Pause) -> Self {
+        self.pause = pause;
+        self
     }
 
     /// Map all colors in this gradient through a transform.
+    #[must_use]
     pub fn map_colors(&self, f: impl Fn(Color) -> Color) -> Self {
         let stops = self
             .stops
@@ -192,15 +300,47 @@ impl GradientSpec {
             .map(|stop| GradientStop::new(stop.offset, f(stop.color)))
             .collect();
         Self {
-            angle_deg: self.angle_deg,
             stops,
+            ..self.clone()
         }
     }
 
-    /// Resolve a gradient color at a point within a rectangle.
+    /// Resolve a gradient color at a point within a rectangle, at rest.
     pub fn color_at(&self, rect: geom::Rect, point: geom::Point) -> Color {
+        self.color_for_ratio(self.ratio_at(rect, point))
+    }
+
+    /// Resolve a gradient color at a point at the clocks' time, drifted by
+    /// the time since the motion epoch.
+    pub(crate) fn color_in_motion(
+        &self,
+        rect: geom::Rect,
+        point: geom::Point,
+        clocks: &MotionClocks,
+    ) -> Color {
+        let ratio = self.ratio_at(rect, point);
+        let Some(drift) = self.moving_drift().filter(|_| !self.pause.holds(clocks)) else {
+            return self.color_for_ratio(ratio);
+        };
+        let period = drift.period().as_nanos();
+        let elapsed = clocks
+            .now
+            .saturating_duration_since(clocks.epoch)
+            .as_nanos();
+        let phase = (elapsed % period) as f64 / period as f64;
+        self.color_for_ratio(drift.shift(f64::from(ratio), phase) as f32)
+    }
+
+    /// Return the drift, unless the gradient holds still: it has none, or
+    /// its period is zero.
+    fn moving_drift(&self) -> Option<Drift> {
+        self.drift.filter(|drift| !drift.period().is_zero())
+    }
+
+    /// Return the position of a point along the gradient, 0.0 to 1.0.
+    fn ratio_at(&self, rect: geom::Rect, point: geom::Point) -> f32 {
         if rect.w == 0 || rect.h == 0 {
-            return self.stops[0].color;
+            return 0.0;
         }
 
         let width = rect.w as f32;
@@ -220,13 +360,11 @@ impl GradientSpec {
         let local_x = point.x.saturating_sub(rect.tl.x) as f32 + 0.5;
         let local_y = point.y.saturating_sub(rect.tl.y) as f32 + 0.5;
         let dot = dir_x * local_x + dir_y * local_y;
-        let ratio = if (max_dot - min_dot).abs() < f32::EPSILON {
+        if (max_dot - min_dot).abs() < f32::EPSILON {
             0.0
         } else {
             ((dot - min_dot) / (max_dot - min_dot)).clamp(0.0, 1.0)
-        };
-
-        self.color_for_ratio(ratio)
+        }
     }
 
     /// Blend between gradient stops for a normalized ratio.
@@ -240,7 +378,7 @@ impl GradientSpec {
             if ratio <= stop.offset {
                 let span = (stop.offset - prev.offset).max(f32::EPSILON);
                 let local = (ratio - prev.offset) / span;
-                return prev.color.blend(stop.color, local);
+                return prev.color.mix(stop.color, local, self.mix);
             }
             prev = stop;
         }
@@ -255,6 +393,8 @@ pub enum Paint {
     Solid(Color),
     /// Gradient fill.
     Gradient(GradientSpec),
+    /// A color that changes over time.
+    Animated(Arc<Animation>),
 }
 
 impl Paint {
@@ -268,27 +408,83 @@ impl Paint {
         Self::Gradient(spec)
     }
 
+    /// Construct an animated paint.
+    pub fn animated(animation: Animation) -> Self {
+        Self::Animated(Arc::new(animation))
+    }
+
     /// Return the solid color if this paint is solid.
     pub fn solid_color(&self) -> Option<Color> {
         match self {
             Self::Solid(color) => Some(*color),
-            Self::Gradient(_) => None,
+            Self::Gradient(_) | Self::Animated(_) => None,
         }
     }
 
-    /// Resolve the paint at a location.
+    /// Resolve the paint at a location, at rest.
     pub fn resolve(&self, rect: geom::Rect, point: geom::Point) -> Color {
         match self {
             Self::Solid(color) => *color,
             Self::Gradient(spec) => spec.color_at(rect, point),
+            Self::Animated(animation) => animation.rest(),
+        }
+    }
+
+    /// Resolve the paint at a location at the clocks' time.
+    pub(crate) fn resolve_in_motion(
+        &self,
+        rect: geom::Rect,
+        point: geom::Point,
+        clocks: &MotionClocks,
+    ) -> Color {
+        match self {
+            Self::Solid(color) => *color,
+            Self::Gradient(spec) => spec.color_in_motion(rect, point, clocks),
+            Self::Animated(animation) => animation.color(clocks),
+        }
+    }
+
+    /// Return whether the paint changes over time.
+    pub fn moves(&self) -> bool {
+        match self {
+            Self::Solid(_) => false,
+            Self::Gradient(spec) => spec.moving_drift().is_some(),
+            Self::Animated(_) => true,
+        }
+    }
+
+    /// Bind the start of an animation that starts when shown, and return
+    /// whether the paint still moves at `clocks.now`.
+    pub(crate) fn show(&self, clocks: &MotionClocks) -> bool {
+        match self {
+            Self::Solid(_) => false,
+            Self::Gradient(spec) => spec.moving_drift().is_some(),
+            Self::Animated(animation) => {
+                animation.bind_shown(clocks.now);
+                !animation.finished(clocks)
+            }
+        }
+    }
+
+    /// Return the next time the paint can change after the clocks' time.
+    pub(crate) fn next_change(&self, clocks: &MotionClocks, sample: Duration) -> Option<Instant> {
+        match self {
+            Self::Solid(_) => None,
+            Self::Gradient(spec) => spec
+                .moving_drift()
+                .filter(|_| !spec.pause.holds(clocks))
+                .map(|_| clocks.now + sample),
+            Self::Animated(animation) => animation.next_change(clocks, sample),
         }
     }
 
     /// Map colors within this paint.
+    #[must_use]
     pub fn map_colors(&self, f: impl Fn(Color) -> Color) -> Self {
         match self {
             Self::Solid(color) => Self::Solid(f(*color)),
             Self::Gradient(spec) => Self::Gradient(spec.map_colors(f)),
+            Self::Animated(animation) => Self::Animated(Arc::new(animation.map_colors(f))),
         }
     }
 }
@@ -302,6 +498,12 @@ impl From<Color> for Paint {
 impl From<GradientSpec> for Paint {
     fn from(spec: GradientSpec) -> Self {
         Self::Gradient(spec)
+    }
+}
+
+impl From<Animation> for Paint {
+    fn from(animation: Animation) -> Self {
+        Self::animated(animation)
     }
 }
 
@@ -320,6 +522,30 @@ impl ResolvedStyle {
     /// Construct a resolved style from components.
     pub fn new(fg: Color, bg: Color, attrs: AttrSet) -> Self {
         Self { fg, bg, attrs }
+    }
+}
+
+/// How much of a cell a glyph covers, for antialiased drawing.
+///
+/// A covered cell mixes its style's background toward its foreground: by
+/// `fg` for the glyph and by `bg` for the cell ground, each 0 to 255.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Coverage {
+    /// Glyph coverage.
+    pub fg: u8,
+    /// Ground coverage.
+    pub bg: u8,
+}
+
+impl Coverage {
+    /// Apply the coverage to a resolved style.
+    pub fn apply(self, style: ResolvedStyle) -> ResolvedStyle {
+        let weight = |coverage: u8| f32::from(coverage) / 255.0;
+        ResolvedStyle::new(
+            style.bg.mix(style.fg, weight(self.fg), Mix::Rgb),
+            style.bg.mix(style.fg, weight(self.bg), Mix::Rgb),
+            style.attrs,
+        )
     }
 }
 
@@ -344,6 +570,11 @@ impl Style {
         )
     }
 
+    /// Return whether either paint changes over time.
+    pub fn moves(&self) -> bool {
+        self.fg.moves() || self.bg.moves()
+    }
+
     /// Resolve the style to a solid variant if both paints are solid.
     pub fn resolve_solid(&self) -> Option<ResolvedStyle> {
         Some(ResolvedStyle::new(
@@ -366,96 +597,38 @@ pub struct PartialStyle {
     pub attrs: Option<AttrSet>,
 }
 
-/// A builder for creating reusable style specifications.
-///
-/// Use this to define styles that can be applied to multiple paths.
-///
-/// # Example
-///
-/// ```
-/// use canopy::style::{Attr, StyleBuilder, StyleMap, solarized};
-///
-/// let selected = StyleBuilder::new()
-///     .fg(solarized::BASE3)
-///     .bg(solarized::BLUE)
-///     .attr(Attr::Bold);
-///
-/// let mut style_map = StyleMap::new();
-/// style_map.rules().style("item/selected", selected).apply();
-/// ```
-#[derive(Clone, Default, Debug, PartialEq)]
-pub struct StyleBuilder {
-    /// The partial style being built.
-    inner: PartialStyle,
-}
-
-impl StyleBuilder {
-    /// Create a new empty style builder.
+impl PartialStyle {
+    /// Create an empty partial style, which inherits every component.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the foreground paint.
+    #[must_use]
     pub fn fg(mut self, paint: impl Into<Paint>) -> Self {
-        self.inner.fg = Some(paint.into());
+        self.fg = Some(paint.into());
         self
     }
 
     /// Set the background paint.
+    #[must_use]
     pub fn bg(mut self, paint: impl Into<Paint>) -> Self {
-        self.inner.bg = Some(paint.into());
+        self.bg = Some(paint.into());
         self
     }
 
-    /// Add a single attribute.
+    /// Add one attribute to the attributes set so far.
+    #[must_use]
     pub fn attr(mut self, attr: Attr) -> Self {
-        if let Some(attrs) = self.inner.attrs {
-            self.inner.attrs = Some(attrs.with(attr));
-        } else {
-            self.inner.attrs = Some(AttrSet::new(attr));
-        }
+        self.attrs = Some(self.attrs.unwrap_or_default().with(attr));
         self
     }
 
-    /// Set all attributes.
+    /// Set every attribute at once; an empty set stops attributes inheriting.
+    #[must_use]
     pub fn attrs(mut self, attrs: AttrSet) -> Self {
-        self.inner.attrs = Some(attrs);
+        self.attrs = Some(attrs);
         self
-    }
-}
-
-impl From<StyleBuilder> for PartialStyle {
-    fn from(s: StyleBuilder) -> Self {
-        s.inner
-    }
-}
-
-impl PartialStyle {
-    /// Create a new PartialStyle with only a foreground paint.
-    pub fn fg(fg: impl Into<Paint>) -> Self {
-        Self {
-            fg: Some(fg.into()),
-            bg: None,
-            attrs: None,
-        }
-    }
-
-    /// Create a new PartialStyle with only a background paint.
-    pub fn bg(bg: impl Into<Paint>) -> Self {
-        Self {
-            fg: None,
-            bg: Some(bg.into()),
-            attrs: None,
-        }
-    }
-
-    /// Create a new PartialStyle with only attributes.
-    pub fn attrs(attrs: AttrSet) -> Self {
-        Self {
-            fg: None,
-            bg: None,
-            attrs: Some(attrs),
-        }
     }
 
     /// Resolve the partial style into a full style.
@@ -508,6 +681,12 @@ pub struct StyleMap {
 }
 
 impl StyleMap {
+    /// Resolve the style at `path`, as a widget with no pushed layers
+    /// would see it.
+    pub fn resolve(&self, path: &str) -> Style {
+        StyleManager::default().get(self, path)
+    }
+
     /// Construct a style map with defaults.
     pub fn new() -> Self {
         let mut cs = Self {
@@ -534,8 +713,8 @@ impl StyleMap {
     /// let mut style_map = StyleMap::new();
     /// style_map
     ///     .rules()
-    ///     .fg("red/text", solarized::RED)
-    ///     .fg("blue/text", solarized::BLUE)
+    ///     .fg("red/text", Color::Red)
+    ///     .fg("blue/text", Color::Blue)
     ///     .apply();
     /// ```
     pub fn rules(&mut self) -> StyleRules<'_> {
@@ -592,7 +771,7 @@ impl<'a> StyleRules<'a> {
     /// with the existing style.
     pub fn fg(mut self, path: &str, paint: impl Into<Paint>) -> Self {
         let full_path = self.make_path(path);
-        self.merge_pending(full_path, PartialStyle::fg(paint));
+        self.merge_pending(full_path, PartialStyle::new().fg(paint));
         self
     }
 
@@ -602,7 +781,7 @@ impl<'a> StyleRules<'a> {
     /// with the existing style.
     pub fn bg(mut self, path: &str, paint: impl Into<Paint>) -> Self {
         let full_path = self.make_path(path);
-        self.merge_pending(full_path, PartialStyle::bg(paint));
+        self.merge_pending(full_path, PartialStyle::new().bg(paint));
         self
     }
 
@@ -612,7 +791,7 @@ impl<'a> StyleRules<'a> {
     /// with the existing style.
     pub fn attr(mut self, path: &str, attr: Attr) -> Self {
         let full_path = self.make_path(path);
-        self.merge_pending(full_path, PartialStyle::attrs(AttrSet::new(attr)));
+        self.merge_pending(full_path, PartialStyle::new().attrs(AttrSet::new(attr)));
         self
     }
 
@@ -704,15 +883,16 @@ impl<'a> StyleRules<'a> {
 /// descendants, and `Canopy` manages popping layers back off the stack at the
 /// appropriate time during rendering.
 ///
-/// When a colour is resolved, we first try to find the specified path under
-/// each layer to the root; failing that we look up the default colours for each
-/// layer to the root.
+/// When a colour is resolved, each prefix of the path, longest first, is
+/// looked up under the whole layer stack, then under the stack with its outer
+/// layers dropped one at a time, then with its inner layers dropped, and
+/// finally under no layers.
 ///
-/// So given a layer stack ["foo"], and an attempt to look up "frame/selected",
-/// we try the following lookups in order: ["foo/frame/selected",
-/// "frame/selected", "foo/frame", "frame", "foo", ""].
+/// So given a layer stack ["foo", "bar"], and an attempt to look up "text",
+/// we try the following lookups in order: ["foo/bar/text", "bar/text",
+/// "foo/text", "text", "foo/bar", "bar", "foo", ""].
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct StyleManager {
+pub(crate) struct StyleManager {
     /// Current render level.
     level: usize,
     /// Active layer names.
@@ -768,16 +948,27 @@ impl StyleManager {
     /// Resolve a style using a path and a layer specification, ignoring
     /// `self.layers`.
     ///
-    /// Probes path prefixes from longest to shortest, and within each, layer
-    /// prefixes from the deepest layer to the root. The first probe that
-    /// sets a component wins.
+    /// Probes path prefixes from longest to shortest. Within each, it probes
+    /// the whole layer stack, then the stack with outer layers dropped, then
+    /// the stack with inner layers dropped, and finally no layers. So a
+    /// component's own rules apply wherever it is mounted, and a context rule
+    /// such as `dialog/button/border` still beats `button/border`. The first
+    /// probe that sets a component wins.
     fn resolve(&self, smap: &StyleMap, layers: &[String], path: &[&str]) -> Style {
+        let n = layers.len();
+        let inner = (1..n).map(|start| start..n);
+        let outer = (1..n).rev().map(|end| 0..end);
+        let windows: Vec<_> = iter::once(0..n)
+            .chain(inner)
+            .chain(outer)
+            .chain((n > 0).then_some(0..0))
+            .collect();
         let mut ret = PartialStyle::default();
         let mut key = String::new();
         for suffix in (0..=path.len()).rev() {
-            for depth in (0..=layers.len()).rev() {
+            for window in &windows {
                 key.clear();
-                let parts = layers[..depth]
+                let parts = layers[window.clone()]
                     .iter()
                     .map(String::as_str)
                     .chain(path[..suffix].iter().copied());
@@ -814,21 +1005,17 @@ mod tests {
             .fg("input/text", Color::Green)
             .apply();
         let mut manager = StyleManager::new();
-        manager.push_layer(roles::BUTTON);
+        manager.push_layer("button");
         manager.push_layer(WidgetState::Pressed.layer());
-        let label = manager.get(&map, roles::BUTTON_LABEL);
-        let border = manager.get(&map, roles::BUTTON_BORDER);
+        let label = manager.get(&map, roles::TEXT);
+        let border = manager.get(&map, roles::BORDER);
         manager.push();
         manager.push();
-        assert_eq!(manager.get(&map, roles::BUTTON_LABEL), label);
-        assert_eq!(manager.get(&map, roles::BUTTON_BORDER), border);
+        assert_eq!(manager.get(&map, roles::TEXT), label);
+        assert_eq!(manager.get(&map, roles::BORDER), border);
         let mut input = StyleManager::new();
-        input.push_layer(roles::INPUT);
+        input.push_layer("input");
         input.push_layer(WidgetState::Focused.layer());
-        assert_eq!(
-            input.get(&map, roles::INPUT_CURSOR),
-            input.get(&map, roles::INPUT_TEXT)
-        );
     }
 
     #[test]
@@ -841,24 +1028,24 @@ mod tests {
             .fg("button/focused/selected/disabled/text", Color::Red)
             .apply();
         let mut manager = StyleManager::new();
-        manager.push_layer(roles::BUTTON);
-        let ordinary = manager.get(&map, roles::BUTTON_LABEL);
+        manager.push_layer("button");
+        let ordinary = manager.get(&map, roles::TEXT);
         manager.push_layer(WidgetState::Focused.layer());
-        let focused = manager.get(&map, roles::BUTTON_LABEL);
+        let focused = manager.get(&map, roles::TEXT);
         manager.push_layer(WidgetState::Selected.layer());
-        let selected = manager.get(&map, roles::BUTTON_LABEL);
+        let selected = manager.get(&map, roles::TEXT);
         manager.push_layer(WidgetState::Disabled.layer());
-        let disabled = manager.get(&map, roles::BUTTON_LABEL);
+        let disabled = manager.get(&map, roles::TEXT);
         assert_ne!(ordinary, focused);
         assert_ne!(focused, selected);
         assert_ne!(selected, disabled);
     }
 
     #[test]
-    fn style_builder_defines_a_reusable_rule() {
-        let selected = StyleBuilder::new()
-            .fg(solarized::BASE3)
-            .bg(solarized::BLUE)
+    fn partial_style_chains_a_reusable_rule() {
+        let selected = PartialStyle::new()
+            .fg(Color::White)
+            .bg(Color::Blue)
             .attr(Attr::Bold);
 
         let mut style_map = StyleMap::new();
@@ -866,8 +1053,8 @@ mod tests {
 
         let manager = StyleManager::new();
         let resolved = manager.get(&style_map, "item/selected");
-        assert_eq!(resolved.fg, Paint::solid(solarized::BASE3));
-        assert_eq!(resolved.bg, Paint::solid(solarized::BLUE));
+        assert_eq!(resolved.fg, Paint::solid(Color::White));
+        assert_eq!(resolved.bg, Paint::solid(Color::Blue));
         assert_eq!(resolved.attrs, AttrSet::new(Attr::Bold));
     }
 
@@ -878,23 +1065,23 @@ mod tests {
             .rules()
             .style(
                 "",
-                StyleBuilder::new()
+                PartialStyle::new()
                     .fg(Color::White)
                     .bg(Color::Black)
                     .attrs(AttrSet::default()),
             )
-            .fg("red/text", solarized::RED)
-            .fg("blue/text", solarized::BLUE)
+            .fg("red/text", Color::Red)
+            .fg("blue/text", Color::Blue)
             .apply();
 
         let manager = StyleManager::new();
         assert_eq!(
             manager.get(&style_map, "red/text"),
-            solid_style(solarized::RED, Color::Black)
+            solid_style(Color::Red, Color::Black)
         );
         assert_eq!(
             manager.get(&style_map, "blue/text"),
-            solid_style(solarized::BLUE, Color::Black)
+            solid_style(Color::Blue, Color::Black)
         );
     }
 
@@ -914,14 +1101,76 @@ mod tests {
         format!("# {name}\n{}\n", lines.join("\n"))
     }
 
+    #[test]
+    fn the_focus_ground_leans_from_the_background_toward_the_accent() {
+        for palette in [
+            themes::default_dark(),
+            themes::solarized_dark(),
+            themes::solarized_light(),
+            themes::dracula(),
+            themes::gruvbox_dark(),
+        ] {
+            let focus = palette.focus_bg();
+            assert_ne!(focus, palette.bg, "the focus ground stands out");
+            assert_ne!(focus, palette.accent, "the focus ground stays a ground");
+            assert_eq!(focus, palette.bg.mix(palette.accent, 0.13, Mix::Rgb));
+        }
+    }
+
+    /// In every built-in theme, a button's key keeps one color in every state
+    /// and reads on each face as well as the theme's text reads on its panel,
+    /// up to WCAG AA. So does the label on the faces of focus and a press;
+    /// on the resting face it keeps the contrast the theme gives it.
+    #[test]
+    fn button_labels_and_keys_read_on_every_face() {
+        for (name, palette) in [
+            ("default_dark", themes::default_dark()),
+            ("solarized_dark", themes::solarized_dark()),
+            ("solarized_light", themes::solarized_light()),
+            ("dracula", themes::dracula()),
+            ("gruvbox_dark", themes::gruvbox_dark()),
+        ] {
+            let map = palette.style_map();
+            let target = palette.fg.contrast_ratio(palette.panel_bg).min(4.5);
+            let colors = |path: &str| {
+                let style = map.resolve(path);
+                (
+                    style.fg.solid_color().expect("solid fg"),
+                    style.bg.solid_color().expect("solid bg"),
+                    style.attrs,
+                )
+            };
+            let (rest_key, ..) = colors("/button/face/key");
+            for state in ["", "focused/", "active/"] {
+                let (text, face, _) = colors(&format!("/button/{state}face/text"));
+                let (key, key_face, attrs) = colors(&format!("/button/{state}face/key"));
+                assert_eq!(face, key_face, "{name} {state}: one face");
+                assert_eq!(key, rest_key, "{name} {state}: one key color");
+                assert!(attrs.bold && !attrs.underline, "{name} {state}: key marks");
+                let parts = if state.is_empty() {
+                    vec![("key", key)]
+                } else {
+                    vec![("text", text), ("key", key)]
+                };
+                for (part, color) in parts {
+                    let ratio = color.contrast_ratio(face);
+                    assert!(
+                        ratio + 0.005 >= target,
+                        "{name} {state}{part}: {ratio:.2} under {target:.2}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Render every built-in theme in a stable order.
     fn dump_all_themes() -> String {
         [
-            ("canopy_dark", super::canopy::canopy_dark()),
-            ("solarized_dark", solarized::solarized_dark()),
-            ("solarized_light", solarized::solarized_light()),
-            ("dracula", dracula::dracula()),
-            ("gruvbox_dark", gruvbox::gruvbox_dark()),
+            ("default_dark", themes::default_dark().style_map()),
+            ("solarized_dark", themes::solarized_dark().style_map()),
+            ("solarized_light", themes::solarized_light().style_map()),
+            ("dracula", themes::dracula().style_map()),
+            ("gruvbox_dark", themes::gruvbox_dark().style_map()),
         ]
         .iter()
         .map(|(name, map)| dump_theme(name, map))
@@ -965,7 +1214,7 @@ mod tests {
         smap.rules()
             .style(
                 "",
-                StyleBuilder::new()
+                PartialStyle::new()
                     .fg(Color::White)
                     .bg(Color::Black)
                     .attrs(AttrSet::default()),
@@ -1041,6 +1290,39 @@ mod tests {
         assert_eq!(c.level, 1);
         assert_eq!(c.layers, vec!["foo"]);
         assert_eq!(c.layer_levels, vec![0, 1]);
+    }
+
+    #[test]
+    fn component_rules_apply_under_any_outer_layer() {
+        let mut map = StyleMap::new();
+        map.rules()
+            .fg("editor/text", Color::Red)
+            .fg("host/text", Color::Blue)
+            .fg("host/selection", Color::Green)
+            .fg("dialog/button/border", Color::Yellow)
+            .fg("button/border", Color::Magenta)
+            .apply();
+        let mut manager = StyleManager::new();
+        manager.push_layer("host");
+        manager.push_layer("editor");
+        assert_eq!(
+            manager.get(&map, "text").fg,
+            Paint::Solid(Color::Red),
+            "the component's rule beats the host's"
+        );
+        assert_eq!(
+            manager.get(&map, "selection").fg,
+            Paint::Solid(Color::Green),
+            "the host's rule fills what the component leaves unset"
+        );
+        let mut dialog = StyleManager::new();
+        dialog.push_layer("dialog");
+        dialog.push_layer("button");
+        assert_eq!(
+            dialog.get(&map, "border").fg,
+            Paint::Solid(Color::Yellow),
+            "a context rule beats the component's"
+        );
     }
 
     #[test]
@@ -1159,8 +1441,8 @@ mod tests {
         let left = spec.color_at(rect, geom::Point { x: 0, y: 0 });
         let right = spec.color_at(rect, geom::Point { x: 9, y: 0 });
 
-        assert_eq!(left, start.blend(end, 0.05));
-        assert_eq!(right, start.blend(end, 0.95));
+        assert_eq!(left, start.mix(end, 0.05, Mix::Oklab));
+        assert_eq!(right, start.mix(end, 0.95, Mix::Oklab));
     }
 
     #[test]
@@ -1180,8 +1462,8 @@ mod tests {
         let top = spec.color_at(rect, geom::Point { x: 0, y: 0 });
         let bottom = spec.color_at(rect, geom::Point { x: 0, y: 9 });
 
-        assert_eq!(top, start.blend(end, 0.05));
-        assert_eq!(bottom, start.blend(end, 0.95));
+        assert_eq!(top, start.mix(end, 0.05, Mix::Oklab));
+        assert_eq!(bottom, start.mix(end, 0.95, Mix::Oklab));
     }
 
     #[test]
@@ -1216,12 +1498,121 @@ mod tests {
         let dot = dir_x * local_x + dir_y * 0.5;
         let ratio = ((dot - min_dot) / (max_dot - min_dot)).clamp(0.0, 1.0);
         let expected = if ratio <= 0.5 {
-            red.blend(green, ratio / 0.5)
+            red.mix(green, ratio / 0.5, Mix::Oklab)
         } else {
-            green.blend(blue, (ratio - 0.5) / 0.5)
+            green.mix(blue, (ratio - 0.5) / 0.5, Mix::Oklab)
         };
 
         assert_eq!(spec.color_at(rect, point), expected);
+    }
+
+    #[test]
+    fn a_drifting_gradient_slides_and_wraps() {
+        use std::time::{Duration, Instant};
+        let spec = GradientSpec::with_stops(
+            0.0,
+            vec![
+                GradientStop::new(0.0, Color::Black),
+                GradientStop::new(1.0, Color::White),
+            ],
+        )
+        .with_drift(Drift::Slide(Duration::from_secs(1)));
+        let rect = geom::Rect::new(0, 0, 10, 1);
+        let point = geom::Point { x: 7, y: 0 };
+        let t0 = Instant::now();
+        let at = |ms: u64| MotionClocks {
+            now: t0 + Duration::from_millis(ms),
+            ..MotionClocks::at(t0)
+        };
+        assert_eq!(
+            spec.color_in_motion(rect, point, &at(0)),
+            spec.color_at(rect, point)
+        );
+        let shifted = geom::Point { x: 2, y: 0 };
+        assert_eq!(
+            spec.color_in_motion(rect, point, &at(500)),
+            spec.color_at(rect, shifted)
+        );
+        assert_eq!(
+            spec.color_in_motion(rect, point, &at(1000)),
+            spec.color_at(rect, point)
+        );
+        let paused = MotionClocks {
+            paused: true,
+            ..at(500)
+        };
+        assert_eq!(
+            spec.color_in_motion(rect, point, &paused),
+            spec.color_at(rect, point)
+        );
+    }
+
+    #[test]
+    fn a_drift_of_no_period_holds_still() {
+        use std::time::{Duration, Instant};
+        let paint = Paint::gradient(
+            GradientSpec::with_stops(0.0, Vec::new())
+                .with_drift(Drift::Sweep(Duration::ZERO))
+                .with_pause(Pause::Never),
+        );
+        assert!(!paint.moves());
+        let clocks = MotionClocks::at(Instant::now());
+        assert!(!paint.show(&clocks));
+        assert_eq!(paint.next_change(&clocks, Duration::from_millis(33)), None);
+    }
+
+    #[test]
+    fn a_sweeping_gradient_swings_to_and_fro() {
+        use std::time::{Duration, Instant};
+        let spec = GradientSpec::with_stops(
+            0.0,
+            vec![
+                GradientStop::new(0.0, Color::Black),
+                GradientStop::new(1.0, Color::White),
+            ],
+        )
+        .with_drift(Drift::Sweep(Duration::from_secs(1)))
+        .with_pause(Pause::Never);
+        let rect = geom::Rect::new(0, 0, 10, 1);
+        let left = geom::Point { x: 2, y: 0 };
+        let right = geom::Point { x: 7, y: 0 };
+        let t0 = Instant::now();
+        let at = |ms: u64| MotionClocks {
+            now: t0 + Duration::from_millis(ms),
+            ..MotionClocks::at(t0)
+        };
+        assert_eq!(
+            spec.color_in_motion(rect, right, &at(0)),
+            spec.color_at(rect, right)
+        );
+        // A quarter period swings the gradient half the rectangle right, and
+        // three quarters swing it half the rectangle left.
+        assert_eq!(
+            spec.color_in_motion(rect, right, &at(250)),
+            spec.color_at(rect, left)
+        );
+        assert_eq!(
+            spec.color_in_motion(rect, left, &at(750)),
+            spec.color_at(rect, right)
+        );
+        assert_eq!(
+            spec.color_in_motion(rect, right, &at(500)),
+            spec.color_at(rect, right)
+        );
+        // A busy gradient swings on while the operator is idle.
+        let paused = MotionClocks {
+            paused: true,
+            ..at(250)
+        };
+        assert_eq!(
+            spec.color_in_motion(rect, right, &paused),
+            spec.color_at(rect, left)
+        );
+        assert!(
+            Paint::gradient(spec)
+                .next_change(&paused, Duration::from_millis(33))
+                .is_some()
+        );
     }
 
     #[test]
@@ -1275,7 +1666,7 @@ mod tests {
         map.rules()
             .fg("//item/", Color::Yellow)
             .bg("item", Color::Red)
-            .style("/item//", StyleBuilder::new().attrs(AttrSet::default()))
+            .style("/item//", PartialStyle::new().attrs(AttrSet::default()))
             .apply();
         let item = manager.get(&map, "item").resolve_solid().unwrap();
         assert_eq!(item.fg, Color::Yellow);

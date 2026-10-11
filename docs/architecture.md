@@ -11,19 +11,53 @@ adding behavior.
 ## Public API Surface
 
 Application code imports core types from the crate root and domain types from
-their module; it selects `canopy_widgets` types directly. The root holds the
-facade traits and their handle types: `Canopy`, `Widget`, `Context`,
-`ViewContext`, `Render`, `NodeName`, `View`, the capability context traits,
-typed node IDs, and the command macros. Value libraries live in their modules:
-`canopy::geom`, `canopy::layout`, `canopy::style`, `canopy::event`,
-`canopy::path`, `canopy::script`, `canopy::error`, `canopy::help`,
-`canopy::cursor`, `canopy::text`, and `canopy::render` (backend interfaces).
-Each item has one canonical location, and there is no prelude.
+their module; it selects `canopy_widgets` types directly. Each item has one
+canonical location, and there is no prelude.
 
-`Canopy` owns `Core` and the style map. Its fields are private. Apps install root
-widgets with helpers such as `Root::install`, mutate styles through
-`Canopy::style_mut()`, and use `Canopy` methods for scripting, fixtures, input
-modes, rendering, and automation.
+The root holds the application, the widget, the contexts, and node handles:
+`Canopy`, `CanopyBuilder`, `Setup`, `Register`, `Widget`, `Context`,
+`ContextExt`, `ViewContext`, `ViewContextExt`, `NodeId`, `TypedId`, `NodeName`,
+`EventOutcome`, `ChangeOutcome`, the command derive macros, `slot!`, and
+`rgb!`. Everything else lives in the module that owns its concept:
+
+| Module | Holds |
+| --- | --- |
+| `canopy::input` | Events (`Event`, `key`, `mouse`), `InputSpec`, bindings and their tiers, intents and the built-in `NavIntent`s, binding targets for key lookup (`BindingTarget`), modals and their framework groups, binding discovery, route analysis, and the route trace |
+| `canopy::tree` | `ChildSlot`, `NodeIdentity`, `FocusDirection`, `FocusScope` |
+| `canopy::layout` | Layout, `View`, scrolling (`ScrollOp`, `ScrollDirection`, `ScrollAxis`, `ScrollMark`), and `RevealAlign` |
+| `canopy::render` | `Render` (including `Render::runs`), `RenderBackend`, `NopBackend`, `TermBuf`, `Cell`, `RenderLimits`, and `cursor` |
+| `canopy::runtime` | `TurnInput`, `TurnOutcome`, published frames (`FrameId`, `FrameSnapshot`, `NodeSnapshot`, `WidgetSemantics`), polls and wakes (`PollLifetime`, `NodeWakeHandle`, `wake_channel`), and notices |
+| `canopy::script` | Evaluation (`EvalRequest`, `EvalTicket`, `EvalOutcome`), automation, the script journal, trust, and fixtures |
+| `canopy::commands` | Command metadata, calls (`CommandCall::with_arg`), and arguments |
+| `canopy::style` | Style maps, `PartialStyle`, colors, effects, shared part `roles`, and `themes` with its `Palette` |
+| `canopy::text` | `width`, `cell_width`, truncation (`Truncate`), and grapheme slicing |
+| `canopy::geom`, `canopy::path`, `canopy::error` | Geometry, node paths, and errors |
+| `canopy::terminal` | The Crossterm run loop |
+
+`canopy_widgets` follows the same rule: every widget is exported at its crate
+root once, and a module is public only when it carries a family of supporting
+types: `editor`, `highlight`, `font`, `terminal`, `scrollbar`, `diff`, `list`,
+and `paged`. Glyph sets are associated constants (`BoxGlyphs::ROUND`,
+`ScrollbarGlyphs::THIN`), and a widget that runs inside modals ships its
+framework group as an associated constant (`Confirm::BINDINGS`).
+
+The `testing` feature adds `canopy::testing`. A public signature names its
+types by their public path, and a test fails when a capture in `api/` shows a
+private `crate::core::` path.
+
+An application runs in two phases. `CanopyBuilder::configure` passes a `Setup`
+handle, which owns every registration: commands, bindings, intents,
+startup scripts, fixtures, mode hooks, render limits, the starting theme, and
+the style rules widgets derive from its palette.
+Each type registers what it needs in a `Register` impl. The builder then
+finalizes the API and returns a `Canopy`, which has no registration methods.
+
+`Canopy` is the running application. It owns `Core` and the style map, and its
+fields are private. Apps install root widgets with helpers such as
+`Root::install`, switch themes at runtime through `Context::set_theme`, and use `Canopy` methods for scripting, fixtures, input
+modes, rendering, and automation. The `testing` feature adds hooks that tests
+need and the builder cannot express: a manual clock, the event receiver, script
+module invalidation, the journal limit, and layout timing.
 
 Lower-level runtime state is crate-private. `Core`, `inputmap`, and raw arena
 mutation are not reachable from app code, and `script` and the backend modules
@@ -33,23 +67,68 @@ Path-oriented APIs use `Path`, `PathFilter`, and `NodeName`. Literal path
 components must be valid node names. Raw script path strings are validated at the
 Luau boundary before matching.
 
+Two rules keep the surface small. `Canopy` holds only operations that cannot
+live on a context or on `Setup`. A new context query or mutation replaces or
+generalizes an existing one, in the node-addressed form: it takes the node it
+acts on rather than acting on the calling node alone. The generated captures
+in `api/` record the surface, and every public API change is reviewed as a
+diff of those captures.
+
+`EvalTicket::completion` exposes `futures::channel::oneshot::Receiver`
+directly. Evaluation completion is a single-consumer event with that receiver's
+polling and cancellation semantics, so a wrapper would add surface without
+changing the contract.
+
 ## Widget capabilities
 
 `canopy-widgets` enables its complete bundle by default. Basic forms can set
-`default-features = false`; Input, List, Root, and Help remain available. The
-shared `canopy_widgets::text_buffer` module is independent of Editor. Editor
-does not re-export text-buffer types; it uses `display_width` internally when
-enabled.
+`default-features = false`; Input, List, Root, Help, and Editor remain
+available. Input and Editor share a crate-private text buffer; `editor`
+re-exports only `TextPosition` and `TextRange`, which `Editor::set_matches`
+takes. Every widget is exported at the crate root once, and a module is public
+only when it carries a family of supporting types: `editor`, `highlight`,
+`font`, `terminal`, `scrollbar`, `diff`, `list`, and `paged`. Every widget measures
+text with `canopy::text::width`, and tab-aware cells with
+`canopy::text::cell_width`, so measurement and painting agree.
+
+Editor and DiffView highlight through any `canopy_widgets::highlight::Highlighter` a
+host supplies; neither needs a feature for that. `syntax` adds the built-in
+Syntect-backed `SyntectHighlighter`, so only its dependencies and detection
+tables are optional.
 
 | Feature | Additional widgets and dependencies |
 | --- | --- |
-| `editor` | Editor and Syntect syntax highlighting |
+| `syntax` | `SyntectHighlighter` and its Syntect dependencies |
 | `terminal-widget` | Terminal and `itty-core` |
 | `graphics` | `ImageView` (crate-root re-export), fonts, `image`, and `fontdue` |
 | `devtools` | Inspector and tracing subscriber support |
 
 Without `devtools`, Root creates no Inspector nodes or Inspector commands.
 Core scripting and the Crossterm adapter remain available in every profile.
+
+## Paged data
+
+`canopy_widgets::paged::Paged` controls a bounded window over a provider's data.
+It preserves provider order: it never sorts items and requires no ordering
+trait. Stable item keys identify selections and viewport anchors; opaque page
+cursors identify boundaries. These can be different types. The total count is
+optional, so a provider can serve pages without scanning the complete dataset.
+
+The controller emits requests and accepts replies. The host owns I/O, scheduling,
+and cancellation. Request tokens reject replies from another controller, an old
+query, or superseded navigation. Errors retain the resident rows and selection;
+empty pages with a continuation pause until the host requests a retry.
+
+The window evicts whole pages to preserve provider cursors. A pinned selection
+survives eviction, and providers can optionally support seeking to its key or
+to the last page. Pending keyboard movement continues when the next page arrives.
+User scrolling can supersede that movement without losing the selection.
+
+Renderers consume anchor or reveal intents after publishing rows, and acknowledge
+reveals after layout. This keeps viewport preservation separate from selection
+visibility. The controller has no runtime or rendering dependency; dummy providers
+test page boundaries, stale replies, and virtual million-item datasets. `fh` uses
+it for its flat filesystem listing.
 
 ## Tree Model
 
@@ -63,7 +142,7 @@ node is attached when its parent chain reaches the root without cycles. Detached
 nodes may exist during assembly or reparenting. The runtime does not render,
 hit-test, or focus them.
 
-A node stores a parent, ordered children, keyed children, a widget slot, layout
+A node stores a parent, ordered children, slots, a widget cell, layout
 and view caches, and mount and polling flags. Parent links, child lists, and keys
 must agree: parents list their children, children point back, and keys point only
 at direct children.
@@ -75,12 +154,12 @@ an error, the runtime restores its structural checkpoint. A failed nested edit
 restores its own checkpoint, even when the enclosing edit handles the error.
 
 The checkpoint captures every arena node, including detached nodes. It restores
-node metadata, topology, child keys, layout and view caches, and lifecycle flags.
-It also restores root, focus, mouse capture, focus recovery hints, exit requests,
-pending style changes, and pending diagnostic requests.
+node metadata, topology, slots, layout and view caches, and lifecycle flags.
+It also restores root, focus, mouse capture, deferred focus repairs, exit
+requests, and pending style changes.
 Layout metadata includes the widget base layout and persistent override.
 
-The checkpoint shares widget slots with the live arena. Widget-owned mutations
+The checkpoint shares widget cells with the live arena. Widget-owned mutations
 survive rollback. Binding registration and external effects, including database
 writes, are also outside this guarantee. Callers must compensate those effects
 or make them safe to repeat.
@@ -104,16 +183,19 @@ changes, so old poll callbacks and wake handles cannot reach the replacement.
 Detaching clears the parent link but preserves mounted widgets. Reattachment does
 not repeat completed mount hooks. Layout caches refresh when the subtree returns.
 
-Runtime-managed work declares `WorkLifetime::Node` or `WorkLifetime::Attachment`.
+Runtime-managed work declares `PollLifetime::Node` or `PollLifetime::Attachment`.
 Node lifetime ends on widget replacement or removal. Attachment lifetime also ends
-on detach. Reattachment starts a new attachment generation. Hiding ends neither
+on detach. Reattachment starts a new attachment generation. An edit updates the
+generations of the subtree it moves and no others. Hiding ends neither
 lifetime. `Widget::poll_lifetime()` defaults to node lifetime, preserving detached
 terminal polling. Attachment polling initializes again after reattachment.
 
-Each `Widget::poll` result replaces its previous timer. `Some(delay)` schedules
-another poll, with delays below one millisecond rounded up to let the adapter
-sleep. `None` cancels scheduled polling, including when an early node wake
-triggered the callback. Explicit wakes remain immediate.
+Each successful `Widget::poll` result replaces its previous timer.
+`Ok(Some(delay))` schedules another poll, with delays below one millisecond
+rounded up to let the adapter sleep. `Ok(None)` cancels scheduled polling,
+including when an early node wake triggered the callback. A poll that fails
+with a notice keeps polling at the delay the last success requested; any other
+failure is fatal. Explicit wakes remain immediate.
 
 `Context::wake_handle(lifetime)` creates a `Send + Sync` `NodeWakeHandle` for the
 current widget incarnation. Attachment handles require an attached owner.
@@ -124,7 +206,7 @@ per owner and stores no producer-result queue.
 Structural success commits lifetime expiration and cancels obsolete polling.
 Provisional registrations allow workers started by mount hooks to wake before
 commit. Rollback removes provisional registrations and preserves valid earlier
-wakes. Successful edits also retire modal scopes whose owner or modal widget is
+wakes. Successful edits also retire modals whose owner or modal widget is
 detached or replaced.
 
 ## Invariants
@@ -133,9 +215,9 @@ detached or replaced.
 layout pass ends with it, so any tree mutation that reaches layout is checked.
 `Core` is crate-private, so only canopy's own tests call it directly.
 
-It checks the root, widget slots, reciprocal links, duplicate children, cycles,
-keys, focus, mouse capture, lifecycle flags, layout caches, computed view caches,
-the semantic-key index, and pending diagnostic targets.
+It checks the root, widget cells, reciprocal links, duplicate children, cycles,
+keys, focus, mouse capture, lifecycle flags, attachment generations, layout
+caches, computed view caches, and the semantic-key index.
 
 It does not run layout. Run layout before using screen coordinates.
 
@@ -156,8 +238,13 @@ passes `&mut Core` to the callback. Event, mount, unmount, poll, command, and
 test helper callbacks use this mode. Nested access to the same widget fails
 instead of aliasing the widget.
 
+`ViewContextExt::with_widget` is the typed read path. It borrows in place and
+does not invalidate. `ContextExt::with_widget_mut` takes the widget cell for a
+mutation callback and invalidates layout. Both check the node's widget type at
+runtime and fail with `NodeTypeMismatch` for another type.
+
 All widget access failures include the operation, node ID, node path, and source
-error. Slot take and restore are safe code through `WidgetSlotGuard`. The only
+error. Cell take and restore are safe code through `WidgetCellGuard`. The only
 `unsafe` in the runtime is the reentrant script bridge.
 
 ## Callback Mutation
@@ -171,19 +258,86 @@ replacing the current node fails. Removing or replacing an ancestor that contain
 the current node also fails. Canopy checks this before running lifecycle hooks,
 so a rejected edit does not partially run `pre_remove` or `on_unmount`.
 
-Removing or replacing siblings is allowed. Removing the focused node recovers
-focus immediately. Removing the mouse-capture node clears capture immediately.
-Removed `NodeId`s become invalid immediately.
+Removing or replacing siblings is allowed. Removing the mouse-capture node
+clears capture immediately. Removed `NodeId`s become invalid immediately.
+
+Focus repair after an edit inside a callback waits until the outermost callback
+returns every widget cell. A widget whose cell a callback holds cannot answer
+`accept_focus`, so an immediate repair would skip it, and often that widget is
+the one that should take focus back. When the edit takes the focused node out of
+the tree, focus clears at once and the edit records its recovery candidates.
+Once the cells return, recovery picks among them, unless the callback focused
+another node in the meantime. Focus that stays in the tree on a node that can
+no longer hold it moves only when the cells return.
 
 Use `Context::remove_after_dispatch(node)` when an active callback must remove
 itself or an ancestor. The bounded FIFO records widget incarnations and drains
-after successful outer dispatch, once active widget slots are restored. Admission
+after successful outer dispatch, once active widget cells are restored. Admission
 fails when the batch reaches capacity. A failed nested dispatch discards requests
 added since its checkpoint. A failed outer dispatch discards its remaining batch.
 
 Missing or replaced targets are harmless. A lifecycle veto stops the drain and
-discards its tail. Earlier successful removals remain committed. Cleanup hooks
-cannot enqueue another removal. Direct removal retains the restrictions above.
+discards its tail. Earlier successful removals remain committed. Direct removal
+retains the restrictions above.
+
+## Posting
+
+A widget tells its host about an event with `Context::post(call)`. The call
+joins the same FIFO batch. It runs when the outermost dispatch completes, after
+every callback that led to it has returned. The host can then read, change, or
+remove the widget that posted. The stock widgets post every host call. These
+are a button's action, an input's change, submit, and cancel, a picker's
+accept and cancel, a list's activation, and a terminal's exit.
+
+`Context::dispatch` stays synchronous. A command that needs a result, or that
+must see its effect at once, dispatches. A notification posts.
+
+`remove_after_dispatch` and `close_modal` remain the tools for a callback that
+ends its own subtree. A posted command borrows its target while it runs. It can
+remove the child that notified it, but not itself or an ancestor. A
+removal or replacement that meets a running widget fails with an error that
+names both remedies.
+
+Admission resolves the target as `dispatch` would, from the call's explicit
+target or from the posting node. It checks the arguments, and validates node
+arguments, so a bad call fails from `post`. It does not read the command's
+status, because the owner can still be borrowed. The request records the
+target, its widget incarnation, the posting node, the event in scope, and the
+kind of handler that was running.
+
+Delivery dispatches the call to exactly the recorded node, inside its own
+checkpoint. It replaces the event scope with exactly the recorded event, or
+with none, and restores the scope on every exit. It revalidates node arguments
+and reads the command's status. A target that is gone or replaced drops the
+call without error. A node argument has no such protection, so a removed one
+fails delivery.
+
+A failed delivery stops the drain and discards the tail, as a lifecycle veto
+does. It undoes neither widget state nor outside effects. Every outermost
+boundary that routes input, and each mount in the render sweep, reports a
+notice-class drain failure as a notice. The notice names the posting node and
+the kind of handler that posted: a binding, a widget handler, or a poll. A
+direct command call, `Canopy::with_context`, and a script call return the
+failure. One drain runs at most 1,024 posted calls, so a command that posts
+itself fails instead of looping.
+
+Delivery is synchronous completion draining, not a later event-loop turn. A
+Luau command call at the top of a script drains before it returns. A Luau
+function bound to a key runs inside the key's boundary, so its later
+statements run before the posted calls.
+
+The drain pops a request before a posted call's dispatch opens its checkpoint,
+so the batch's length checkpoints stay valid. A nested boundary neither drains
+nor clears the queue, and the drain restores its state on every exit. Every
+`pre_remove` and `on_unmount` runs sealed, on every removal path, so a cleanup
+hook can neither post nor queue work.
+
+Callbacks that run outside any dispatch boundary would leave posted calls
+waiting for an unrelated later drain. `Canopy::replace_root` therefore runs in
+a boundary, and the render sweep mounts each node in its own boundary. The
+sweep skips a node that a delivered call removed. Draining whenever the
+outermost callback returns would run host commands inside tree edits, so the
+drain points stay at boundaries.
 
 ## Layout
 
@@ -217,12 +371,20 @@ times in one pass.
 Canvas calculation is also infallible. It returns the scrollable content extent,
 which is at least the content size. Layout clamps scroll after every pass.
 
-Scrolling and revealing are separate. `Context::scroll_to()`, `scroll_by()`,
-and `scroll_to_of()` move a view at once. `Context::reveal_area()`,
+Scrolling and revealing are separate. `Context::scroll()` and `scroll_node()`
+apply a `ScrollOp` and move a view at once. A `ScrollOp` scrolls to an offset,
+by an offset, or by a count of lines or pages. A page is the view extent less
+one line, so consecutive pages keep one line of overlap. `Context::reveal_area()`,
 `reveal_anchor()`, and `reveal_node()` queue requests that run after layout
 settles the geometry they show, so a widget can change content and reveal it in
 the same turn. `reveal_anchor()` asks `Widget::reveal_anchor()` for a rectangle
 using the final content size. The editor reveals its cursor this way.
+
+Neither operation can express the other: a scroll moves now, and a reveal waits
+for layout. A scrollbar owner scrolls a node other than itself, so
+`scroll_node()` takes a node. The three reveals take different targets: a
+rectangle of the node's canvas, an anchor the widget computes after layout, and
+a node in its ancestor views.
 
 Each node holds one local request, an area or an anchor, and one request to
 reveal the node in its ancestor views. A later call replaces its slot. Every
@@ -252,7 +414,7 @@ scrolls. Those axes measure children without a bound, and the other axis stays
 bounded. Content that must grow uses measured or fixed sizing on a scrolling
 axis; flex children share only the space that remains.
 
-Hidden nodes and `Display::None` nodes do not participate in visible layout.
+Hidden nodes do not participate in visible layout.
 Layout clears their subtree caches.
 
 Layout errors must surface. Re-entrant widget access and missing nodes must not
@@ -282,6 +444,10 @@ only when the target reaches the border: every node from the target up to the
 frame's child ends at its parent's content edge on that side. A sidebar beside
 the target therefore removes the vertical track.
 
+A thumb covers whole cells. Both of its ends round to the nearest cell, and a
+thumb is at least one cell long. A drag inverts the same rounding, so the thumb
+stays under the pointer and its last position reaches the final offset.
+
 `Columns` also owns scrollbars. It places panes in a row with a one-cell gap
 after each pane and one trailing column, and draws a divider in each of those
 cells. Each divider displays the vertical target in the pane on its left: the
@@ -293,10 +459,12 @@ horizontal tracks; horizontal overflow scrolls through wheel input.
 Layout-only grouping uses `Container`, which supplies a row, column, stack, or
 any other layout and has no other behavior. A parent sets each child's sizing
 through layout overrides such as `LayoutOverride::flex_vertical()` and
-`LayoutOverride::fixed_height()`.
+`LayoutOverride::fixed_height()`. `Context::set_layout_override` is the one layout
+setter. It replaces the node's whole override, and
+`LayoutOverride::from(layout)` pins every field of a complete layout.
 
 Painting and input resolve the same tracks. Wheel input on a track scrolls the
-target with `Context::scroll_to_of` only when the step can move. A press starts
+target with `Context::scroll_node` only when the step can move. A press starts
 a drag that stores the target, the track, and the pointer's offset within the
 thumb. Each later event and render resolves the track again. A drag continues
 while the same target and track exist, against the target's current range. It
@@ -307,11 +475,19 @@ releases capture.
 
 ## Rendering
 
-Rendering consumes current layout and view state. Canopy renders visible nodes in
-tree order into an offscreen buffer and applies the cursor overlay. Published
-snapshots and backend output use separate buffers. Observation can refresh the
-published snapshot without changing the backend diff baseline. The baseline
-advances only after output and backend flush succeed. Any backend failure
+The frame pipeline has five words. To prepare is to build a frame: mount pending
+nodes, run layout, render, and publish. To render is widget painting only:
+Canopy renders visible nodes in tree order into an offscreen buffer, then
+paints the cursors that nodes declared. To publish is to make a `FrameSnapshot` current; the
+snapshot owns its buffer through an `Arc<TermBuf>`. To emit is to write a
+buffer to a backend, in full (`TermBuf::emit`) or as a diff against the last
+emitted buffer (`TermBuf::emit_diff`). To flush is only to push backend bytes.
+
+Publishing and emitting keep separate baselines, and share buffers rather than
+copying them. Observation can refresh the published snapshot without changing
+the backend diff baseline. The baseline
+advances only after output and backend flush succeed. Each emitted frame flushes
+the backend once. Any backend failure
 invalidates it, so the next attempt repaints in full. A failed write may have
 already changed the terminal, making a repeated diff unsafe.
 
@@ -336,22 +512,65 @@ with full render output.
 If a pre-render hook marks layout dirty, Canopy runs layout again before
 rendering. Rendering must not rely on stale views.
 
+### Soft cursors
+
+Canopy draws its own cursors. The terminal cursor stays hidden for the whole
+session, so snapshots, screen dumps, and headless runs see every cursor, and
+style effects apply to cursor cells like any other cells.
+
+A widget declares a cursor while it renders, with `Render::cursor(location,
+CursorRequest)`. The request names a role, such as `cursor/vi/insert`, and can
+replace the color, shape, or motion of the role. Canopy clips the declaration
+to the node's visible view. A node holds at most one cursor.
+
+After the tree renders, Canopy resolves each role to a `CursorLook` and paints
+it. The primary cursor is the declaration of the deepest node on the focus
+path. It takes the motion of its look. Every other cursor is a steady
+secondary cursor. `FrameSnapshot::cursors` records every painted cursor, the
+primary cursor first. After each emission, the backend moves the hidden
+terminal cursor to the primary cursor, where input methods and screen
+magnifiers look for it.
+
+### Motion at emission
+
+A paint can change over time: `Paint::Animated` holds an `Animation`, and a
+`GradientSpec` can drift. Motion belongs to emission. Rendering writes the
+rest color of every moving paint, and the published buffer stays at rest, so
+snapshots, screen text, and tests do not depend on time.
+
+The `TermBuf` keeps a motion record for each moving grapheme. Every write to a
+cell clears the record of the grapheme it overwrites, so a later layer, such as
+a modal or a cursor, owns its cells. `emit_frame` writes the current colors of
+the moving cells over a copy of the published buffer, then diffs that against
+the last emitted buffer. The composed buffer becomes the new baseline. A motion
+record applies one style to its whole grapheme, so wide graphemes stay
+canonical.
+
+Motion is emitted only when an adapter sets it live. The terminal adapter does;
+headless evaluation and the test harness keep every cell at rest unless a test
+calls `Canopy::set_motion_live`. `MotionSettings` can turn motion off, limit
+continuous samples per second, and set the idle pause: after a time without
+input, repeating motion holds at rest and sets no deadline. Repeating motion
+also rests while the terminal lacks focus. A paint with `Pause::Never` ignores
+both pauses.
+
 ## Runtime Turns
 
-`Canopy::turn(Work)` drives input, background wakes, evaluation start or cancellation,
-and explicit preparation. `TurnOutcome` reports the published `FrameId`, evaluation
-admission, unticketed completion, and exit status. Ticket-backed evaluations complete
+`Canopy::turn(TurnInput)` drives input, background wakes, evaluation start or cancellation,
+and explicit preparation. `TurnOutcome` reports the published `FrameId`, whether
+moving cells changed without a new frame, evaluation admission, unticketed
+completion, and exit status. Ticket-backed evaluations complete
 through their `EvalTicket`. Crossterm, headless evaluation, and the test harness use
 this driver.
 
-`Work::Input` carries the input events that arrived together. The turn dispatches
+`TurnInput::Events` carries the input events that arrived together. The turn dispatches
 them in order and prepares one frame, so a burst of input costs one render. Layout
 settles before each mouse event that follows another event, so hit testing sees
 current geometry. The terminal adapter drains waiting input into a bounded batch
 and collapses consecutive pointer moves, and drags with the same button, to the
 latest position.
 
-Dispatch completion restores widget slots and applies queued removals before layout.
+Dispatch completion restores widget cells and applies queued removals before layout.
 The driver services bounded native automation work, due polls, node wakes, and
 ready VM segments. It then prepares layout, paints, and publishes changed state.
 Evaluation tickets complete after preparation. Publication wakes parked predicates
@@ -365,46 +584,152 @@ The MCP transport owns only factory handles and results; bounded blocking worker
 own headless applications. Live evaluation stays on the UI thread, and dropping
 a ticket wakes that driver to cancel its work.
 
-`ChangeSet` tracks layout, paint, cursor, and observation invalidation. Mutable
-widget access and accepted runtime mutations record the required work. Failed
-mutations retain invalidation for state they changed. Read-only automation does
-not request a redraw. `Canopy::render` remains an explicit preparation and emission
-path for isolated rendering tests. `Canopy::flush` prepares pending changes for
-native callers that need snapshots or geometry before the next turn.
+The runtime records pending frame work as one invalidation level. The levels are
+ordered: layout includes paint, paint includes the snapshot, and semantics
+republishes the snapshot only. A mutation raises the level to what it needs and
+never lowers it. Settling layout between batched events runs only when layout is
+pending. Frame preparation runs when any level is pending, and it lays out and
+paints the whole tree. Failed mutations retain invalidation for state they
+changed. Read-only automation does not request a redraw. `Canopy::render`
+prepares a frame and emits it to a given backend; headless MCP evaluation and
+rendering tests use it. Scripts prepare pending changes with `canopy.prepare()`
+when they need snapshots or geometry before the next turn.
+
+Every mutable widget callback invalidates layout before it runs, so any
+mutable callback repaints the whole frame. There is no per-node damage
+tracking. Widgets can therefore read other nodes while they render, and still
+repaint when a callback changes what they read. canopy-fileselect relies on
+this: its footer reads the file selector during render, and its listings read
+another node's focus. Any narrower invalidation must keep this guarantee.
 
 Poll deadlines belong to the driver. There is no eager scheduler thread per
-application. Adapters wait on terminal input, runtime notifications, and
-`Canopy::next_deadline()` with fair ready-source selection. Tests can install
-`testing::ManualClock` before initialization, advance it, then deliver `Work::Wake`.
+application. The next change of a moving cell is also a driver deadline: the
+next stop edge of a held animation, or the next sample of a continuous one. A
+turn at that deadline reports motion only when an emitted color would change,
+and the adapter then emits with no layout or render. The terminal adapter, headless evaluation, and the test
+harness share one work selector. It waits on adapter input, runtime
+notifications, and the next driver deadline, and it takes ready sources in
+rotating order, so a source that stays ready cannot starve the others. Tests can
+install `testing::ManualClock` before initialization, advance it, then deliver
+`TurnInput::Wake`. `Harness::wait_until` runs real turns through the same selector
+until a condition holds, which is the native counterpart of Luau
+`canopy.wait_for`.
 
 ## Event Routing
 
 Input arrives as typed events. `Core` owns one flat `InputMap` with complete
 records for application and framework bindings. Each record contains its
-normalized input, owner, scope, path matcher, description, source, target, and
+normalized input, tier, path matcher, description, source, target, phase, and
 insertion order. Application targets call Luau functions or dispatch stored
 commands. Framework targets dispatch commands.
 
-The resolver checks the framework binding group admitted by the top modal scope
-first. Without one, it checks the global scope, active modes from newest to
-oldest, and then the default scope. A transient mode ends that search, so a key
-it does not bind resolves to nothing. Path specificity and insertion order select
-a winner within one scope. The binding phase chooses dispatch before widget
-input or after the widget ignores it. The default phase is `after_widget`, and
-the path filter has no effect on the phase. Key and mouse bindings take either
-phase. The phase belongs to the winner at one route node, so an early binding
-on an ancestor still runs after every descendant declines.
+A `BindingTier` is a binding's resolution layer, and its variant order is the
+resolution order: `Framework(group)`, `Global`, `Mode(name)`, then `Default`.
+The resolver checks the framework group that the top modal admits first.
+A framework modal also admits every global binding, so a key such as help
+works everywhere. Without a modal, the resolver checks the global tier, active modes from newest to oldest, and
+then the default tier. A transient mode ends that search, so a key it does not
+bind resolves to nothing. Path specificity and insertion order select a winner
+within one tier. `Setup::bind` installs a binding in any tier: a framework
+tier is registered idempotently and takes a command or an intent, and an
+application tier replaces any binding with the same tier, input, and path.
+Scripts install only the three application tiers.
 
-Routing and `available_bindings` call the same resolver at each node in the
+The binding phase chooses dispatch before widget input or after the widget
+ignores it. The default phase is `after_widget`, and the path filter has no
+effect on the phase. Key and mouse bindings take either phase. The phase
+belongs to the winner at one route node, so an early binding on an ancestor
+still runs after every descendant declines.
+
+An application can also bind a key to a named intent instead of a
+command or callback. Each widget type registers the intents it implements in
+the catalog with `Setup::register_intent`, from its `Register` impl. The catalog validates binding names and
+renders the application's Luau API; a name promises a bindable operation, not a
+consumer in every state. At each node the resolver ranks candidates, and an
+intent candidate is eligible only when that node's widget accepts the intent in
+its current state. A dormant intent falls through to the next candidate at the
+same node, so it never shadows a usable binding.
+
+A command candidate follows the same rule: it is eligible only when its
+command has a target that shows. Command lookup skips a hidden node and
+everything under it, because a widget the user cannot see offers nothing to
+act on. A binding to a hidden widget's command is therefore dormant: its key
+falls through, and help does not list it until the widget shows. An
+application binds a widget's commands where they make sense and hides the
+widget when it has nothing to show, and help follows without further work. An
+exact target names its node outright, so it reaches a hidden node. An eligible intent runs before
+the node's raw key handler, so its stored phase is always `before_widget`, and
+an explicit `after_widget` on one is an error. A release mismatch from a
+widget that breaks its acceptance promise is treated as a decline, recorded in
+the route trace, and never aborts the application. In a transient mode the
+mode pops before its intent runs, and an intent without a consumer dismisses
+the mode the way an unbound key does. A framework modal can admit application
+bindings to named intents: `ModalBindings::Framework { groups, intents }` admits
+the global tier and the listed intents after its framework groups, and only while a widget inside
+the modal accepts them.
+
+A widget that runs inside modals ships a framework group from its `Register`
+impl: `Confirm::BINDINGS`, `Picker::BINDINGS`, and `List::BINDINGS` (installed
+with `List::register_bindings`). A host admits its own group plus the groups
+of the widgets inside the modal, so it never re-declares their keys. An inline
+widget, such as Button or Root, keeps a default-binding script at the
+application tier instead. `Confirm::open` asks a question in a modal that
+admits `Confirm::BINDINGS`, and `Picker::set_commands` names what the picker's
+Enter and Esc run.
+
+Core registers the navigation intents (`input::NavIntent`) in every catalog.
+A node accepts one when its widget does, or when its view can move that way:
+the runtime then applies the scroll itself, as it does for the wheel, so
+widgets need no scroll or page commands of their own.
+
+Every widget predicts its keys. `Widget::key_outcome` returns the
+`EventOutcome` that `on_event` would return for the same key and pre-event
+state, and its default, `Ignore`, suits a widget that handles no keys. Routing
+reads the prediction before each key reaches a widget and compares it with the
+actual result. A mismatch records a `RouteTraceKind::Widget` entry and fails a
+debug assertion, so tests catch a widget that forgot to predict. A widget that
+cannot be read, because it is running the callback that asks, predicts `Ignore`
+during analysis.
+
+Routing and `available_bindings` call the same selection at each node in the
 focus-to-root route. Availability returns an owned snapshot with one effective
 winner per normalized key in `bindings`, and one per normalized mouse input in
-`mouse_bindings`. Both carry the same description, owner, scope, route, phase,
-command availability, and source. The mouse route starts at the requested node,
-as a click on it would; the pointer's position plays no part, and hit testing
-and capture still choose the real target. Discovery also cannot know whether a
-widget will consume an input before an after-widget binding sees it. Diagnostic
+`mouse_bindings`. An action row needs an accepting widget, while an ordinary
+target claims the key when the route reaches it. Every row carries the same
+description, tier, route, target kind, phase, command availability, and source.
+The snapshot also names the framework group the top modal admits.
+
+The mouse route starts at the requested node, as a click on it would. The
+pointer's position plays no part, and hit testing and capture still choose the
+real target. Key discovery asks each widget's `key_outcome` along the route:
+`Handle` hides the after-widget bindings at that node and above, and `Ignore`
+continues. An intent without an accepting consumer does not appear. Diagnostic
 binding output uses the same registry and reports why records are active,
-shadowed, blocked by the top modal's framework group, or unmatched.
+dormant, shadowed, blocked by the top modal's framework group, or unmatched.
+
+`Canopy::explain_key` walks the same route without acting and returns an owned
+`KeyRouteExplanation`. Each examined step records its node, path, widget
+prediction, and the binding selected there as one `StepBinding` of id, target
+kind, and phase. The outcome is a `RouteOutcome`: `Binding` or `Transient` with
+a `RouteWinner`, `Widget`, `TransientDismiss`, or `Unhandled`. A `RouteWinner`
+names the binding, its node and path, its target kind, and its phase. The
+explanation is exact for the current state, but it is advisory. Routing still
+resolves and dispatches one node at a time, because an ignored widget can change
+the tree, focus, or bindings before the route reaches an ancestor.
+`available_bindings` projects its key results from the same analysis, so
+discovery and explanation cannot disagree.
+
+`Canopy::route_trace` records what routing actually did. Each entry has a
+`RouteTraceKind`: `Start`, `BeforeWidgetBinding`, `OfferIntent`, `Widget`,
+`AfterWidgetBinding`, `RunBinding`, `DefaultAction`, `Bubble`, `Handled`,
+`Unhandled`, or `Notice`. An intent offer traces as `OfferIntent`, and a
+`Notice` entry ends a route whose binding or widget handler failed with a
+notice. Labels are snake_case, such as `before_widget_binding`.
+
+`Canopy::send_key_checked` analyzes the route, rejects a mismatched expectation
+before delivery, then guards each normal route step and stops before an
+unexpected consumer acts. It never selects a target from the stored analysis,
+and it is not a transaction: earlier widgets may already have observed the key.
 
 One label names an input everywhere. `Mouse` writes the spec `parse_spec`
 reads back, such as `Ctrl+LeftDown`, and it carries no space, so help can
@@ -418,54 +743,70 @@ the widget receives the event, then a matching binding runs, then the runtime
 applies the input's default action. The first of these that acts ends the
 route; otherwise the route continues to the parent. An ancestor binding runs
 only after every descendant declines. The route stops at the modal owner and
-never applies a default action outside the modal region.
+never applies a default action outside the modal region. Paste and focus-change
+events take the same route from the focus to the modal owner, offered to
+widgets only.
 
 Wheel input is the only input with a default action. It scrolls the node by
 the step that `event::mouse::Action::scroll_delta()` returns. The runtime
 computes the clamped destination first. A step that cannot move declines, so
 the wheel reaches the nearest ancestor that can move, and the node's pending
 reveal survives. The route trace records each applied action as
-`RoutePhase::DefaultAction`. Widgets that give the wheel another meaning, such
+`RouteTraceKind::DefaultAction`. Widgets that give the wheel another meaning, such
 as a terminal that reports mouse input to its program, handle the event
-themselves. Command scopes expose the originating event and target.
+themselves. A command that runs while an event is handled can take that event
+as an injected `Event` or `MouseEvent` parameter.
 
-A declarative binding whose command is not available consumes its input without
-running it. The route stops there rather than offering the input to an ancestor,
-so a control the user saw as unavailable cannot be acted on in its place, and an
-ordinary click on it cannot end the run loop with an error. Availability is read
-inside the event scope at dispatch, not taken from the last rendered frame, and
-the route trace records the reason. An invoked command's own failure propagates
-unchanged, as does an opaque script callback's.
+A declarative binding whose command reports itself disabled consumes its input
+without running it. The route stops there rather than offering the input to an
+ancestor, so a control the user saw as unavailable cannot be acted on in its
+place. Help lists such a binding with the reason the command gives.
+Availability is read inside the event scope at dispatch, not taken from the last
+rendered frame, and the route trace records the reason. An invoked command's own
+failure, or an opaque script callback's, becomes a notice that consumes the
+input; see [Notices](#notices).
 
 Widget activation is a command like any other. `Button::press` runs the action a
 button was built with, and `button.default_bindings()` binds unmodified
-`LeftDown`, `Enter`, and `Space` to it under `**/button/**/`, so a click on the
-label or the border resolves to the button containing it. The records are
+`LeftDown`, `Enter`, and `Space` to it under `**/button/**/`, so a click
+anywhere on a button resolves to it. The records are
 ordinary application bindings that a configuration can replace or unbind.
-`root.default_bindings()` installs them. A modal that admits only a framework
-group must bind activation in that group itself.
+`root.default_bindings()` installs them. A modal that admits only framework
+groups admits none of them, so a widget used there ships activation in its own
+group, as Confirm does.
+
+A modal normally opens inside its owner. A modal in the overlay layer, a
+child of the root that `ContextExt::add_modal` adds hidden, may instead open
+over any owner the current top modal admits, even an owner that is itself
+modal, such as a question over a picker. Its route ends at the modal rather
+than climbing to the root, closing the owner's scope closes it, and removing
+the owner retires it, as for a nested modal.
 
 Root captures a help snapshot before it opens a modal with `ModalOptions` and
-`ModalBindings::Framework(HELP_BINDINGS)`. The scope dims the main pane, and the
-help overlay draws only its panel, so the dimmed application stays visible
-around it. The scope admits only Root-owned help controls until the modal
+`ModalBindings::Framework` for `HELP_BINDINGS`. The modal dims the main pane, and
+the help overlay draws only its panel, so the dimmed application stays visible
+around it. The modal admits only Root-owned help controls until the modal
 closes. Root then calls `close_modal` with the returned
-`InteractionToken` and restores the original focus when that node remains live.
-Removing or replacing a subtree retires modal scopes whose owner or modal widget
+`ModalToken` and restores the original focus when that node remains live.
+Removing or replacing a subtree retires modals whose owner or modal widget
 no longer belongs to the tree.
 
 Key routing gives a transient mode the next key before any widget sees it. It
 pops the mode, then runs the binding that the key resolved to, if there is one.
-`Canopy::register_mode_hook` registers a function that runs against the root
+`Setup::register_mode_hook` registers a function that runs against the root
 context before a frame whenever the mode stack has changed. Root uses one to
 list the keys of a transient mode in a panel that overlays the main pane. The
 help modal covers that panel, and hides it while help is open.
+`Setup::register_notice_hook` does the same for the shown notice. Root uses
+one to show the newest notice as one row at the bottom of the main pane.
 
 ## Focus and Mouse Capture
 
 Focus is `Option<NodeId>`. A valid focus node exists, is attached to the root,
-is not hidden, and accepts focus. After removal, recovery prefers the next
-focusable node, then the previous node, then a focusable ancestor.
+is not hidden, and accepts focus. Removal, replacement, and detachment record
+the same recovery candidates when they take the focused node out of the tree.
+Recovery prefers the next focusable node after the subtree, then the previous
+node, then a focusable ancestor, then the first focusable node.
 
 Structural changes check focus without views, because a node added or shown
 since the last layout has none. A widget can focus such a node, for example in
@@ -488,7 +829,7 @@ Script-owned IDs, function handles, and binding handles are runtime capabilities
 They remain valid only while the app, node, script host, and registry entry remain
 alive.
 
-MCP and live automation cross the event-loop boundary. Work submitted from another
+MCP and live automation cross the event-loop boundary. TurnInput submitted from another
 thread must marshal back to the UI thread before touching `Canopy` or `Core`.
 `AutomationHandle::submit_eval` queues an `EvalRequest` and returns an `EvalTicket`.
 Await its completion outside the UI thread. The queue applies bounded backpressure.
@@ -496,13 +837,50 @@ Await its completion outside the UI thread. The queue applies bounded backpressu
 Only one top-level evaluation may be active. Another evaluation or module reload
 receives `ScriptBusy`. Input and bounded native automation continue during parked
 evaluations. A detached invocation holds no application, widget, or VM borrow
-between polls. Each resumed segment restores its original script anchor.
+between polls. Each resumed segment restores its original script origin.
 
 ## Failure and Panic Policy
 
 Public Canopy APIs report expected failures with `Result` or `Option`: invalid
 node IDs, invalid tree edits, re-entrant widget access, script errors, command
-errors, layout failures, render failures, and runloop misuse.
+errors, layout failures, render failures, and runloop misuse. Application code
+returns its own failures, such as I/O errors, unwrapped as `Error::App`, whose
+script kind is `app`.
+
+### Notices
+
+A failure is either a notice or fatal, and `Error::is_notice` is the one rule
+that decides:
+
+- A command's failure (`Error::Command`), an application error
+  (`Error::App`), and an error a script raises are notices.
+- A widget operation failure takes the class of its source.
+- Timeouts, cancellation, and runtime invariant, backend, render, and layout
+  failures are fatal.
+
+The runtime applies the rule where input and background work fail: a binding's
+command or callback, a widget's event or intent handler, and a widget's poll.
+It records a notice and keeps running. The failed input counts as consumed, and
+the route trace ends with a `Notice` entry. A failed poll keeps polling at the
+delay its last successful poll requested. A fatal failure still returns from
+`Canopy::turn`, which ends the terminal run loop. A script call is not input,
+so it raises every failure as a script error; a key that a script sends is
+input, so a failure it causes is a notice.
+
+`Canopy::notices` and Luau `canopy.notices()` return the newest 32 notices,
+oldest first. A `Notice` holds the message, the failure's `ScriptErrorKind`, a
+`NoticeSource` (`Binding`, `Widget`, or `Poll`), and the node when known. The
+newest notice is shown from its record until the next key, paste, or mouse
+action other than a bare move. `ViewContext::notice` returns it while it is
+shown, and a notice hook runs whenever that changes, before the frame after a
+record, and before the dismissing input routes. Root's hook shows the notice as
+one row at the bottom of the main pane, styled `root/notice`, and hides the row
+otherwise, so the row takes no clicks while it is empty.
+
+A failed command changes no structure. Its completion boundary drops the
+removals and modal closes it queued, while changes to widget state stand. A
+command that closes a dialog and then does fallible work therefore does the
+work first, so a failure leaves the dialog open and consistent.
 
 Panics are for tests and impossible internal bugs. A panic in public library code
 needs a clear invariant and a test around the surrounding behavior.

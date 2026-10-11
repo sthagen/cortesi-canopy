@@ -1,10 +1,6 @@
 //! Command dispatch and call-into-Luau helpers.
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    result::Result as StdResult,
-    time::Duration,
-};
+use std::{result::Result as StdResult, time::Duration};
 
 use ruau::{
     session::RootHandle,
@@ -12,50 +8,13 @@ use ruau::{
 };
 
 use super::{
-    ArgValue, Canopy, CommandArgs, CommandInvocation, CommandSpec, NodeId, Result,
-    StoredFunctionTarget, arg_value_to_scoped, commands, error, retained_runtime_error_to_canopy,
+    ArgValue, Canopy, CommandArgs, CommandSpec, NodeId, Result, StoredFunctionTarget,
+    arg_value_to_scoped, commands, error, retained_runtime_error_to_canopy,
     runtime_error_to_canopy, scoped_to_arg_value, script_error_to_canopy, with_current_canopy,
 };
 
-/// Determine whether a map matches a command's named parameters.
-fn map_matches_named(spec: &CommandSpec, map: &BTreeMap<String, ArgValue>) -> bool {
-    if map.is_empty() {
-        return false;
-    }
-    let allowed = spec
-        .params
-        .iter()
-        .filter(|param| param.kind == commands::CommandParamKind::User)
-        .map(|param| commands::normalize_key(param.name))
-        .collect::<HashSet<_>>();
-    let mut matched = false;
-    for key in map.keys() {
-        let normalized = commands::normalize_key(key);
-        if allowed.contains(&normalized) {
-            matched = true;
-        } else {
-            return false;
-        }
-    }
-    matched
-}
-
-/// Build command arguments from converted script values.
-///
-/// A single map argument whose keys name the command's parameters binds by
-/// name; every other shape binds positionally.
-fn build_args_from_values(spec: &CommandSpec, mut values: Vec<ArgValue>) -> CommandArgs {
-    if values.len() != 1 {
-        return CommandArgs::Positional(values);
-    }
-    let arg = values.pop().expect("single argument checked above");
-    match arg {
-        ArgValue::Map(map) if map_matches_named(spec, &map) => CommandArgs::Named(map),
-        arg => CommandArgs::Positional(vec![arg]),
-    }
-}
-
-/// Dispatch a command using the active script context.
+/// Dispatch a command positionally from `node_id` using the active script
+/// context.
 pub(super) fn dispatch_command(
     scope: &Scope<'_>,
     spec: &'static CommandSpec,
@@ -63,52 +22,26 @@ pub(super) fn dispatch_command(
     values: Vec<ArgValue>,
 ) -> Result<ArgValue> {
     with_current_canopy(scope, |canopy, _| {
-        let invocation = CommandInvocation {
-            id: spec.id,
-            args: build_args_from_values(spec, values),
-        };
-        commands::dispatch_target(
-            &mut canopy.core,
-            commands::CommandTarget::From(node_id),
-            &invocation,
-        )
-        .map_err(error::Error::from)
+        let call = spec.call_with(CommandArgs::Positional(values));
+        commands::dispatch(&mut canopy.core, node_id, &call).map_err(error::Error::from)
     })
 }
 
-/// Dispatch a command by id using the current focus-relative context.
-pub(super) fn dispatch_command_by_name(
-    scope: &Scope<'_>,
-    name: &str,
-    node_id: Option<NodeId>,
-    values: Vec<ArgValue>,
-) -> Result<ArgValue> {
-    let (anchor, spec) = with_current_canopy(scope, |canopy, anchor| {
-        let spec = canopy.core.commands.get(name).ok_or_else(|| {
-            error::Error::from(commands::CommandError::UnknownCommand {
-                id: name.to_string(),
-            })
-        })?;
-        Ok((anchor, spec))
-    })?;
-    dispatch_command(scope, spec, node_id.unwrap_or(anchor), values)
-}
-
-/// Dispatch explicit arguments without the legacy single-map inference.
+/// Dispatch explicit arguments to an explicit target.
 pub(super) fn dispatch_explicit(
     scope: &Scope<'_>,
     name: &str,
     target: commands::CommandTarget,
     args: CommandArgs,
 ) -> Result<ArgValue> {
-    with_current_canopy(scope, |canopy, _| {
+    with_current_canopy(scope, |canopy, origin| {
         let spec = canopy.core.commands.get(name).ok_or_else(|| {
             error::Error::from(commands::CommandError::UnknownCommand {
                 id: name.to_string(),
             })
         })?;
-        let invocation = CommandInvocation { id: spec.id, args };
-        commands::dispatch_target(&mut canopy.core, target, &invocation).map_err(error::Error::from)
+        let call = spec.call_with(args).with_target(target);
+        commands::dispatch(&mut canopy.core, origin, &call).map_err(error::Error::from)
     })
 }
 

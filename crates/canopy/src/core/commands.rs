@@ -11,14 +11,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use crate::{
-    Context, ViewContext,
-    core::{
-        Core, NodeId,
-        context::{CoreContext, CoreViewContext},
-        world::WidgetOperation,
-    },
-    error::Result as CoreResult,
-    event::{Event, mouse::MouseEvent},
+    Context, NodeId, ViewContext,
+    core::{Core, context::CoreViewContext, world::WidgetOperation},
+    error::{Result as CoreResult, ScriptErrorKind},
+    input::{Event, mouse::MouseEvent},
 };
 
 /// Canonical dynamic representation for command arguments and return values.
@@ -659,7 +655,7 @@ impl fmt::Display for CommandId {
     }
 }
 
-/// Canonical argument container for command invocation.
+/// Canonical argument container for a command call.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandArgs {
     /// Positional arguments.
@@ -678,15 +674,6 @@ impl From<()> for CommandArgs {
     fn from(_: ()) -> Self {
         Self::Positional(Vec::new())
     }
-}
-
-/// A command invocation with encoded arguments.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CommandInvocation {
-    /// Command identifier.
-    pub id: CommandId,
-    /// Invocation arguments.
-    pub args: CommandArgs,
 }
 
 /// Identifies how a command parameter is provided.
@@ -764,8 +751,6 @@ pub enum CommandRequirement {
     Event,
     /// An originating mouse event.
     Mouse,
-    /// An originating list row.
-    ListRow,
 }
 
 impl CommandRequirement {
@@ -774,7 +759,6 @@ impl CommandRequirement {
         match self {
             Self::Event => "event",
             Self::Mouse => "mouse",
-            Self::ListRow => "list_row",
         }
     }
 }
@@ -782,9 +766,9 @@ impl CommandRequirement {
 /// Current command eligibility, separate from authorization and resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandStatus {
-    /// The action can currently run.
+    /// The command can currently run.
     Enabled,
-    /// The action cannot run, with a user-facing reason.
+    /// The command cannot run, with a user-facing reason.
     Disabled(String),
 }
 
@@ -812,13 +796,61 @@ pub enum CommandTarget {
     Focus,
 }
 
-/// Stored action with an optional explicit target policy.
+/// A command id, its encoded arguments, and an optional target policy.
+///
+/// This is the one value that names a command call: dispatch, eligibility
+/// checks, bindings, and scripts all take it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CommandAction {
-    /// Command and its encoded arguments.
-    pub invocation: CommandInvocation,
-    /// Omission uses the caller's route origin.
+pub struct CommandCall {
+    /// Command identifier.
+    pub id: CommandId,
+    /// Encoded arguments.
+    pub args: CommandArgs,
+    /// Explicit target policy. `None` resolves from the call's origin: the
+    /// dispatching node for a context, or the node where a binding wins.
     pub target: Option<CommandTarget>,
+}
+
+impl CommandCall {
+    /// Bind this call to a target policy.
+    #[must_use]
+    pub fn with_target(mut self, target: CommandTarget) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Return this call with one more argument: appended last to positional
+    /// arguments, or stored under `name` among named ones.
+    ///
+    /// A widget that notifies an owner through a stored call uses this to
+    /// pass what changed, such as a row index or a field's value.
+    #[must_use]
+    pub fn with_arg(&self, name: &str, value: impl ToArgValue) -> Self {
+        let value = value.to_arg_value();
+        let args = match &self.args {
+            CommandArgs::Positional(values) => {
+                let mut out = values.clone();
+                out.push(value);
+                CommandArgs::Positional(out)
+            }
+            CommandArgs::Named(values) => {
+                let mut out = values.clone();
+                out.insert(name.to_string(), value);
+                CommandArgs::Named(out)
+            }
+        };
+        Self {
+            id: self.id,
+            args,
+            target: self.target,
+        }
+    }
+
+    /// Return the explicit target, or a search from `origin` when the call
+    /// has none.
+    pub fn target_or(&self, origin: NodeId) -> CommandTarget {
+        self.target.unwrap_or(CommandTarget::From(origin))
+    }
 }
 
 /// Static metadata for a command return type.
@@ -832,9 +864,9 @@ pub enum CommandReturnSpec {
 
 /// Erased invoke function signature.
 pub type InvokeFn = fn(
-    target: Option<&mut dyn Any>,
+    target: &mut dyn Any,
     ctx: &mut dyn Context,
-    inv: &CommandInvocation,
+    args: &CommandArgs,
 ) -> Result<ArgValue, CommandError>;
 
 /// Erased argument check signature.
@@ -843,28 +875,6 @@ pub type InvokeFn = fn(
 /// command's invoke function. It needs no target, context, or call.
 pub type CheckFn = fn(args: &CommandArgs) -> Result<(), CommandError>;
 
-/// Command dispatch routing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandDispatchKind {
-    /// Invoke with `target = None`.
-    Free,
-    /// Route to a node by owner name.
-    Node {
-        /// Owner node name.
-        owner: &'static str,
-    },
-}
-
-impl CommandDispatchKind {
-    /// Return the owner name for node-routed commands.
-    pub fn owner(&self) -> Option<&'static str> {
-        match self {
-            Self::Node { owner } => Some(owner),
-            Self::Free => None,
-        }
-    }
-}
-
 /// Static metadata for a command.
 #[derive(Clone, Copy, Debug)]
 pub struct CommandSpec {
@@ -872,8 +882,9 @@ pub struct CommandSpec {
     pub id: CommandId,
     /// Command name.
     pub name: &'static str,
-    /// Dispatch routing.
-    pub dispatch: CommandDispatchKind,
+    /// Name of the node type that owns the command. Dispatch routes the
+    /// command to a node with this name.
+    pub owner: &'static str,
     /// Parameter specs.
     pub params: &'static [CommandParamSpec],
     /// Return spec.
@@ -891,8 +902,6 @@ pub struct CommandSpec {
 /// Resolution of a command dispatch target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandResolution {
-    /// Command is free (no target).
-    Free,
     /// Command targets the specified owner without searching.
     Exact {
         /// Target node ID.
@@ -912,9 +921,9 @@ pub enum CommandResolution {
 
 /// Command availability from a given focus context.
 #[derive(Clone, Debug)]
-pub struct CommandAvailability<'a> {
+pub struct CommandAvailability {
     /// Command specification.
-    pub spec: &'a CommandSpec,
+    pub spec: &'static CommandSpec,
     /// Resolution if the command has a target, or `None` if no target exists.
     pub resolution: Option<CommandResolution>,
     /// Eligibility for a resolved command.
@@ -924,13 +933,10 @@ pub struct CommandAvailability<'a> {
 }
 
 impl CommandResolution {
-    /// Return the resolved node target, if this command dispatches to a node.
-    pub fn target(self) -> Option<NodeId> {
+    /// Return the resolved node target.
+    pub fn target(self) -> NodeId {
         match self {
-            Self::Free => None,
-            Self::Exact { target } | Self::Subtree { target } | Self::Ancestor { target } => {
-                Some(target)
-            }
+            Self::Exact { target } | Self::Subtree { target } | Self::Ancestor { target } => target,
         }
     }
 }
@@ -962,29 +968,23 @@ impl<'a> CommandResolver<'a> {
     /// Resolve a command specification to the target dispatch would use.
     pub(crate) fn resolve(&self, spec: &CommandSpec) -> Option<CommandResolution> {
         if let CommandTarget::Exact(node) = self.target {
-            return match spec.dispatch {
-                CommandDispatchKind::Node { owner }
-                    if self
-                        .core
-                        .nodes
-                        .get(node)
-                        .is_some_and(|node| node.name == owner) =>
-                {
-                    Some(CommandResolution::Exact { target: node })
-                }
-                _ => None,
-            };
+            return self
+                .core
+                .nodes
+                .get(node)
+                .is_some_and(|node| node.name == spec.owner)
+                .then_some(CommandResolution::Exact { target: node });
         }
-        if !self.core.nodes.contains_key(self.start) {
-            return None;
-        }
-        match spec.dispatch {
-            CommandDispatchKind::Free => Some(CommandResolution::Free),
-            CommandDispatchKind::Node { owner } => self.resolve_owner(owner),
-        }
+        self.resolve_owner(spec.owner)
     }
 
     /// Resolve a node-owner name with subtree targets preferred over ancestors.
+    ///
+    /// A hidden node, and everything under it, takes no commands: a widget
+    /// the user cannot see offers nothing to act on. So a command whose only
+    /// owner is hidden has no target, and a binding to it is dormant until the
+    /// owner shows. An exact target names its node outright and is resolved
+    /// by [`Self::resolve`] whether or not the node shows.
     pub(crate) fn resolve_owner(&self, owner: &str) -> Option<CommandResolution> {
         if !self.core.nodes.contains_key(self.start) {
             return None;
@@ -993,6 +993,9 @@ impl<'a> CommandResolver<'a> {
         let mut stack = vec![self.start];
         while let Some(node_id) = stack.pop() {
             let node = &self.core.nodes[node_id];
+            if node.hidden {
+                continue;
+            }
             if node.name == owner {
                 return Some(CommandResolution::Subtree { target: node_id });
             }
@@ -1004,7 +1007,7 @@ impl<'a> CommandResolver<'a> {
         let mut current = self.core.nodes[self.start].parent;
         while let Some(node_id) = current {
             let node = &self.core.nodes[node_id];
-            if node.name == owner {
+            if node.name == owner && !node.hidden {
                 return Some(CommandResolution::Ancestor { target: node_id });
             }
             current = node.parent;
@@ -1014,7 +1017,7 @@ impl<'a> CommandResolver<'a> {
     }
 
     /// Return availability for every registered command.
-    pub(crate) fn availability(&self) -> CoreResult<Vec<CommandAvailability<'a>>> {
+    pub(crate) fn availability(&self) -> CoreResult<Vec<CommandAvailability>> {
         self.core
             .commands
             .iter()
@@ -1025,8 +1028,8 @@ impl<'a> CommandResolver<'a> {
     /// Inspect one command using the same resolution and eligibility rules.
     pub(crate) fn availability_for(
         &self,
-        spec: &'a CommandSpec,
-    ) -> CoreResult<CommandAvailability<'a>> {
+        spec: &'static CommandSpec,
+    ) -> CoreResult<CommandAvailability> {
         let resolution = self.resolve(spec);
         let status = match resolution {
             Some(resolution) => Some(status_at(self.core, spec, resolution)?),
@@ -1054,7 +1057,7 @@ impl CommandSpec {
     fn equivalent(&self, other: &Self) -> bool {
         self.id == other.id
             && self.name == other.name
-            && self.dispatch == other.dispatch
+            && self.owner == other.owner
             && self.params == other.params
             && self.ret == other.ret
             && self.doc == other.doc
@@ -1068,51 +1071,16 @@ impl CommandSpec {
     }
 
     /// Build a call to this command with no arguments.
-    pub fn call(&'static self) -> CommandCall {
+    pub fn call(&self) -> CommandCall {
         self.call_with(())
     }
 
     /// Build a call to this command.
-    pub fn call_with(&'static self, args: impl Into<CommandArgs>) -> CommandCall {
+    pub fn call_with(&self, args: impl Into<CommandArgs>) -> CommandCall {
         CommandCall {
-            spec: self,
+            id: self.id,
             args: args.into(),
             target: None,
-        }
-    }
-}
-
-/// Builder for a command invocation.
-#[derive(Clone, Debug)]
-pub struct CommandCall {
-    /// Command spec for invocation.
-    spec: &'static CommandSpec,
-    /// Argument payload for invocation.
-    args: CommandArgs,
-    /// Optional explicit target policy.
-    target: Option<CommandTarget>,
-}
-
-impl CommandCall {
-    /// Bind this call to a target policy.
-    pub fn with_target(mut self, target: CommandTarget) -> Self {
-        self.target = Some(target);
-        self
-    }
-
-    /// Preserve both arguments and target when storing an action.
-    pub fn action(self) -> CommandAction {
-        CommandAction {
-            target: self.target,
-            invocation: self.invocation(),
-        }
-    }
-
-    /// Convert into an invocation.
-    pub fn invocation(self) -> CommandInvocation {
-        CommandInvocation {
-            id: self.spec.id,
-            args: self.args,
         }
     }
 }
@@ -1228,16 +1196,16 @@ pub enum CommandError {
     },
 
     /// An exact target does not own the requested node command.
-    #[error("node {node:?} does not own command {id} (expected {expected:?})")]
+    #[error("node {node:?} does not own command {id} (expected owner {expected})")]
     WrongOwner {
         /// Requested command identifier.
         id: String,
         /// Requested exact node.
         node: NodeId,
-        /// Required owner, absent for a free command.
-        expected: Option<String>,
+        /// Required owner name.
+        expected: String,
     },
-    /// Eligibility changed or the action was already disabled.
+    /// Eligibility changed or the command was already disabled.
     #[error("command {id} is disabled: {reason}")]
     Disabled {
         /// Requested command identifier.
@@ -1309,6 +1277,27 @@ pub enum CommandError {
 }
 
 impl CommandError {
+    /// Return the stable script-visible category of this failure.
+    pub(crate) fn script_kind(&self) -> ScriptErrorKind {
+        match self {
+            Self::UnknownCommand { .. } => ScriptErrorKind::UnknownCommand,
+            Self::ConflictingCommand { .. } => ScriptErrorKind::ConflictingCommand,
+            Self::InvalidCommand { .. } => ScriptErrorKind::InvalidCommand,
+            Self::NoTarget { .. } => ScriptErrorKind::NoTarget,
+            Self::InvalidNode { .. } => ScriptErrorKind::InvalidNode,
+            Self::WrongOwner { .. } => ScriptErrorKind::WrongOwner,
+            Self::Disabled { .. } => ScriptErrorKind::DisabledCommand,
+            Self::ArityMismatch { .. } => ScriptErrorKind::ArityMismatch,
+            Self::MissingNamedArg { .. } => ScriptErrorKind::MissingNamedArgument,
+            Self::UnknownNamedArg { .. } => ScriptErrorKind::UnknownNamedArgument,
+            Self::TypeMismatch { .. } => ScriptErrorKind::TypeMismatch,
+            Self::MissingInjected { .. } => ScriptErrorKind::MissingInjected,
+            Self::Conversion { .. } => ScriptErrorKind::Conversion,
+            Self::TargetTypeMismatch => ScriptErrorKind::TargetTypeMismatch,
+            Self::Exec(_) => ScriptErrorKind::CommandExecution,
+        }
+    }
+
     /// Preserve a command implementation's concrete error as the execution
     /// source.
     #[doc(hidden)]
@@ -1317,6 +1306,7 @@ impl CommandError {
     }
 
     #[doc(hidden)]
+    #[must_use]
     pub fn with_param(self, param: &str) -> Self {
         match self {
             Self::TypeMismatch { expected, got, .. } => Self::TypeMismatch {
@@ -1354,8 +1344,25 @@ impl CommandError {
     }
 }
 
-/// Trait for injectable parameters.
-pub trait Inject: Sized {
+/// Seals [`Inject`]: the command derive selects injected parameters by type
+/// name, so only Canopy's own implementations can take part.
+mod sealed {
+    use super::{Event, MouseEvent};
+
+    /// Marker implemented only for Canopy's injectable types.
+    pub trait Inject {}
+
+    impl Inject for Event {}
+    impl Inject for MouseEvent {}
+    impl<T: Inject> Inject for Option<T> {}
+}
+
+/// A command parameter that Canopy supplies from the current event instead
+/// of the caller.
+///
+/// The implementations are [`Event`], [`MouseEvent`], and an `Option` of
+/// either. The trait is sealed.
+pub trait Inject: sealed::Inject + Sized {
     /// Required event context, if this injection depends on one.
     fn requirement() -> Option<CommandRequirement> {
         None
@@ -1378,32 +1385,12 @@ where
     }
 }
 
-/// Context passed to list row injections.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListRowContext {
-    /// Owning list node id.
-    pub list: NodeId,
-    /// Row index.
-    pub index: usize,
-    /// Stable collection key for this row.
-    pub key: ArgValue,
-}
-
 impl Inject for MouseEvent {
     fn requirement() -> Option<CommandRequirement> {
         Some(CommandRequirement::Mouse)
     }
     fn inject(ctx: &dyn Context) -> Option<Self> {
         ctx.current_mouse_event()
-    }
-}
-
-impl Inject for ListRowContext {
-    fn requirement() -> Option<CommandRequirement> {
-        Some(CommandRequirement::ListRow)
-    }
-    fn inject(ctx: &dyn Context) -> Option<Self> {
-        ctx.current_list_row()
     }
 }
 
@@ -1414,17 +1401,6 @@ impl Inject for Event {
     fn inject(ctx: &dyn Context) -> Option<Self> {
         ctx.current_event().cloned()
     }
-}
-
-/// Command scope frame for injection.
-#[derive(Debug, Clone, Default)]
-pub struct CommandScopeFrame {
-    /// Event snapshot.
-    pub event: Option<Event>,
-    /// Mouse event snapshot.
-    pub mouse: Option<MouseEvent>,
-    /// List row context.
-    pub list_row: Option<ListRowContext>,
 }
 
 /// Normalize named argument keys for lookup.
@@ -1468,14 +1444,15 @@ pub fn normalize_named_args<'a>(
     Ok(normalized)
 }
 
-/// Resolve and invoke using one explicit target policy.
-pub(crate) fn dispatch_target(
+/// Resolve and invoke a call. A call without a target resolves from
+/// `origin`.
+pub(crate) fn dispatch(
     core: &mut Core,
-    target: CommandTarget,
-    inv: &CommandInvocation,
+    origin: NodeId,
+    call: &CommandCall,
 ) -> Result<ArgValue, CommandError> {
     let checkpoint = core.begin_dispatch();
-    let result = dispatch_target_inner(core, target, inv);
+    let result = dispatch_inner(core, call.target_or(origin), call);
     let completion = core.finish_dispatch(checkpoint, result.is_ok());
     match result {
         Ok(value) => {
@@ -1486,29 +1463,44 @@ pub(crate) fn dispatch_target(
     }
 }
 
+/// Resolve and check a call that runs later, as [`dispatch`] would now.
+///
+/// The command must exist, its arguments must convert, its node arguments
+/// must be live, and its target must resolve. A call without a target
+/// resolves from `origin`. The command's status is not read, because its
+/// owner can still be borrowed.
+pub(crate) fn resolve_posted(
+    core: &Core,
+    origin: NodeId,
+    call: &CommandCall,
+) -> Result<NodeId, CommandError> {
+    let spec = core
+        .commands
+        .get(call.id.0)
+        .ok_or_else(|| CommandError::UnknownCommand {
+            id: call.id.0.to_string(),
+        })?;
+    (spec.check)(&call.args)?;
+    validate_node_args(core, &call.args)?;
+    let resolver = CommandResolver::for_target(core, call.target_or(origin));
+    Ok(checked_resolution(&resolver, spec)?.target())
+}
+
 /// Invoke one command inside an established completion boundary.
-fn dispatch_target_inner(
+fn dispatch_inner(
     core: &mut Core,
     target: CommandTarget,
-    inv: &CommandInvocation,
+    call: &CommandCall,
 ) -> Result<ArgValue, CommandError> {
     let spec = core
         .commands
-        .get(inv.id.0)
+        .get(call.id.0)
         .ok_or_else(|| CommandError::UnknownCommand {
-            id: inv.id.0.to_string(),
+            id: call.id.0.to_string(),
         })?;
-    validate_node_args(core, &inv.args)?;
-    let resolver = CommandResolver::for_target(core, target);
-    let start = resolver.start;
-    let resolution = checked_resolution(&resolver, spec)?;
-    match resolution {
-        CommandResolution::Free => {
-            let mut ctx = CoreContext::new(core, start);
-            (spec.invoke)(None, &mut ctx, inv)
-        }
-        resolved => dispatch_on_node(core, resolved.target().expect("node resolution"), spec, inv),
-    }
+    validate_node_args(core, &call.args)?;
+    let resolution = checked_resolution(&CommandResolver::for_target(core, target), spec)?;
+    dispatch_on_node(core, resolution.target(), spec, &call.args)
 }
 
 /// Reject stale and wrong exact owners before invocation or inspection.
@@ -1523,29 +1515,31 @@ fn checked_resolution(
         CommandTarget::Exact(node) => CommandError::WrongOwner {
             id: spec.id.0.to_string(),
             node,
-            expected: spec.dispatch.owner().map(str::to_string),
+            expected: spec.owner.to_string(),
         },
         _ => CommandError::NoTarget {
             id: spec.id.0.to_string(),
-            owner: spec.dispatch.owner().unwrap_or_default().to_string(),
+            owner: spec.owner.to_string(),
         },
     })
 }
 
-/// Report unavailable action targets as disabled without hiding hook failures.
+/// Report an unavailable call target as disabled without hiding hook
+/// failures. A call without a target resolves from `origin`.
 pub(crate) fn command_status(
     core: &Core,
-    target: CommandTarget,
-    inv: &CommandInvocation,
+    origin: NodeId,
+    call: &CommandCall,
 ) -> CoreResult<CommandStatus> {
-    let Some(spec) = core.commands.get(inv.id.0) else {
+    let Some(spec) = core.commands.get(call.id.0) else {
         return Ok(CommandStatus::Disabled(
             CommandError::UnknownCommand {
-                id: inv.id.0.to_string(),
+                id: call.id.0.to_string(),
             }
             .to_string(),
         ));
     };
+    let target = call.target_or(origin);
     let resolution = match checked_resolution(&CommandResolver::for_target(core, target), spec) {
         Ok(resolution) => resolution,
         Err(error) => return Ok(CommandStatus::Disabled(error.to_string())),
@@ -1559,9 +1553,10 @@ fn status_at(
     spec: &CommandSpec,
     resolution: CommandResolution,
 ) -> CoreResult<CommandStatus> {
-    let (Some(status), Some(node)) = (spec.status, resolution.target()) else {
+    let Some(status) = spec.status else {
         return Ok(CommandStatus::Enabled);
     };
+    let node = resolution.target();
     core.with_widget(
         node,
         WidgetOperation::access("command status"),
@@ -1569,9 +1564,9 @@ fn status_at(
     )?
 }
 
-/// Find required injections absent in the current invocation scope.
+/// Find required injections absent from the current event.
 fn missing_requirements(core: &Core, spec: &CommandSpec) -> Vec<CommandRequirement> {
-    let scope = core.current_command_scope();
+    let event = core.current_event();
     let mut missing = Vec::new();
     for requirement in spec
         .params
@@ -1579,11 +1574,10 @@ fn missing_requirements(core: &Core, spec: &CommandSpec) -> Vec<CommandRequireme
         .filter(|p| !p.optional)
         .filter_map(|p| p.requirement.and_then(|f| f()))
     {
-        let present = scope.is_some_and(|scope| match requirement {
-            CommandRequirement::Event => scope.event.is_some(),
-            CommandRequirement::Mouse => scope.mouse.is_some(),
-            CommandRequirement::ListRow => scope.list_row.is_some(),
-        });
+        let present = match requirement {
+            CommandRequirement::Event => event.is_some(),
+            CommandRequirement::Mouse => matches!(event, Some(Event::Mouse(_))),
+        };
         if !present && !missing.contains(&requirement) {
             missing.push(requirement);
         }
@@ -1596,7 +1590,7 @@ fn dispatch_on_node(
     core: &mut Core,
     node_id: NodeId,
     spec: &CommandSpec,
-    inv: &CommandInvocation,
+    args: &CommandArgs,
 ) -> Result<ArgValue, CommandError> {
     core.with_widget_ctx(node_id, |widget, ctx| {
         if let Some(status) = spec.status
@@ -1608,13 +1602,12 @@ fn dispatch_on_node(
                 reason,
             });
         }
-        (spec.invoke)(Some(widget as &mut dyn Any), ctx, inv)
+        (spec.invoke)(widget as &mut dyn Any, ctx, args)
     })
     .map_err(CommandError::execution)?
 }
 
-/// Validate every node handle carried by an invocation before command code sees
-/// it.
+/// Validate every node handle carried by a call before command code sees it.
 fn validate_node_args(core: &Core, args: &CommandArgs) -> Result<(), CommandError> {
     match args {
         CommandArgs::Positional(values) => {
@@ -1658,7 +1651,7 @@ mod tests {
     use serde::{Serialize, ser};
 
     use super::*;
-    use crate::{Widget, core::id::testing_node_id, error::Error, state::NodeName};
+    use crate::{NodeName, Widget, core::id::testing_node_id, error::Error};
 
     struct StatusOwner;
 
@@ -1676,9 +1669,7 @@ mod tests {
     static FAILING_STATUS: CommandSpec = CommandSpec {
         id: CommandId("status_owner.action"),
         name: "action",
-        dispatch: CommandDispatchKind::Node {
-            owner: "status_owner",
-        },
+        owner: "status_owner",
         params: &[],
         ret: CommandReturnSpec::Unit,
         doc: None,
@@ -1696,37 +1687,35 @@ mod tests {
         let owner = core.create_detached(StatusOwner)?;
         let missing = core.create_detached(StatusOwner)?;
         core.remove_subtree(missing)?;
-        let invocation = CommandInvocation {
-            id: FAILING_STATUS.id,
-            args: CommandArgs::default(),
-        };
+        let call = FAILING_STATUS.call();
         let context = CoreViewContext::new(&core, core.root);
         assert!(matches!(
-            context.command_status(CommandTarget::Exact(missing), &invocation)?,
+            context.command_status(&call.clone().with_target(CommandTarget::Exact(missing)))?,
             CommandStatus::Disabled(_)
         ));
         assert!(matches!(
-            context.command_status(CommandTarget::Exact(core.root), &invocation)?,
+            context.command_status(&call.clone().with_target(CommandTarget::Exact(core.root)))?,
             CommandStatus::Disabled(_)
         ));
         assert!(
-            matches!(context.command_status(CommandTarget::Exact(owner), &invocation), Err(Error::Invalid(message)) if message == "eligibility hook failed")
+            matches!(context.command_status(&call.with_target(CommandTarget::Exact(owner))), Err(Error::Invalid(message)) if message == "eligibility hook failed")
         );
-        let unknown = CommandInvocation {
+        let unknown = CommandCall {
             id: CommandId("unknown.action"),
             args: CommandArgs::default(),
+            target: Some(CommandTarget::Exact(owner)),
         };
         assert!(matches!(
-            context.command_status(CommandTarget::Exact(owner), &unknown)?,
+            context.command_status(&unknown)?,
             CommandStatus::Disabled(_)
         ));
         Ok(())
     }
 
     fn registry_invoke(
-        _target: Option<&mut dyn Any>,
+        _target: &mut dyn Any,
         _ctx: &mut dyn Context,
-        _invocation: &CommandInvocation,
+        _args: &CommandArgs,
     ) -> Result<ArgValue, CommandError> {
         Ok(ArgValue::Null)
     }
@@ -1738,7 +1727,7 @@ mod tests {
     static REGISTRY_A: CommandSpec = CommandSpec {
         id: CommandId("registry.a"),
         name: "a",
-        dispatch: CommandDispatchKind::Free,
+        owner: "registry",
         params: &[],
         ret: CommandReturnSpec::Unit,
         doc: Some("a"),
@@ -1749,7 +1738,7 @@ mod tests {
     static REGISTRY_A_CONFLICT: CommandSpec = CommandSpec {
         id: CommandId("registry.a"),
         name: "a",
-        dispatch: CommandDispatchKind::Free,
+        owner: "registry",
         params: &[],
         ret: CommandReturnSpec::Unit,
         doc: Some("conflict"),
@@ -1760,7 +1749,7 @@ mod tests {
     static REGISTRY_B: CommandSpec = CommandSpec {
         id: CommandId("registry.b"),
         name: "b",
-        dispatch: CommandDispatchKind::Free,
+        owner: "registry",
         params: &[],
         ret: CommandReturnSpec::Unit,
         doc: None,

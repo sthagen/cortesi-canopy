@@ -2,28 +2,21 @@
 
 mod binding_list;
 mod mode;
-mod panel;
 #[cfg(test)]
 mod tests;
 
 pub use binding_list::BindingList;
 use canopy::{
-    Canopy, ChildSlot, Context, ContextExt, EventOutcome, Loader, NodeId, NodeName, Render,
-    TypedId, ViewContext, Widget, derive_commands,
+    Context, ContextExt, EventOutcome, NodeId, NodeName, Register, Setup, TypedId, ViewContext,
+    ViewContextExt, Widget, derive_commands,
     error::{Error, Result},
-    event::Event,
-    layout::{Align, Direction, Edges, Layout},
+    input::Event,
+    layout::{Edges, Layout},
+    render::Render,
 };
-pub use mode::ModeHelp;
-use panel::{ControlFooter, HelpPanel};
+pub use mode::{ModeHelp, Shown};
 
-use crate::{center::Center, frame::Frame};
-
-canopy::slot!(pub(crate) ModalSlot: Center);
-canopy::slot!(pub(crate) FrameSlot: Frame);
-canopy::slot!(pub(crate) PanelSlot: HelpPanel);
-canopy::slot!(pub(crate) BindingListSlot: BindingList);
-canopy::slot!(pub(crate) FooterSlot: ControlFooter);
+use crate::Dialog;
 
 /// Transparent overlay that owns the help modal subtree.
 ///
@@ -35,34 +28,15 @@ pub struct Help;
 impl Help {
     /// Build the complete help subtree and return its root.
     pub(crate) fn install(context: &mut dyn Context) -> Result<NodeId> {
-        let bindings = context.create_detached(BindingList::new())?;
-        let footer = context.create_detached(ControlFooter::new())?;
-
-        let panel = context.create_detached(HelpPanel::new())?;
-        context.attach_slot(panel.into(), BindingListSlot::KEY, bindings.into())?;
-        context.attach_slot(panel.into(), FooterSlot::KEY, footer.into())?;
-
-        let frame = context.create_detached(Frame::new().with_title("Keyboard shortcuts"))?;
-        context.attach_slot(frame.into(), PanelSlot::KEY, panel.into())?;
-        context.with_layout_of(frame.into(), &mut |layout| {
-            *layout = Layout::fill()
-                .max_width(72)
-                .max_height(28)
-                .padding(Edges::all(1));
-        })?;
-
-        let modal = context.create_detached(Center::new())?;
-        context.attach_slot(modal.into(), FrameSlot::KEY, frame.into())?;
-        context.with_layout_of(modal.into(), &mut |layout| {
-            *layout = Layout::fill()
-                .direction(Direction::Stack)
-                .align_horizontal(Align::Center)
-                .align_vertical(Align::Center)
-                .padding(Edges::all(1));
-        })?;
-
         let help = context.create_detached(Self)?;
-        context.attach_slot(help.into(), ModalSlot::KEY, modal.into())?;
+        // Two rows above and below keep the frame clear of the screen edges,
+        // so a tall modal never fills the window, and the list scrolls only
+        // once the content outgrows the room that leaves.
+        Dialog::new()
+            .with_title("Keyboard shortcuts")
+            .with_max_width(72)
+            .with_margin(Edges::symmetric(2, 1))
+            .add(context, help.into(), BindingList::new())?;
         Ok(help.into())
     }
 
@@ -71,26 +45,9 @@ impl Help {
         context: &dyn Context,
         help: NodeId,
     ) -> Result<TypedId<BindingList>> {
-        let panel = Self::panel_id(context, help)?;
         context
-            .get_slot_of::<BindingListSlot>(panel)?
-            .ok_or_else(|| Error::NotFound("binding_list".to_string()))
-    }
-
-    /// Return the panel node within an installed help subtree.
-    fn panel_id(context: &dyn Context, help: NodeId) -> Result<NodeId> {
-        let modal = context
-            .get_slot_of::<ModalSlot>(help)?
-            .map(NodeId::from)
-            .ok_or_else(|| Error::NotFound("modal".to_string()))?;
-        let frame = context
-            .get_slot_of::<FrameSlot>(modal)?
-            .map(NodeId::from)
-            .ok_or_else(|| Error::NotFound("frame".to_string()))?;
-        context
-            .get_slot_of::<PanelSlot>(frame)?
-            .map(NodeId::from)
-            .ok_or_else(|| Error::NotFound("help_panel".to_string()))
+            .unique_descendant::<BindingList>(help)?
+            .ok_or_else(|| Error::NotFound("help binding list".into()))
     }
 }
 
@@ -117,10 +74,10 @@ impl Widget for Help {
     }
 }
 
-impl Loader for Help {
-    fn load(canopy: &mut Canopy) -> Result<()> {
-        canopy.add_commands::<Self>()?;
-        BindingList::load(canopy)?;
+impl Register for Help {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        BindingList::register(setup)?;
         Ok(())
     }
 }

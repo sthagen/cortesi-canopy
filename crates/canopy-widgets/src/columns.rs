@@ -1,15 +1,16 @@
 //! Panes side by side, with dividers that show their scroll positions.
 
 use canopy::{
-    Context, EventOutcome, NodeId, NodeName, Render, ViewContext, ViewContextExt, Widget,
-    derive_commands,
+    Context, EventOutcome, NodeId, NodeName, ViewContext, Widget, derive_commands,
     error::Result,
-    event::Event,
     geom::Rect,
-    layout::{Direction, Edges, Layout},
+    input::Event,
+    layout::{Direction, Edges, Layout, ScrollAxis},
+    render::Render,
+    tree::FocusScope,
 };
 
-use crate::scrollbar::{Axis, Scrollbar, ScrollbarGlyphs, THIN, edge_track, pane_target};
+use crate::scrollbar::{Scrollbar, ScrollbarGlyphs, edge_track, pane_target};
 
 /// Panes side by side, each followed by a divider.
 ///
@@ -37,8 +38,8 @@ impl Columns {
     /// Construct columns with no panes.
     pub fn new() -> Self {
         Self {
-            glyphs: THIN,
-            scrollbar: Self::scrollbar(THIN),
+            glyphs: ScrollbarGlyphs::THIN,
+            scrollbar: Self::scrollbar(ScrollbarGlyphs::THIN),
         }
     }
 
@@ -46,6 +47,7 @@ impl Columns {
     ///
     /// Rebuilding the thumbs drops a drag in progress, so configure glyphs
     /// before mounting.
+    #[must_use]
     pub fn with_scrollbar_glyphs(mut self, glyphs: ScrollbarGlyphs) -> Self {
         self.glyphs = glyphs;
         self.scrollbar = Self::scrollbar(glyphs);
@@ -59,16 +61,12 @@ impl Columns {
             .with_track("columns/divider", glyphs.track_vertical)
     }
 
-    /// Return the scrollbar glyphs these columns draw with.
-    pub fn scrollbar_glyphs(&self) -> ScrollbarGlyphs {
-        self.glyphs
-    }
-
     /// Move focus to another displayed pane by a signed offset, wrapping
     /// around.
     ///
-    /// Focus moves to the pane's first focusable leaf, or to its first leaf
-    /// when none accepts focus. Columns without a displayed pane do nothing.
+    /// Focus moves to the first node in the pane that accepts focus. A pane
+    /// with none leaves focus where it is, and columns without a displayed
+    /// pane do nothing.
     /// @param delta Panes to move; negative values move left.
     #[command]
     pub fn focus_column(&mut self, c: &mut dyn Context, delta: i32) -> Result<()> {
@@ -78,25 +76,18 @@ impl Columns {
         }
         let current = panes
             .iter()
-            .position(|pane| c.is_on_focus_path_of(*pane))
+            .position(|pane| c.is_on_focus_path(*pane))
             .unwrap_or(0);
         let count = i64::try_from(panes.len()).unwrap_or(i64::MAX);
         let next = (i64::try_from(current).unwrap_or(0) + i64::from(delta)).rem_euclid(count);
         let pane = panes[usize::try_from(next).unwrap_or(0)];
-        let target = c
-            .focusable_leaves(pane)
-            .first()
-            .copied()
-            .or_else(|| c.first_leaf(pane));
-        if let Some(target) = target {
-            c.set_focus(target)?;
-        }
+        c.focus_first(FocusScope::Node(pane))?;
         Ok(())
     }
 
     /// Return the displayed panes in order.
     fn panes(ctx: &dyn ViewContext) -> Vec<NodeId> {
-        ctx.children()
+        ctx.children_of(ctx.node_id())
             .into_iter()
             .filter(|pane| ctx.view_of(*pane).is_some_and(|view| !view.is_empty()))
             .collect()
@@ -120,10 +111,10 @@ impl Columns {
             let Some(divider) = Self::divider(ctx, pane) else {
                 continue;
             };
-            let Some(target) = pane_target(ctx, owner, pane, Axis::Vertical)? else {
+            let Some(target) = pane_target(ctx, owner, pane, ScrollAxis::Vertical)? else {
                 continue;
             };
-            if let Some(track) = edge_track(ctx, &target, pane, Axis::Vertical, divider) {
+            if let Some(track) = edge_track(ctx, &target, pane, ScrollAxis::Vertical, divider) {
                 tracks.push((target.node, track));
             }
         }

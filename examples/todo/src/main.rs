@@ -1,11 +1,13 @@
 #![deny(unsafe_code)]
 //! Command-line entry point for the Todo example application.
 
-use std::{path::PathBuf, process};
+use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::{Result, bail};
 use canopy::terminal::RunOptions;
-use canopy_mcp::{AppFactory, AppMetadata, Error as McpError, LaunchMode, ResetPolicy, launch};
+use canopy_mcp::{
+    AppFactory, AppMetadata, ConfigHome, Error as McpError, LaunchMode, ResetPolicy, launch,
+};
 use clap::{Parser, Subcommand};
 use todo::{create_app, store::Store};
 
@@ -21,9 +23,14 @@ struct Args {
     #[clap(long)]
     api: bool,
 
-    /// Path to a Luau config file
-    #[clap(short, long, global = true)]
-    config: Option<PathBuf>,
+    /// Do not read the user Luau configuration.
+    #[clap(long)]
+    no_config: bool,
+
+    /// Directory holding `init.luau`, in place of `TODO_CONFIG_HOME` or
+    /// `~/.todo`.
+    #[clap(long)]
+    config_home: Option<PathBuf>,
 
     /// Serve live MCP automation over the given Unix-domain socket path.
     #[clap(long)]
@@ -43,8 +50,9 @@ enum Command {
     },
 }
 
-/// Build an application factory for a database and optional config.
-fn make_factory(path: String, config: Option<PathBuf>) -> AppFactory {
+/// Build an application factory for a database and optional configuration
+/// home.
+fn make_factory(path: String, home: Option<ConfigHome>) -> AppFactory {
     let reset = if path == ":memory:" {
         ResetPolicy::Isolated
     } else {
@@ -57,44 +65,32 @@ fn make_factory(path: String, config: Option<PathBuf>) -> AppFactory {
         },
         move || {
             let store = Store::open(&path).map_err(McpError::app)?;
-            create_app(store, config.as_deref()).map_err(McpError::app)
+            create_app(store, home.as_ref()).map_err(McpError::app)
         },
     )
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let args = Args::parse();
 
-    let code = match args.command {
-        Some(Command::Mcp { path }) => launch(
-            make_factory(path, args.config),
-            LaunchMode::HeadlessMcp,
-            RunOptions::default(),
-        )?,
-        None if args.api => launch(
-            AppFactory::new(
-                AppMetadata {
-                    app: "todo".into(),
-                    reset: ResetPolicy::Isolated,
-                },
-                || Ok(todo::api_app()?),
-            ),
-            LaunchMode::Api,
-            RunOptions::default(),
-        )?,
+    if args.api {
+        print!("{}", todo::api_app()?.script_api()?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let (path, mode) = match args.command {
+        Some(Command::Mcp { path }) => (path, LaunchMode::HeadlessMcp),
         None => {
             let Some(path) = args.path else {
                 bail!("specify a SQLite database path, --api, or the mcp subcommand");
             };
             let mode = LaunchMode::Run {
                 mcp_socket: args.mcp,
+                options: RunOptions::default(),
             };
-            launch(make_factory(path, args.config), mode, RunOptions::default())?
+            (path, mode)
         }
     };
-    if code != 0 {
-        process::exit(code);
-    }
-
-    Ok(())
+    let home = ConfigHome::resolve("todo", args.config_home, args.no_config, &mode)?;
+    let code = launch(make_factory(path, home), mode)?;
+    Ok(code)
 }

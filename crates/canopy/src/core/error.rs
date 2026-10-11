@@ -4,12 +4,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{commands::CommandError, core::id::NodeId, geom, layout::LayoutValidationError};
+use crate::{
+    NodeId, commands::CommandError, geom, input::KeyDispatchDivergence,
+    layout::LayoutValidationError,
+};
 
 /// Result type for canopy operations.
 pub type Result<T> = StdResult<T, Error>;
 
-/// Parse error marker type.
+/// A parse failure, with its source position when known.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct ParseError {
     /// Parse error message.
@@ -152,6 +155,8 @@ script_error_kinds! {
     ScriptBusy => "script_busy",
     /// Script evaluation was explicitly cancelled.
     ScriptCancelled => "script_cancelled",
+    /// Application code returned its own error.
+    App => "app",
 }
 
 impl fmt::Display for ScriptErrorKind {
@@ -166,6 +171,9 @@ pub enum Error {
     /// Evaluation explicitly cancelled by its caller.
     #[error("script evaluation cancelled")]
     ScriptCancelled,
+    /// Another runtime turn or top-level script evaluation is active.
+    #[error("script busy: {0}")]
+    ScriptBusy(String),
     /// A render target exceeds its configured width limit.
     #[error("render target width {requested} exceeds limit {limit}")]
     RenderWidthLimit {
@@ -221,18 +229,23 @@ pub enum Error {
     /// Terminal I/O failure.
     #[error("terminal I/O failed: {0}")]
     TerminalIo(#[source] io::Error),
-    #[error("runloop: {0}")]
-    /// Run loop failure.
-    RunLoop(String),
+    /// Turn driver failure: a closed channel, a failed backend, or a runtime
+    /// that could not start.
+    #[error("driver: {0}")]
+    Driver(String),
+    /// Internal failure, such as a broken core invariant.
     #[error("internal: {0}")]
-    /// Internal error.
     Internal(String),
-    /// Core invariant violation.
-    #[error("invariant violation: {0}")]
-    Invariant(String),
     /// Re-entrant widget borrow attempt.
     #[error("re-entrant widget borrow: {0:?}")]
     ReentrantWidgetBorrow(NodeId),
+    /// A removal or replacement reached a widget whose callback is running.
+    #[error(
+        "{0:?} is running a callback, so it cannot be removed or replaced now: \
+         a handler ends its own subtree with Context::remove_after_dispatch, and \
+         a widget notifies its host with Context::post"
+    )]
+    WidgetRunning(NodeId),
     /// Node-bound widget operation failure with its original source.
     #[error("{kind} {operation} for node {node:?} at {path}: {source}")]
     NodeOperation {
@@ -248,8 +261,8 @@ pub enum Error {
         #[source]
         source: Box<Self>,
     },
+    /// Invalid input or operation.
     #[error("invalid: {0}")]
-    /// Invalid input error.
     Invalid(String),
     /// Requested item was not found.
     #[error("not found: {0}")]
@@ -267,7 +280,7 @@ pub enum Error {
     MultipleMatches,
     /// Duplicate child key under the same parent.
     #[error("duplicate child key: {0}")]
-    DuplicateChildKey(String),
+    DuplicateSlot(String),
     /// Duplicate child under the same parent.
     #[error("duplicate child {child:?} under parent {parent:?}")]
     DuplicateChild {
@@ -287,9 +300,6 @@ pub enum Error {
         /// Child node involved in the cycle.
         child: NodeId,
     },
-    /// Invalid structural operation.
-    #[error("invalid operation: {0}")]
-    InvalidOperation(String),
     /// Operation attempted before a mutable widget callback returned.
     #[error("{operation} is not allowed during a widget mutation callback")]
     InvalidPhase {
@@ -305,6 +315,9 @@ pub enum Error {
     /// Command dispatch failure.
     #[error(transparent)]
     Command(#[from] CommandError),
+    /// A checked key dispatch diverged from its prospective analysis.
+    #[error("checked key dispatch diverged from the analyzed route")]
+    KeyDispatchDivergence(Box<KeyDispatchDivergence>),
 
     #[error("parse error: {0}")]
     /// Parsing failure.
@@ -336,9 +349,111 @@ pub enum Error {
     /// Node exists but is not attached to the root tree.
     #[error("node is detached: {0:?}")]
     NodeDetached(NodeId),
+    /// An application's own failure, returned unwrapped from app code.
+    ///
+    /// Commands, widget handlers, and polls return I/O and domain errors this
+    /// way. From a binding or a poll, it is a notice rather than a fatal
+    /// failure.
+    #[error(transparent)]
+    App(Box<dyn StdError + Send + Sync>),
 }
 
 impl Error {
+    /// Return the stable script-visible category of this error.
+    ///
+    /// Luau error payloads and automation reports both classify through this
+    /// one mapping.
+    pub fn script_kind(&self) -> ScriptErrorKind {
+        match self {
+            Self::ScriptCancelled => ScriptErrorKind::ScriptCancelled,
+            Self::ScriptBusy(_) => ScriptErrorKind::ScriptBusy,
+            Self::ScriptTimeout { .. } => ScriptErrorKind::Timeout,
+            Self::ScriptStructured { kind, .. } => *kind,
+            Self::Command(error) => error.script_kind(),
+            Self::NodeOperation { source, .. } => source.script_kind(),
+            Self::NodeNotFound(_) => ScriptErrorKind::NodeNotFound,
+            Self::NodeDetached(_) => ScriptErrorKind::NodeDetached,
+            Self::NodeTypeMismatch { .. } => ScriptErrorKind::TypeMismatch,
+            Self::NotFound(_) => ScriptErrorKind::NotFound,
+            Self::Invalid(_) => ScriptErrorKind::Invalid,
+            Self::InvalidPhase { .. } => ScriptErrorKind::InvalidPhase,
+            Self::App(_) => ScriptErrorKind::App,
+            Self::RenderWidthLimit { .. }
+            | Self::RenderHeightLimit { .. }
+            | Self::RenderCellCountOverflow { .. }
+            | Self::RenderCellLimit { .. }
+            | Self::RenderAllocation { .. }
+            | Self::InvalidCellCharacter { .. }
+            | Self::Geometry(_)
+            | Self::InvalidLayout(_)
+            | Self::TerminalIo(_)
+            | Self::Driver(_)
+            | Self::Internal(_)
+            | Self::ReentrantWidgetBorrow(_)
+            | Self::WidgetRunning(_)
+            | Self::MultipleMatches
+            | Self::DuplicateSlot(_)
+            | Self::DuplicateChild { .. }
+            | Self::AlreadyAttached(_)
+            | Self::WouldCreateCycle { .. }
+            | Self::TreeEditDuringRollback { .. }
+            | Self::KeyDispatchDivergence(_)
+            | Self::Parse(_) => ScriptErrorKind::Canopy,
+        }
+    }
+
+    /// Return whether this failure is a notice: an operation's own failure,
+    /// which the runtime reports while the application keeps running.
+    ///
+    /// A command's failure, an application error, and an error a script
+    /// raises are notices. A widget operation failure takes the class of its
+    /// source. Timeouts, cancellation, and runtime invariant, backend, render,
+    /// and layout failures are fatal. The runtime applies this rule to
+    /// failures from input bindings, widget handlers, and polls; a script
+    /// call raises every failure as a script error.
+    pub fn is_notice(&self) -> bool {
+        match self {
+            Self::Command(_) | Self::App(_) => true,
+            Self::ScriptStructured { kind, .. } => !matches!(
+                kind,
+                ScriptErrorKind::Timeout
+                    | ScriptErrorKind::ScriptCancelled
+                    | ScriptErrorKind::ScriptBusy
+            ),
+            Self::NodeOperation { source, .. } => source.is_notice(),
+            Self::ScriptCancelled
+            | Self::ScriptBusy(_)
+            | Self::ScriptTimeout { .. }
+            | Self::RenderWidthLimit { .. }
+            | Self::RenderHeightLimit { .. }
+            | Self::RenderCellCountOverflow { .. }
+            | Self::RenderCellLimit { .. }
+            | Self::RenderAllocation { .. }
+            | Self::InvalidCellCharacter { .. }
+            | Self::Geometry(_)
+            | Self::InvalidLayout(_)
+            | Self::TerminalIo(_)
+            | Self::Driver(_)
+            | Self::Internal(_)
+            | Self::ReentrantWidgetBorrow(_)
+            | Self::WidgetRunning(_)
+            | Self::Invalid(_)
+            | Self::NotFound(_)
+            | Self::NodeTypeMismatch { .. }
+            | Self::MultipleMatches
+            | Self::DuplicateSlot(_)
+            | Self::DuplicateChild { .. }
+            | Self::AlreadyAttached(_)
+            | Self::WouldCreateCycle { .. }
+            | Self::InvalidPhase { .. }
+            | Self::TreeEditDuringRollback { .. }
+            | Self::KeyDispatchDivergence(_)
+            | Self::Parse(_)
+            | Self::NodeNotFound(_)
+            | Self::NodeDetached(_) => false,
+        }
+    }
+
     /// Construct a structured script failure.
     pub(crate) fn script_structured(kind: ScriptErrorKind, message: impl Into<String>) -> Self {
         Self::ScriptStructured {
@@ -365,13 +480,46 @@ impl Error {
 
 impl From<mpsc::RecvError> for Error {
     fn from(e: mpsc::RecvError) -> Self {
-        Self::RunLoop(e.to_string())
+        Self::Driver(e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::id::testing_node_id;
+
+    #[test]
+    fn notices_are_an_operations_own_failures() {
+        let app = Error::App("disk full".into());
+        assert!(app.is_notice());
+        assert_eq!(app.script_kind(), ScriptErrorKind::App);
+        assert_eq!(app.to_string(), "disk full");
+        assert!(Error::Command(CommandError::execution(Error::Internal("x".into()))).is_notice());
+        assert!(Error::script("raised").is_notice());
+        assert!(
+            Error::NodeOperation {
+                kind: NodeOperationKind::Access,
+                operation: "event",
+                node: testing_node_id(),
+                path: "/root".into(),
+                source: Box::new(Error::App("handler failed".into())),
+            }
+            .is_notice(),
+            "a widget operation failure takes its source's class"
+        );
+        for fatal in [
+            Error::Internal("broken".into()),
+            Error::Invalid("bad".into()),
+            Error::Driver("closed".into()),
+            Error::ScriptCancelled,
+            Error::ScriptTimeout { timeout_ms: 1 },
+            Error::script_structured(ScriptErrorKind::Timeout, "late"),
+            Error::TerminalIo(io::Error::other("gone")),
+        ] {
+            assert!(!fatal.is_notice(), "{fatal}");
+        }
+    }
 
     #[test]
     fn parse_error_preserves_source_position() {

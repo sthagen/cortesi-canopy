@@ -1,55 +1,50 @@
 //! A modal question with a yes or no answer.
 
 use canopy::{
-    Canopy, Context, ContextExt, EventOutcome, FocusDirection, FocusScope, Loader, NodeId,
-    NodeName, Render, ViewContext, Widget,
+    Context, ContextExt, NodeId, NodeName, Register, Setup, TypedId, ViewContext, Widget,
     commands::{CommandCall, CommandStatus, CommandTarget},
     derive_commands,
     error::{Error, Result},
-    event::Event,
     geom::Size,
-    layout::{
-        Align, CanvasContext, Direction, Edges, Layout, LayoutOverride, MeasureConstraints,
-        Measurement, Sizing,
+    input::{
+        BindingAction, BindingOptions, BindingPhase, BindingTier, FrameworkBindingGroup, InputSpec,
+        ModalBindings, ModalOptions, ModalToken, key::Key, mouse::Mouse,
     },
+    layout::{Align, CanvasContext, Direction, Edges, Layout, MeasureConstraints, Measurement},
+    render::Render,
     text,
+    tree::{FocusDirection, FocusScope},
 };
 
-use crate::{Button, Container, boxed::ROUND, frame::Frame};
+use crate::{Button, ButtonLook, Container, Dialog, frame::Frame};
 
 /// Columns of blank between the body's text and each of its sides.
 const SIDE_PADDING: u32 = 1;
 /// Columns a row spends on its blank lead column and a trailing gutter.
 const ROW_PADDING: u32 = SIDE_PADDING * 2;
-/// Rows and columns left around the frame, so the view shows through.
-const FRAME_MARGIN: u32 = 1;
 /// Columns between the buttons.
 const BUTTON_GAP: u32 = 2;
-/// Columns a button spends on its border and the space inside it.
+/// Columns a button spends on the space beside its label.
 const BUTTON_PADDING: u32 = 4;
-/// Rows a button occupies, border included.
-const BUTTON_ROWS: u32 = 3;
-/// Rows the body keeps above the buttons: the message and a blank line.
-const MESSAGE_ROWS: u32 = 2;
+/// Rows a button occupies.
+const BUTTON_ROWS: u32 = ButtonLook::Solid.rows();
+/// Rows the body keeps below the message, above the buttons.
+const MESSAGE_GAP_ROWS: u32 = 1;
 
-/// Default answer bindings exposed through `confirm.default_bindings()`.
-///
-/// `y` and `n` answer whichever button holds focus, because an accelerator
-/// names an answer rather than a focus. The arrows and tabs move between the
-/// answers inside the dialog alone, so neither reaches the application behind
-/// it. A dialog inside an exclusive modal admits none of these, and its owner
-/// installs the same records in its own group.
-const DEFAULT_BINDINGS: &str = r#"
-canopy.keymap({
-    path = "**/confirm/**/",
-    { key = "y", description = "Yes", action = command.confirm.yes() },
-    { key = "n", description = "No", action = command.confirm.no() },
-    { key = "Left", description = "Previous answer", action = command.confirm.focus("Left") },
-    { key = "Right", description = "Next answer", action = command.confirm.focus("Right") },
-    { key = "Tab", description = "Next answer", action = command.confirm.focus("Next") },
-    { key = "BackTab", description = "Previous answer", action = command.confirm.focus("Prev") },
-})
-"#;
+/// What a dialog asks, and what each answer runs.
+#[derive(Clone, Debug)]
+pub struct ConfirmRequest {
+    /// Title on the dialog's frame.
+    pub title: String,
+    /// The question.
+    pub message: String,
+    /// Call the affirmative answer runs.
+    pub yes: CommandCall,
+    /// Call the negative answer, and Esc, run.
+    pub no: CommandCall,
+    /// Node dimmed while the dialog is open.
+    pub dim_target: Option<NodeId>,
+}
 
 /// One of the two answers a question takes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,9 +58,7 @@ pub enum Answer {
 
 /// Return the columns a button with `label` occupies.
 fn button_width(label: &str) -> u32 {
-    u32::try_from(text::display_width(label))
-        .unwrap_or(u32::MAX)
-        .saturating_add(BUTTON_PADDING)
+    text::width(label).saturating_add(BUTTON_PADDING)
 }
 
 /// Return the columns every button and the gap between them occupy.
@@ -103,7 +96,7 @@ fn centred_width(width: u32) -> u32 {
 /// the command each button runs, and keeps whatever agreeing to it does,
 /// including closing the dialog.
 ///
-/// Open it inside a modal scope with [`Confirm::initial_focus`] as the initial
+/// Open it inside a modal with [`Confirm::initial_focus`] as the initial
 /// focus, and the scope dims what the dialog covers and gives it the keyboard.
 pub struct Confirm {
     /// The question, once mounted.
@@ -124,6 +117,43 @@ impl Default for Confirm {
 
 #[derive_commands]
 impl Confirm {
+    /// The framework group a question admits while it is open.
+    ///
+    /// `y` and `n` answer whichever button holds focus, because an accelerator
+    /// names an answer rather than a focus, and Esc declines. Enter, Space, and
+    /// a click give the focused answer, and the arrows and tabs move between
+    /// the answers inside the dialog alone.
+    pub const BINDINGS: FrameworkBindingGroup = FrameworkBindingGroup::new("confirm");
+
+    /// Ask `request` in `confirm` as a modal owned by the calling node, and
+    /// return its token.
+    ///
+    /// The modal admits [`Confirm::BINDINGS`] alone, so the question stands
+    /// until it is answered. Closing it is part of what each answer's call
+    /// does.
+    pub fn open(
+        context: &mut dyn Context,
+        confirm: TypedId<Self>,
+        request: ConfirmRequest,
+    ) -> Result<ModalToken> {
+        let owner = context.node_id();
+        let focus = context.with_widget_mut(confirm, |dialog: &mut Self, context| {
+            dialog.ask(context, &request.title, &request.message)?;
+            dialog.set_commands(context, request.yes, request.no)?;
+            dialog.initial_focus()
+        })?;
+        context.open_modal(ModalOptions {
+            owner,
+            modal: confirm.into(),
+            initial_focus: focus,
+            dim_target: request.dim_target,
+            bindings: ModalBindings::Framework {
+                groups: &[Self::BINDINGS],
+                intents: &[],
+            },
+        })
+    }
+
     /// Build an empty dialog.
     pub fn new() -> Self {
         Self {
@@ -139,8 +169,8 @@ impl Confirm {
         let body = self.body()?;
         let title = title.to_owned();
         let message = message.to_owned();
-        context.with_widget_mut(body, |body: &mut ConfirmBody, context| {
-            body.show(context, message);
+        context.with_widget_mut(body, |body: &mut ConfirmBody, _context| {
+            body.show(&message);
             Ok(())
         })?;
         let frame = context
@@ -157,7 +187,7 @@ impl Confirm {
     /// Each command is stored on its own button, so a click, a key, and an
     /// accelerator all run the same one. The dialog decides nothing: closing it
     /// is part of what a host's answer command does.
-    pub fn set_actions(
+    pub fn set_commands(
         &mut self,
         context: &mut dyn Context,
         yes: CommandCall,
@@ -184,8 +214,8 @@ impl Confirm {
     /// Return the question, or an error before it mounts.
     ///
     /// This is the dialog's body, not its initial focus. Use
-    /// [`Confirm::initial_focus`] when opening a modal scope.
-    pub fn body(&self) -> Result<NodeId> {
+    /// [`Confirm::initial_focus`] when opening a modal.
+    fn body(&self) -> Result<NodeId> {
         self.body
             .ok_or_else(|| Error::NotFound("confirm body".to_string()))
     }
@@ -231,10 +261,7 @@ impl Confirm {
     /// Activate one answer's button.
     fn press(&self, context: &mut dyn Context, answer: Answer) -> Result<()> {
         let button = self.answer(answer)?;
-        context.dispatch(
-            CommandTarget::Exact(button),
-            &Button::call_press().invocation(),
-        )?;
+        context.dispatch_exact(button, &Button::call_press())?;
         Ok(())
     }
 
@@ -258,29 +285,90 @@ impl Confirm {
                 "the dialog has not mounted".to_string(),
             ));
         };
-        context.command_status(
-            CommandTarget::Exact(button),
-            &Button::call_press().invocation(),
-        )
+        context.command_status(&Button::call_press().with_target(CommandTarget::Exact(button)))
     }
 }
 
-impl Loader for Confirm {
-    fn load(canopy: &mut Canopy) -> Result<()> {
-        Button::load(canopy)?;
-        canopy.add_commands::<Self>()?;
-        canopy.register_default_bindings("confirm", DEFAULT_BINDINGS)
+impl Register for Confirm {
+    fn register(setup: &mut Setup) -> Result<()> {
+        Button::register(setup)?;
+        setup.add_commands::<Self>()?;
+        register_bindings(setup)
     }
+}
+
+/// Install [`Confirm::BINDINGS`].
+fn register_bindings(setup: &mut Setup) -> Result<()> {
+    let keys: [(&str, &str, CommandCall); 12] = [
+        ("y", "Yes", Confirm::call_yes()),
+        ("n", "No", Confirm::call_no()),
+        ("Esc", "No", Confirm::call_no()),
+        ("Enter", "Give the focused answer", Button::call_press()),
+        ("Space", "Give the focused answer", Button::call_press()),
+        (
+            "Left",
+            "Previous answer",
+            Confirm::call_focus(FocusDirection::Left),
+        ),
+        (
+            "Right",
+            "Next answer",
+            Confirm::call_focus(FocusDirection::Right),
+        ),
+        (
+            "Up",
+            "Previous answer",
+            Confirm::call_focus(FocusDirection::Prev),
+        ),
+        (
+            "Down",
+            "Next answer",
+            Confirm::call_focus(FocusDirection::Next),
+        ),
+        (
+            "Tab",
+            "Next answer",
+            Confirm::call_focus(FocusDirection::Next),
+        ),
+        (
+            "BackTab",
+            "Previous answer",
+            Confirm::call_focus(FocusDirection::Prev),
+        ),
+        ("LeftDown", "Give the answer clicked", Button::call_press()),
+    ];
+    for (input, description, command) in keys {
+        // Activation reaches a button, so it binds on the buttons alone and a
+        // click on the frame or the margin answers nothing.
+        let path = if command == Button::call_press() {
+            "**/confirm/**/button/**/"
+        } else {
+            "**/confirm/**/"
+        };
+        let input: InputSpec = if input == "LeftDown" {
+            InputSpec::Mouse(Mouse::parse_spec(input)?)
+        } else {
+            InputSpec::Key(Key::parse_spec(input)?)
+        };
+        setup.bind(
+            input,
+            BindingOptions {
+                show_in_help: true,
+                path: Some(path.parse()?),
+                tier: BindingTier::Framework(Confirm::BINDINGS),
+                description: description.to_string(),
+                source: None,
+                phase: Some(BindingPhase::AfterWidget),
+            },
+            BindingAction::Command(command),
+        )?;
+    }
+    Ok(())
 }
 
 impl Widget for Confirm {
     fn layout(&self) -> Layout {
-        // A stack centres the frame over what the dialog covers, and the margin
-        // keeps that visible around it.
         Layout::fill()
-            .direction(Direction::Stack)
-            .align_center()
-            .padding(Edges::all(FRAME_MARGIN))
     }
 
     fn render(&mut self, render: &mut Render, _context: &dyn ViewContext) -> Result<()> {
@@ -290,21 +378,12 @@ impl Widget for Confirm {
 
     fn on_mount(&mut self, context: &mut dyn Context) -> Result<()> {
         let root = context.node_id();
-        let frame = context.add_child_to(root, Frame::new())?;
-        // The frame fits the question rather than filling the view, so the
-        // dialog is only as large as what it asks.
-        context.set_layout_override_of(
-            frame.into(),
-            LayoutOverride {
-                width: Some(Sizing::Measure),
-                height: Some(Sizing::Measure),
-                ..LayoutOverride::new()
-            },
-        )?;
-        let body = context.add_child_to(frame, ConfirmBody::new())?;
+        // The dialog fits the question, so it is only as large as what it
+        // asks.
+        let (_, body) = Dialog::new().add(context, root, ConfirmBody::new())?;
         // One row holds both answers, centred as a group, so the gap between
         // them belongs to the dialog rather than to either button.
-        let answers = context.add_child_to(
+        let answers = context.add_child(
             body,
             Container::new(
                 Layout::fill()
@@ -321,16 +400,14 @@ impl Widget for Confirm {
         // binding does not want.
         for (answer, label, key) in [(Answer::Yes, "yes", 'y'), (Answer::No, "no", 'n')] {
             let button: NodeId = context
-                .add_child_to(
-                    answers,
-                    Button::new(label).with_glyphs(ROUND).with_accelerator(key),
-                )?
+                .add_child(answers, Button::new(label).with_accelerator(key))?
                 .into();
-            context.set_layout_of(
+            context.set_layout_override(
                 button,
                 Layout::fill()
                     .fixed_width(button_width(label))
-                    .fixed_height(BUTTON_ROWS),
+                    .fixed_height(BUTTON_ROWS)
+                    .into(),
             )?;
             match answer {
                 Answer::Yes => self.yes = Some(button),
@@ -341,15 +418,6 @@ impl Widget for Confirm {
         Ok(())
     }
 
-    fn on_event(&mut self, event: &Event, _context: &mut dyn Context) -> Result<EventOutcome> {
-        // A click on the margin, the frame, or the gap between the answers
-        // belongs to the dialog, not to what it covers and not to an answer.
-        match event {
-            Event::Mouse(_) => Ok(EventOutcome::Handle),
-            _ => Ok(EventOutcome::Ignore),
-        }
-    }
-
     fn name(&self) -> NodeName {
         NodeName::convert("confirm")
     }
@@ -357,8 +425,9 @@ impl Widget for Confirm {
 
 /// The question a dialog asks, above the row that answers it.
 struct ConfirmBody {
-    /// What the question is about.
-    message: String,
+    /// What the question is about, one entry for each line. A message has at
+    /// least one line.
+    lines: Vec<String>,
     /// Content width that shows the message and the answers unclipped.
     fitted_width: u32,
 }
@@ -367,20 +436,36 @@ impl ConfirmBody {
     /// Build an empty question.
     fn new() -> Self {
         Self {
-            message: String::new(),
+            lines: vec![String::new()],
             fitted_width: 0,
         }
     }
 
-    /// Show `message` as the question.
-    fn show(&mut self, context: &mut dyn Context, message: String) {
-        let widest = u32::try_from(text::display_width(&message)).unwrap_or(u32::MAX);
+    /// Show `message` as the question. Each line of the message takes one
+    /// row.
+    fn show(&mut self, message: &str) {
+        let mut lines = message.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let widest = lines
+            .iter()
+            .map(|line| text::width(line))
+            .max()
+            .unwrap_or(0);
         // This is the body's content box. The blank columns beside it are the
         // body's own padding, which layout adds around whatever is measured
         // here, so counting them again would spend them twice.
         self.fitted_width = widest.max(buttons_width());
-        self.message = message;
-        context.invalidate_layout();
+        self.lines = lines;
+    }
+
+    /// Rows the body keeps above the buttons: each line of the message and a
+    /// blank line.
+    fn message_rows(&self) -> u32 {
+        u32::try_from(self.lines.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(MESSAGE_GAP_ROWS)
     }
 }
 
@@ -390,7 +475,12 @@ impl Widget for ConfirmBody {
         // the padding keeps the answers below them.
         Layout::fill()
             .direction(Direction::Column)
-            .padding(Edges::new(MESSAGE_ROWS, SIDE_PADDING, 0, SIDE_PADDING))
+            .padding(Edges::new(
+                self.message_rows(),
+                SIDE_PADDING,
+                0,
+                SIDE_PADDING,
+            ))
     }
 
     fn measure(&self, c: MeasureConstraints) -> Measurement {
@@ -421,11 +511,14 @@ impl Widget for ConfirmBody {
         if area.w == 0 || area.h == 0 {
             return Ok(());
         }
-        // A message is identified by its tail, which is what a path needs, so
+        // A line is identified by its tail, which is what a path needs, so
         // one too wide loses its head.
         let budget = (area.w as usize).saturating_sub(ROW_PADDING as usize);
-        let message = text::truncate_start(&self.message, budget);
-        render.text("confirm/message", area.line(0)?, &format!(" {message}"))
+        for (row, line) in (0..area.h).zip(&self.lines) {
+            let line = text::truncate_start(line, budget);
+            render.text("message", area.line(row)?, &format!(" {line}"))?;
+        }
+        Ok(())
     }
 
     fn name(&self) -> NodeName {
@@ -436,10 +529,9 @@ impl Widget for ConfirmBody {
 #[cfg(test)]
 mod tests {
     use canopy::{
-        ModalBindings, ModalOptions,
         commands::CommandStatus,
-        event::{key, mouse},
         geom::PointI32,
+        input::{FrameworkBindingGroup, ModalBindings, ModalOptions, key, mouse},
         testing::harness::Harness,
     };
 
@@ -449,7 +541,9 @@ mod tests {
     #[derive(Default)]
     struct Host {
         /// The dialog, once mounted.
-        dialog: Option<NodeId>,
+        dialog: Option<TypedId<Confirm>>,
+        /// The open question's modal, if one is open.
+        token: Option<ModalToken>,
         /// Answers the host was given, in order.
         answered: Vec<Answer>,
         /// Whether the affirmative answer reports itself eligible.
@@ -480,15 +574,21 @@ mod tests {
             self.close(context)
         }
 
-        /// Hide the dialog the way closing a modal scope would.
-        fn close(&self, context: &mut dyn Context) -> Result<()> {
-            let dialog = self.dialog()?;
-            context.set_hidden_of(dialog, true)?;
+        /// Close the open question.
+        fn close(&mut self, context: &mut dyn Context) -> Result<()> {
+            if let Some(token) = self.token.take() {
+                context.close_modal(token)?;
+            }
             Ok(())
         }
 
-        /// Return the dialog, or an error before it mounts.
+        /// Return the dialog node, or an error before it mounts.
         fn dialog(&self) -> Result<NodeId> {
+            self.typed_dialog().map(Into::into)
+        }
+
+        /// Return the typed dialog, or an error before it mounts.
+        fn typed_dialog(&self) -> Result<TypedId<Confirm>> {
             self.dialog
                 .ok_or_else(|| Error::NotFound("dialog".to_string()))
         }
@@ -500,16 +600,10 @@ mod tests {
         }
 
         fn on_mount(&mut self, context: &mut dyn Context) -> Result<()> {
-            let owner = context.node_id();
-            let dialog = context.add_child(Confirm::new())?;
-            self.dialog = Some(dialog.into());
-            context.with_widget_mut(dialog, |confirm: &mut Confirm, context| {
-                confirm.set_actions(
-                    context,
-                    Self::call_accept().with_target(CommandTarget::Exact(owner)),
-                    Self::call_decline().with_target(CommandTarget::Exact(owner)),
-                )
-            })
+            let dialog = context.add_child(context.node_id(), Confirm::new())?;
+            context.set_hidden(dialog.into(), true)?;
+            self.dialog = Some(dialog);
+            Ok(())
         }
 
         fn name(&self) -> NodeName {
@@ -517,42 +611,53 @@ mod tests {
         }
     }
 
-    impl Loader for Host {
-        fn load(canopy: &mut Canopy) -> Result<()> {
-            Confirm::load(canopy)?;
-            canopy.add_commands::<Self>()
+    impl Register for Host {
+        fn register(setup: &mut Setup) -> Result<()> {
+            Confirm::register(setup)?;
+            setup.add_commands::<Self>()
         }
     }
 
-    /// Build a host asking `message`, with both answers installed and drawn.
-    fn dialog(message: &str, width: u32, height: u32) -> Result<Harness> {
+    /// Build a host with its dialog mounted and closed.
+    fn host(width: u32, height: u32) -> Result<Harness> {
         let mut harness = Harness::builder(Host {
             yes_enabled: true,
             ..Host::default()
         })
-        .bindings(
-            "dialog-defaults",
-            "button.default_bindings()\nconfirm.default_bindings()",
-        )
+        .register::<Host>()
         .size(width, height)
         .build()?;
         harness.render()?;
+        Ok(harness)
+    }
+
+    /// Build a host asking `message`.
+    fn dialog(message: &str, width: u32, height: u32) -> Result<Harness> {
+        let mut harness = host(width, height)?;
         ask(&mut harness, message)?;
         Ok(harness)
     }
 
-    /// Ask `message` and focus the dialog's default answer.
+    /// Ask `message`, closing any question already open.
     fn ask(harness: &mut Harness, message: &str) -> Result<()> {
-        let focus = harness.with_root_context(|host: &mut Host, context| {
-            let dialog = host.dialog()?;
-            context.set_hidden_of(dialog, false)?;
-            context.with_widget_mut(dialog, |confirm: &mut Confirm, context| {
-                confirm.ask(context, "Bookmark", message)?;
-                confirm.initial_focus()
-            })
-        })?;
-        harness.canopy.with_root_context(|context| {
-            context.set_focus(focus)?;
+        // A modal closes after the callback that closes it returns, so the old
+        // question closes in its own turn before the new one opens.
+        harness.with_root_widget_context(|host: &mut Host, context| host.close(context))?;
+        harness.render()?;
+        harness.with_root_widget_context(|host: &mut Host, context| {
+            let owner = CommandTarget::Exact(context.node_id());
+            let token = Confirm::open(
+                context,
+                host.typed_dialog()?,
+                ConfirmRequest {
+                    title: "Bookmark".into(),
+                    message: message.into(),
+                    yes: Host::call_accept().with_target(owner),
+                    no: Host::call_decline().with_target(owner),
+                    dim_target: None,
+                },
+            )?;
+            host.token = Some(token);
             Ok(())
         })?;
         harness.render()
@@ -565,7 +670,7 @@ mod tests {
 
     /// Return one answer's button node.
     fn answer_node(harness: &mut Harness, answer: Answer) -> Result<NodeId> {
-        let dialog = harness.with_root_context(|host: &mut Host, _| host.dialog())?;
+        let dialog = harness.with_root_widget_context(|host: &mut Host, _| host.dialog())?;
         harness.canopy.with_context(dialog, |context| {
             context.with_widget_mut(dialog, |confirm: &mut Confirm, _| confirm.answer(answer))
         })
@@ -585,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn the_dialog_states_its_question_and_frames_its_answers() -> Result<()> {
+    fn the_dialog_states_its_question_and_offers_its_answers() -> Result<()> {
         let harness = dialog("/tmp/alpha/notes.txt", 50, 14)?;
         let screen = harness.tbuf().lines().join("\n");
         assert!(screen.contains("Bookmark"), "the frame carries the title");
@@ -593,20 +698,12 @@ mod tests {
             screen.contains("/tmp/alpha/notes.txt"),
             "the question shows its message"
         );
-        // Each button is framed, so the button row carries its own corners
-        // besides the dialog frame's.
+        // The answers are filled rows, so only the dialog is framed.
         let corners = screen.matches('\u{256d}').count();
-        assert_eq!(
-            corners, 3,
-            "the dialog and both buttons are framed, got {screen}"
-        );
+        assert_eq!(corners, 1, "only the dialog is framed, got {screen}");
         assert!(
-            screen.contains("\u{2502} yes \u{2502}"),
-            "the affirmative button keeps both borders, got {screen}"
-        );
-        assert!(
-            screen.contains("\u{2502} no \u{2502}"),
-            "the negative button keeps both borders, got {screen}"
+            screen.contains("  yes  ") && screen.contains("  no  "),
+            "each answer pads its label on its face, got {screen}"
         );
         Ok(())
     }
@@ -662,6 +759,30 @@ mod tests {
     }
 
     #[test]
+    fn a_message_of_several_lines_shows_each_line_above_the_answers() -> Result<()> {
+        let mut harness = dialog("/tmp/alpha\n- first fact\n- second fact", 50, 14)?;
+        let screen = harness.tbuf().lines();
+        let row = |needle: &str| {
+            screen
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is on screen: {screen:#?}"))
+        };
+        let (first, second, third) = (row("/tmp/alpha"), row("- first fact"), row("- second fact"));
+        assert_eq!((second, third), (first + 1, first + 2), "{screen:#?}");
+        let yes = answer_node(&mut harness, Answer::Yes)?;
+        let top = harness
+            .canopy
+            .with_root_view(|context| context.view_of(yes).expect("live node").outer.tl.y);
+        assert_eq!(
+            usize::try_from(top).expect("answer row"),
+            third + 2,
+            "one blank line separates the message from the answers: {screen:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn the_answer_keys_are_highlighted_rather_than_repeated() -> Result<()> {
         let harness = dialog("/tmp/a", 50, 14)?;
         let screen = harness.tbuf().lines().join("\n");
@@ -676,7 +797,8 @@ mod tests {
                 .canopy
                 .snapshot()
                 .expect("published dialog")
-                .cells
+                .buffer
+                .cells()
                 .iter()
                 .find(|cell| cell.ch == needle)
                 .map(|cell| (cell.style.fg, cell.style.bg))
@@ -692,6 +814,18 @@ mod tests {
             style_of('o'),
             "both keys stand out from their labels"
         );
+        // The dialog opens on `no`, whose face differs from the face of the
+        // unfocused answer.
+        assert_ne!(
+            style_of('n').1,
+            style_of('y').1,
+            "focus changes the face of the answer"
+        );
+        assert_ne!(
+            style_of('o').1,
+            style_of('e').1,
+            "the focused answer takes a face of its own"
+        );
         Ok(())
     }
 
@@ -701,14 +835,15 @@ mod tests {
         let snapshot = harness.canopy.snapshot().expect("published dialog");
         let background = |needle: char| {
             snapshot
-                .cells
+                .buffer
+                .cells()
                 .iter()
                 .find(|cell| cell.ch == needle)
                 .map(|cell| cell.style.bg)
                 .expect("the cell renders")
         };
-        // The frame's border and title sit on the same ground as the message,
-        // and so do the buttons.
+        // The frame's border and title sit on the same ground as the message.
+        // The buttons stand on it with faces of their own.
         assert_eq!(
             background('\u{256d}'),
             background('B'),
@@ -719,7 +854,18 @@ mod tests {
             background('B'),
             "every frame edge shares it"
         );
-        assert_eq!(background('y'), background('B'), "a button shares it too");
+        assert_ne!(background('y'), background('B'), "a button has its face");
+        // The padding of a button is part of its face.
+        let cells = snapshot.buffer.cells();
+        let label = cells
+            .iter()
+            .position(|cell| cell.ch == 'n')
+            .expect("the label of `no` renders");
+        assert_eq!(
+            cells[label - 1].style.bg,
+            cells[label].style.bg,
+            "the padding of a button takes its face"
+        );
         Ok(())
     }
 
@@ -828,7 +974,7 @@ mod tests {
         );
 
         // The reason stays reachable, and declining still works.
-        let dialog_node = harness.with_root_context(|host: &mut Host, _| host.dialog())?;
+        let dialog_node = harness.with_root_widget_context(|host: &mut Host, _| host.dialog())?;
         let status = harness.canopy.with_context(dialog_node, |context| {
             context.with_widget_mut(dialog_node, |confirm: &mut Confirm, context| {
                 confirm.yes_status(context)
@@ -843,7 +989,7 @@ mod tests {
     #[test]
     fn a_click_outside_the_answers_does_not_answer() -> Result<()> {
         let mut harness = dialog("/tmp/a", 40, 12)?;
-        let dialog_node = harness.with_root_context(|host: &mut Host, _| host.dialog())?;
+        let dialog_node = harness.with_root_widget_context(|host: &mut Host, _| host.dialog())?;
         let body = harness.canopy.with_context(dialog_node, |context| {
             context.with_widget_mut(dialog_node, |confirm: &mut Confirm, _| confirm.body())
         })?;
@@ -886,7 +1032,7 @@ mod tests {
         assert_eq!(focus(&harness), Some(no));
 
         // A host can open on the affirmative answer deliberately.
-        let dialog_node = harness.with_root_context(|host: &mut Host, _| host.dialog())?;
+        let dialog_node = harness.with_root_widget_context(|host: &mut Host, _| host.dialog())?;
         harness.canopy.with_context(dialog_node, |context| {
             context.with_widget_mut(dialog_node, |confirm: &mut Confirm, _| {
                 confirm.set_default_answer(Answer::Yes);
@@ -899,37 +1045,48 @@ mod tests {
     }
 
     #[test]
-    fn an_exclusive_modal_keeps_the_question_standing() -> Result<()> {
-        let mut harness = dialog("/tmp/a", 40, 12)?;
+    fn a_modal_without_the_dialog_group_keeps_the_question_standing() -> Result<()> {
+        const GROUP: FrameworkBindingGroup = FrameworkBindingGroup::new("confirm.test_dialog");
+        let mut harness = host(40, 12)?;
         let (owner, dialog_node, focus) =
-            harness.with_root_context(|host: &mut Host, context| {
+            harness.with_root_widget_context(|host: &mut Host, context| {
                 let dialog = host.dialog()?;
-                let focus = context
-                    .with_widget_mut(dialog, |confirm: &mut Confirm, _| confirm.initial_focus())?;
+                let owner = CommandTarget::Exact(context.node_id());
+                context.set_hidden(dialog, false)?;
+                let focus = context.with_widget_mut(dialog, |confirm: &mut Confirm, context| {
+                    confirm.set_commands(
+                        context,
+                        Host::call_accept().with_target(owner),
+                        Host::call_decline().with_target(owner),
+                    )?;
+                    confirm.initial_focus()
+                })?;
                 Ok((context.node_id(), dialog, focus))
             })?;
-        let group = canopy::FrameworkBindingGroup::new("confirm.test_dialog");
         harness.canopy.with_root_context(|context| {
             context.open_modal(ModalOptions {
                 owner,
                 modal: dialog_node,
                 initial_focus: focus,
                 dim_target: None,
-                bindings: ModalBindings::Framework(group),
+                bindings: ModalBindings::Framework {
+                    groups: &[GROUP],
+                    intents: &[],
+                },
             })?;
             Ok(())
         })?;
         harness.render()?;
 
-        // The group admits nothing, so no application default reaches the
-        // dialog and the question stands until its owner binds an answer.
+        // The modal admits only a group of its own, not Confirm::BINDINGS, so
+        // nothing answers and the question stands.
         harness.key('y')?;
         harness.key(key::KeyCode::Enter)?;
         let button = answer_node(&mut harness, Answer::Yes)?;
         click(&mut harness, button)?;
         assert!(
             answered(&mut harness).is_empty(),
-            "an exclusive group admits no application binding"
+            "a framework group admits no application binding"
         );
         assert!(
             harness.canopy.available_bindings(None)?.bindings.is_empty(),

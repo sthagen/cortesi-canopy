@@ -5,8 +5,8 @@ use crate::{
     core::view::View,
     geom::{Point, PointI32, Rect, RectI32, Size},
     layout::{
-        Align, CanvasChild, CanvasContext, Constraint, Direction as LayoutDirection, Display,
-        Layout, MeasureConstraints, MeasureOverflow, Measurement, Sizing,
+        Align, CanvasChild, CanvasContext, Constraint, Direction as LayoutDirection, Layout,
+        MeasureConstraints, MeasureOverflow, Measurement, Sizing,
     },
 };
 
@@ -28,7 +28,7 @@ impl Core {
         // Focus recovery reads the published views. Reveals then run against
         // the settled geometry, including the reveal of a recovered focus, and
         // the views they move are published again.
-        self.ensure_focus_valid(None)?;
+        self.ensure_focus_valid()?;
         if self.apply_reveals()? {
             LayoutPass::new(self).update_views(root, screen_view)?;
         }
@@ -138,7 +138,7 @@ impl<'a> LayoutPass<'a> {
         width_budget: Option<u32>,
     ) -> Result<Size> {
         let (layout, hidden) = self.node_layout_snapshot(node_id)?;
-        if hidden || layout.display == Display::None {
+        if hidden {
             self.clear_layout(node_id)?;
             return Ok(Size::ZERO);
         }
@@ -178,7 +178,7 @@ impl<'a> LayoutPass<'a> {
             .get_mut(node_id)
             .ok_or(Error::NodeNotFound(node_id))?;
 
-        if node.hidden || node.layout.display == Display::None {
+        if node.hidden {
             return self.clear_layout(node_id);
         }
 
@@ -680,7 +680,7 @@ impl<'a> LayoutPass<'a> {
                 .nodes
                 .get(*child)
                 .ok_or(Error::NodeNotFound(*child))?;
-            if !child_node.hidden && child_node.layout.display == Display::Block {
+            if !child_node.hidden {
                 visible.push(*child);
             }
         }
@@ -808,7 +808,16 @@ fn constraint_for_axis(
     overflow: bool,
 ) -> Constraint {
     match sizing {
-        Sizing::Flex(_) => Constraint::Exact(available_content),
+        // A flex axis takes the space available within its bounds, so a
+        // measure sees the size the node gets.
+        Sizing::Flex(_) => Constraint::Exact(
+            clamp_axis(
+                available_content.saturating_add(pad_axis),
+                min_outer,
+                max_outer,
+            )
+            .saturating_sub(pad_axis),
+        ),
         Sizing::Measure => {
             if overflow && max_outer.is_none() {
                 return Constraint::Unbounded;
@@ -953,7 +962,7 @@ fn locate_recursive(
         .get(node_id)
         .ok_or(Error::NodeNotFound(node_id))?;
 
-    if node.hidden || node.layout.display == Display::None {
+    if node.hidden {
         return Ok(None);
     }
 

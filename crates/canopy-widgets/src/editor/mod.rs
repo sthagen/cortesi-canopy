@@ -3,8 +3,11 @@
     reason = "Editor methods are split by rendering, vi, and prompt concerns."
 )]
 //! Editor widget and supporting types.
+//!
+//! Editing policy, such as vi modes, search, and selection behavior, belongs on
+//! the editor. Buffer mechanics, such as positions, ranges, and edits, belong
+//! on the shared text buffer.
 
-pub mod highlight;
 /// Layout and wrapping cache.
 mod layout;
 /// Search state and match helpers.
@@ -14,9 +17,10 @@ mod vi;
 /// Editor widget implementation.
 pub(crate) mod widget;
 
+pub use vi::{ViMode, VisualMode};
 pub use widget::Editor;
 
-pub(crate) use crate::text_buffer::display_width;
+pub use crate::text_buffer::{TextPosition, TextRange};
 
 #[cfg(test)]
 mod tests;
@@ -26,8 +30,36 @@ mod tests;
 pub enum WrapMode {
     /// No wrapping; horizontal scrolling is enabled.
     None,
-    /// Soft wrapping at the view width.
+    /// Soft wrapping at the view width. Rows break between words, and a
+    /// word wider than a row breaks between graphemes. Blanks at a break stay
+    /// at the end of the upper row. An editor that accepts focus keeps the
+    /// last column of the view for the caret.
     Soft,
+}
+
+/// How an editor takes input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Interaction {
+    /// Focusable and editable.
+    #[default]
+    Edit,
+    /// Focusable and navigable, but read-only.
+    View,
+    /// Read-only and unfocusable: text embedded for display alone, which
+    /// focus traversal skips.
+    Display,
+}
+
+impl Interaction {
+    /// Return whether edits are refused.
+    pub fn read_only(self) -> bool {
+        !matches!(self, Self::Edit)
+    }
+
+    /// Return whether the editor accepts focus.
+    pub fn focusable(self) -> bool {
+        !matches!(self, Self::Display)
+    }
 }
 
 /// Editing mode for the editor widget.
@@ -55,6 +87,18 @@ pub enum LineNumbers {
 pub struct EditorConfig {
     /// Allow multi-line content.
     pub multiline: bool,
+    /// Whether Enter adds a line to multi-line content. Without it, Enter
+    /// reaches the application's bindings, so a host can take Enter for its
+    /// own action and add lines with another key through [`Editor::insert`].
+    /// A Ctrl or Alt chord of Enter never adds a line.
+    pub enter_newline: bool,
+    /// Whether Up and Down reach the application's bindings where they
+    /// step through a history of the host instead of moving the cursor. In
+    /// text mode, Up on the top row and Down on the bottom row reach the
+    /// bindings. In vi normal mode, Up and Down always reach them, and j
+    /// and k still move the cursor. Vi insert and visual modes keep the
+    /// arrows.
+    pub history_arrows: bool,
     /// Wrapping mode.
     pub wrap: WrapMode,
     /// Auto-grow height to fit contents.
@@ -65,10 +109,8 @@ pub struct EditorConfig {
     pub max_height: Option<u32>,
     /// Edit mode behavior.
     pub mode: EditMode,
-    /// Whether the editor is read-only.
-    pub read_only: bool,
-    /// Whether the editor accepts focus.
-    pub focusable: bool,
+    /// Whether the editor edits, views, or only displays its text.
+    pub interaction: Interaction,
     /// Line number rendering mode.
     pub line_numbers: LineNumbers,
     /// Tab stop width in columns.
@@ -79,13 +121,14 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             multiline: true,
+            enter_newline: true,
+            history_arrows: false,
             wrap: WrapMode::Soft,
             auto_grow: false,
             min_height: 1,
             max_height: None,
             mode: EditMode::Text,
-            read_only: false,
-            focusable: true,
+            interaction: Interaction::Edit,
             line_numbers: LineNumbers::None,
             tab_stop: 4,
         }
@@ -99,63 +142,78 @@ impl EditorConfig {
     }
 
     /// Configure multiline behavior.
+    #[must_use]
     pub fn with_multiline(mut self, multiline: bool) -> Self {
         self.multiline = multiline;
         self
     }
 
+    /// Configure whether Enter adds a line to multi-line content.
+    #[must_use]
+    pub fn with_enter_newline(mut self, enter_newline: bool) -> Self {
+        self.enter_newline = enter_newline;
+        self
+    }
+
+    /// Configure whether Up and Down reach the application's bindings to
+    /// step through a history.
+    #[must_use]
+    pub fn with_history_arrows(mut self, history_arrows: bool) -> Self {
+        self.history_arrows = history_arrows;
+        self
+    }
+
     /// Configure wrapping mode.
+    #[must_use]
     pub fn with_wrap(mut self, wrap: WrapMode) -> Self {
         self.wrap = wrap;
         self
     }
 
     /// Configure auto-grow behavior.
+    #[must_use]
     pub fn with_auto_grow(mut self, auto_grow: bool) -> Self {
         self.auto_grow = auto_grow;
         self
     }
 
     /// Configure the minimum height.
+    #[must_use]
     pub fn with_min_height(mut self, min_height: u32) -> Self {
         self.min_height = min_height;
         self
     }
 
     /// Configure the maximum height.
+    #[must_use]
     pub fn with_max_height(mut self, max_height: Option<u32>) -> Self {
         self.max_height = max_height;
         self
     }
 
     /// Configure the edit mode.
+    #[must_use]
     pub fn with_mode(mut self, mode: EditMode) -> Self {
         self.mode = mode;
         self
     }
 
-    /// Configure read-only behavior.
-    pub fn with_read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
-        self
-    }
-
-    /// Configure whether the editor accepts focus.
-    ///
-    /// A read-only view embedded for display alone should decline focus so
-    /// that focus traversal skips over it.
-    pub fn with_focusable(mut self, focusable: bool) -> Self {
-        self.focusable = focusable;
+    /// Configure whether the editor edits, views, or only displays its text.
+    #[must_use]
+    pub fn with_interaction(mut self, interaction: Interaction) -> Self {
+        self.interaction = interaction;
         self
     }
 
     /// Configure line number rendering.
+    #[must_use]
     pub fn with_line_numbers(mut self, line_numbers: LineNumbers) -> Self {
         self.line_numbers = line_numbers;
         self
     }
 
     /// Configure the tab stop width.
+    #[must_use]
     pub fn with_tab_stop(mut self, tab_stop: usize) -> Self {
         self.tab_stop = tab_stop.max(1);
         self

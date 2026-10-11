@@ -4,7 +4,6 @@
 /// Backend implementations.
 pub mod backend;
 /// Keyed child collection helpers.
-pub mod children;
 /// Command definition and dispatch.
 pub mod commands;
 /// Cursor and position helpers.
@@ -19,6 +18,8 @@ pub mod event;
 pub mod fixture;
 /// Node data and arena structures.
 pub mod node;
+/// Recoverable failures reported while the application keeps running.
+pub mod notice;
 /// Path and traversal helpers.
 pub mod path;
 /// Rendering interfaces.
@@ -27,8 +28,6 @@ pub mod render;
 pub mod script;
 /// Immutable frame observations.
 pub mod snapshot;
-/// Shared node name types.
-pub mod state;
 /// Styling and color helpers.
 pub mod style;
 /// Testing utilities.
@@ -49,8 +48,11 @@ pub mod help;
 pub mod id;
 /// Input mapping.
 pub mod inputmap;
+pub mod keyroute;
 /// Polling utilities.
 pub mod poll;
+/// Consumer-aware binding selection.
+mod select;
 /// Terminal buffer types.
 pub mod termbuf;
 /// Text utilities.
@@ -63,27 +65,8 @@ mod widget_access;
 pub mod world;
 
 // Public exports from internal modules
-pub use canopy::{
-    AutomationCallback, AutomationHandle, Canopy, CanopyBuilder, EvalId, EvalOutcome, EvalRequest,
-    EvalTicket, FrameId, Loader, RoutePhase, RouteTraceEntry, ScriptJournalEntry, ScriptOrigin,
-    ScriptTrust, TurnOutcome, Work,
-};
-pub use change::{ChangeOutcome, ChangeSet, Invalidation};
-pub use children::{ChildBuilder, ChildConfig, KeyedChildren};
-pub use context::{
-    ChildSlot, Context, ContextExt, FocusDirection, FocusScope, RevealAlign, ViewContext,
-    ViewContextExt,
-};
-pub use fixture::{Fixture, FixtureInfo};
+pub use canopy::{Canopy, CanopyBuilder, Register, Setup};
+pub use change::ChangeOutcome;
+pub use context::{Context, ContextExt, ViewContext, ViewContextExt};
 pub use id::{NodeId, TypedId};
-pub use inputmap::{
-    BindingId, BindingOptions, BindingOwner, BindingPhase, BindingScope, FrameworkBindingGroup,
-    InputSpec,
-};
-pub use node::SemanticIdentity;
-pub use snapshot::{FrameSnapshot, NodeSnapshot, WidgetSemantics};
-pub use wake::{NodeWakeHandle, WakeOutcome, WorkLifetime};
-pub use world::{
-    Core,
-    interaction::{InteractionToken, ModalBindings, ModalOptions},
-};
+pub use world::Core;

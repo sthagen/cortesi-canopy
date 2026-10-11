@@ -12,7 +12,7 @@ new_key_type! {
     struct RawNodeId;
 }
 
-/// Opaque identifier for a node stored in the Core arena.
+/// Opaque identifier for a node in an application tree.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(RawNodeId);
 
@@ -62,11 +62,6 @@ impl<T> NodeArena<T> {
         self.0.len()
     }
 
-    /// Iterate over opaque identifiers.
-    pub fn keys(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.0.keys().map(NodeId)
-    }
-
     /// Iterate over identifiers and borrowed values.
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, &T)> + '_ {
         self.0.iter().map(|(id, value)| (NodeId(id), value))
@@ -93,7 +88,7 @@ impl<T> IndexMut<NodeId> for NodeArena<T> {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 /// Construct an opaque identifier for tests that do not own a live core.
 pub fn testing_node_id() -> NodeId {
     let mut arena = NodeArena::new();

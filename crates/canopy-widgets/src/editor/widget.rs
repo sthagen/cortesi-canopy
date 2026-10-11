@@ -1,31 +1,38 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use canopy::{
-    Context, EventOutcome, FocusDirection, NodeName, Render, RevealAlign, ScrollAxis, ScrollMark,
-    ViewContext, Widget, cursor, derive_commands,
+    Context, EventOutcome, NodeName, Register, Setup, ViewContext, Widget, derive_commands,
     error::Result,
-    event::{Event, key, mouse},
     geom::{Line, Point, Rect, Size},
-    layout::{CanvasContext, Constraint, MeasureConstraints, Measurement},
+    input::{Event, key, mouse},
+    layout::{
+        CanvasContext, Constraint, MeasureConstraints, Measurement, RevealAlign, ScrollAxis,
+        ScrollMark,
+    },
+    render::{
+        Render,
+        cursor::{self, CursorRequest},
+    },
     style::Style,
+    tree::FocusDirection,
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    EditMode, EditorConfig, LineNumbers, WrapMode, display_width,
-    highlight::{HighlightSpan, Highlighter},
-    layout::{LayoutCache, LineLayout, WrapSegment, layout_line, metrics, point_for_position},
+    EditMode, EditorConfig, LineNumbers, WrapMode,
+    layout::{
+        LayoutCache, LineLayout, Wrap, WrapSegment, layout_line, metrics, point_for_position,
+    },
     search::{PromptState, SearchDirection, SearchState},
     vi::{ViMode, ViState},
 };
 use crate::{
+    CLEAR_INTENT,
     click::ClickTracker,
-    scrollbar::THIN,
+    highlight::{HighlightSpan, Highlighter},
+    register_clear_intent, run_paint,
+    scrollbar::ScrollbarGlyphs,
     text_buffer::{Selection, TextBuffer, TextPosition, TextRange, single_line},
 };
-
-/// Maximum delay between clicks to count as multi-click selection.
-const DOUBLE_CLICK_MS: u64 = 500;
 
 /// Rows of context kept above a revealed search match, when space allows.
 const SEARCH_MATCH_TOP_CONTEXT: u32 = 3;
@@ -34,9 +41,45 @@ const SEARCH_MATCH_TOP_CONTEXT: u32 = 3;
 ///
 /// This is the shared thin track vertical, so a mark blends into the
 /// surrounding divider or border and only its color stands out.
-const SEARCH_MARK: char = THIN.track_vertical;
+const SEARCH_MARK: char = ScrollbarGlyphs::THIN.track_vertical;
+
+/// One text-entry action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextCommand {
+    /// Insert one character.
+    Insert(char),
+    /// Delete backward.
+    Backspace,
+    /// Delete forward.
+    Delete,
+    /// Move the caret.
+    Move(TextMove),
+    /// Insert a newline.
+    Newline,
+}
+
+/// A text-entry caret movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextMove {
+    /// Move left.
+    Left,
+    /// Move right.
+    Right,
+    /// Move up a display row.
+    Up,
+    /// Move down a display row.
+    Down,
+    /// Move to the line start.
+    Home,
+    /// Move to the line end.
+    End,
+}
 
 /// Editor widget implementation.
+///
+/// An editable editor consumes [`CLEAR_INTENT`]: it clears the field of an
+/// open search or replace prompt, or else the whole text, as one edit that
+/// undo reverses. A read-only editor leaves the intent to its ancestors.
 pub struct Editor {
     /// Editor configuration.
     pub(super) config: EditorConfig,
@@ -48,6 +91,9 @@ pub struct Editor {
     pub(super) cursor_view_point: Option<Point>,
     /// Preferred display column for vertical movement.
     pub(super) preferred_column: usize,
+    /// Column in the display row that consecutive row moves keep, from the
+    /// first of them until the cursor moves another way.
+    pub(super) row_goal: Option<usize>,
     /// Vi mode state when enabled.
     pub(super) vi: ViState,
     /// Yank register for vi operations.
@@ -109,10 +155,10 @@ impl<'a, 'b> RenderLineContext<'a, 'b> {
     /// Construct a new render context, resolving the fixed cell styles once.
     fn new(r: &'a mut Render<'b>, view_rect: Rect, origin: Point, gutter_width: u32) -> Self {
         let styles = CellStyles {
-            text: r.resolve_style("editor/text"),
-            selection: r.resolve_style("editor/selection"),
-            search_current: r.resolve_style("editor/search/current"),
-            search_match: r.resolve_style("editor/search/match"),
+            text: r.resolve_style("text"),
+            selection: r.resolve_style("selection"),
+            search_current: r.resolve_style("search/current"),
+            search_match: r.resolve_style("search/match"),
         };
         Self {
             r,
@@ -182,6 +228,7 @@ impl Editor {
             layout: LayoutCache::new(),
             cursor_view_point: None,
             preferred_column,
+            row_goal: None,
             vi: ViState::new(),
             yank: String::new(),
             yank_linewise: false,
@@ -219,6 +266,35 @@ impl Editor {
         self.search = SearchState::new();
     }
 
+    /// Clear what the editor edits, for [`CLEAR_INTENT`]: the field of an
+    /// open prompt, or else the whole text, as one edit that undo reverses.
+    /// Visual mode ends, and insert mode stays. Returns false when the editor
+    /// is read-only.
+    fn clear(&mut self, ctx: &mut dyn Context) -> bool {
+        if self.config.interaction.read_only() {
+            return false;
+        }
+        if self.clear_prompt() {
+            return true;
+        }
+        self.commit_text_entry_transaction();
+        if let Some(ViMode::Visual(_)) = self.vi_mode() {
+            self.exit_visual();
+        }
+        let last = self.buffer.line_count().saturating_sub(1);
+        let end = TextPosition::new(last, self.buffer.line_char_len(last));
+        if end != TextPosition::new(0, 0) {
+            self.replace_range(TextRange::new(TextPosition::new(0, 0), end), "");
+        }
+        // Insert mode groups its typing into one edit from its start.
+        if self.vi_mode() == Some(ViMode::Insert) {
+            self.begin_text_entry_transaction();
+        }
+        self.update_preferred_column();
+        self.ensure_cursor_visible(ctx);
+        true
+    }
+
     /// Install a syntax highlighter.
     ///
     /// Preparation is deferred until the next render, using the latest buffer
@@ -240,7 +316,7 @@ impl Editor {
     /// Every path that changes buffer contents goes through this accessor, so
     /// read-only is decided in one place instead of at each call site.
     pub(super) fn editable(&mut self) -> Option<&mut TextBuffer> {
-        if self.config.read_only {
+        if self.config.interaction.read_only() {
             return None;
         }
         Some(&mut self.buffer)
@@ -286,41 +362,66 @@ impl Editor {
         }
     }
 
-    /// Return `(display_line_count, max_line_width)` for a wrap width. The
-    /// layout cache serves the answer when it is current; otherwise the
-    /// buffer is scanned directly.
-    fn display_metrics(&self, wrap_width: usize) -> (usize, usize) {
-        self.layout
-            .metrics_for(
-                &self.buffer,
-                wrap_width,
-                self.config.wrap,
-                self.config.tab_stop,
-            )
+    /// Return the width that shows every line without wrapping: the widest
+    /// line's display width, with tabs expanded, plus the line-number gutter
+    /// and the caret column of a soft-wrapped editor that accepts focus.
+    ///
+    /// A host that sizes the editor to this width shows the text as one
+    /// unbroken block, such as a column centred in a wider pane.
+    pub fn natural_width(&self) -> u32 {
+        let tab_stop = self.config.tab_stop;
+        // Line widths ignore wrapping, so a scan without wrapping finds the
+        // widest line.
+        let widest = self
+            .layout
+            .widest_for(&self.buffer, tab_stop)
             .unwrap_or_else(|| {
-                metrics(
-                    &self.buffer,
-                    self.config.wrap,
-                    wrap_width,
-                    self.config.tab_stop,
-                )
-            })
+                metrics(&self.buffer, Wrap::new(WrapMode::None, 1, tab_stop, false)).1
+            });
+        u32::try_from(widest)
+            .unwrap_or(u32::MAX)
+            .saturating_add(self.gutter_width())
+            .saturating_add(self.caret_column())
+    }
+
+    /// Return the columns that a soft-wrapped row keeps after its text for
+    /// the caret: one for an editor that accepts focus, so a caret after a
+    /// word at the wrap width still shows, and none for a display.
+    fn caret_column(&self) -> u32 {
+        u32::from(self.config.wrap == WrapMode::Soft && self.config.interaction.focusable())
+    }
+
+    /// Return how the layout wraps lines for a content width. The text
+    /// fills the width less the gutter and the caret column.
+    pub(super) fn wrap(&self, width: u32) -> Wrap {
+        let caret = self.caret_column();
+        let text_width = width
+            .saturating_sub(self.gutter_width())
+            .saturating_sub(caret);
+        Wrap::new(
+            self.config.wrap,
+            text_width as usize,
+            self.config.tab_stop,
+            caret > 0,
+        )
+    }
+
+    /// Return `(display_line_count, max_line_width)` for wrap parameters.
+    /// The layout cache serves the answer when it is current; otherwise the
+    /// buffer is scanned directly.
+    fn display_metrics(&self, wrap: Wrap) -> (usize, usize) {
+        self.layout
+            .metrics_for(&self.buffer, wrap)
+            .unwrap_or_else(|| metrics(&self.buffer, wrap))
     }
 
     /// Synchronize layout and return the cursor position in content
     /// coordinates.
     pub(super) fn update_layout(&mut self, view_rect: Rect, gutter_width: u32) -> Point {
-        let wrap_width = view_rect.w.saturating_sub(gutter_width).max(1) as usize;
-        self.layout.sync(
-            &mut self.buffer,
-            wrap_width,
-            self.config.wrap,
-            self.config.tab_stop,
-        );
+        let wrap = self.wrap(view_rect.w);
+        self.layout.sync(&mut self.buffer, wrap);
         let cursor = self.buffer.cursor();
-        let point = self
-            .layout
-            .point_for_position(&self.buffer, cursor, self.config.tab_stop);
+        let point = self.layout.point_for_position(&self.buffer, cursor);
         let cursor_point = Point {
             x: point.x.saturating_add(gutter_width),
             y: point.y,
@@ -347,22 +448,15 @@ impl Editor {
     /// A current layout cache answers directly. Otherwise the position is
     /// computed without changing the cache.
     fn cursor_point(&self, width: u32) -> Point {
-        let gutter = self.gutter_width();
-        let wrap_width = width.saturating_sub(gutter).max(1) as usize;
-        let (wrap, tab_stop) = (self.config.wrap, self.config.tab_stop);
+        let wrap = self.wrap(width);
         let cursor = self.buffer.cursor();
-        let point = if self
-            .layout
-            .metrics_for(&self.buffer, wrap_width, wrap, tab_stop)
-            .is_some()
-        {
-            self.layout
-                .point_for_position(&self.buffer, cursor, tab_stop)
+        let point = if self.layout.metrics_for(&self.buffer, wrap).is_some() {
+            self.layout.point_for_position(&self.buffer, cursor)
         } else {
-            point_for_position(&self.buffer, cursor, wrap, wrap_width, tab_stop)
+            point_for_position(&self.buffer, cursor, wrap)
         };
         Point {
-            x: point.x.saturating_add(gutter),
+            x: point.x.saturating_add(self.gutter_width()),
             y: point.y,
         }
     }
@@ -372,10 +466,12 @@ impl Editor {
         self.preferred_column = self
             .buffer
             .column_for_position(self.buffer.cursor(), self.config.tab_stop);
+        self.row_goal = None;
     }
 
     /// Move vertically by logical lines, preserving preferred column.
     pub(super) fn move_vertical(&mut self, delta: isize) {
+        self.row_goal = None;
         let cursor = self.buffer.cursor();
         let line_count = self.buffer.line_count().max(1);
         let mut line = cursor.line as isize + delta;
@@ -388,34 +484,36 @@ impl Editor {
         self.buffer.set_cursor(target);
     }
 
-    /// Move vertically by display lines using the layout cache.
-    pub(super) fn move_display_line(&mut self, delta: isize, ctx: &dyn Context) {
-        let view = ctx.view();
-        let view_rect = view.view_rect();
-        let gutter_width = self.gutter_width();
-        self.update_layout(view_rect, gutter_width);
-        let point = self.layout.point_for_position(
-            &self.buffer,
-            self.buffer.cursor(),
-            self.config.tab_stop,
-        );
-        let mut y = point.y as isize + delta;
-        if y < 0 {
-            y = 0;
-        }
-        let max_y = self.layout.total_lines().saturating_sub(1) as isize;
-        if y > max_y {
-            y = max_y;
-        }
-        let new_point = Point {
-            x: point.x,
-            y: y as u32,
-        };
-        let pos = self
+    /// Move the cursor by display rows. Consecutive row moves keep the
+    /// column of the first one, also through rows too short for it.
+    pub(super) fn move_row(&mut self, delta: isize, ctx: &dyn Context) {
+        let view_rect = ctx.view().view_rect();
+        self.update_layout(view_rect, self.gutter_width());
+        let point = self
             .layout
-            .position_for_point(&self.buffer, new_point, self.config.tab_stop);
-        self.buffer.set_cursor(pos);
-        self.update_preferred_column();
+            .point_for_position(&self.buffer, self.buffer.cursor());
+        let goal = *self.row_goal.get_or_insert(point.x as usize);
+        let last = self.layout.total_lines().saturating_sub(1);
+        let row = (point.y as usize).saturating_add_signed(delta).min(last);
+        let target = self.layout.position_in_row(&self.buffer, row, goal);
+        self.buffer.set_cursor(target);
+        self.preferred_column = self
+            .buffer
+            .column_for_position(target, self.config.tab_stop);
+    }
+
+    /// Return whether a history takes a row move by `delta` for a content
+    /// `width`: with history arrows, Up on the top row and Down on the
+    /// bottom row leave the text.
+    fn history_takes_row_move(&self, delta: isize, width: u32) -> bool {
+        if !self.config.history_arrows {
+            return false;
+        }
+        let row = self.cursor_point(width).y as usize;
+        if delta < 0 {
+            return row == 0;
+        }
+        row.saturating_add(1) >= self.display_metrics(self.wrap(width)).0
     }
 
     /// Insert text at the cursor, respecting read-only state. Returns the
@@ -467,7 +565,7 @@ impl Editor {
 
     /// Delete the grapheme under the cursor and update yank register.
     pub(super) fn delete_char_forward(&mut self) -> bool {
-        if self.config.read_only {
+        if self.config.interaction.read_only() {
             return false;
         }
         let cursor = self.buffer.cursor();
@@ -493,140 +591,138 @@ impl Editor {
         self.buffer.commit_transaction();
     }
 
-    /// Return whether `event` edits text in text-entry mode.
-    fn is_text_edit(event: &Event) -> bool {
+    /// Return whether `key` edits text in text-entry mode.
+    fn is_text_edit_key(key: key::Key) -> bool {
         matches!(
-            event,
-            Event::Paste(_)
-                | Event::Key(key::Key {
-                    key: key::KeyCode::Char(_)
-                        | key::KeyCode::Backspace
-                        | key::KeyCode::Delete
-                        | key::KeyCode::Enter,
-                    ..
-                })
+            key.key,
+            key::KeyCode::Char(_)
+                | key::KeyCode::Backspace
+                | key::KeyCode::Delete
+                | key::KeyCode::Enter
         )
+    }
+
+    /// Classify one text-entry key for a content `width` without running its
+    /// edit.
+    fn text_command(&self, key: key::Key, width: u32) -> Option<TextCommand> {
+        if self.config.interaction.read_only() && Self::is_text_edit_key(key) {
+            return None;
+        }
+        Some(match key.key {
+            key::KeyCode::Char(character) if !key.mods.ctrl && !key.mods.alt => {
+                TextCommand::Insert(character)
+            }
+            key::KeyCode::Backspace => TextCommand::Backspace,
+            key::KeyCode::Delete => TextCommand::Delete,
+            key::KeyCode::Left => TextCommand::Move(TextMove::Left),
+            key::KeyCode::Right => TextCommand::Move(TextMove::Right),
+            key::KeyCode::Up if !self.history_takes_row_move(-1, width) => {
+                TextCommand::Move(TextMove::Up)
+            }
+            key::KeyCode::Down if !self.history_takes_row_move(1, width) => {
+                TextCommand::Move(TextMove::Down)
+            }
+            key::KeyCode::Home => TextCommand::Move(TextMove::Home),
+            key::KeyCode::End => TextCommand::Move(TextMove::End),
+            key::KeyCode::Enter if self.enter_adds_line(key) => TextCommand::Newline,
+            _ => return None,
+        })
+    }
+
+    /// Return whether `key` is an Enter that adds a line: a plain or shifted
+    /// Enter in a multi-line editor whose Enter adds lines. A Ctrl or Alt
+    /// chord reaches the application's bindings instead.
+    pub(super) fn enter_adds_line(&self, key: key::Key) -> bool {
+        self.config.multiline && self.config.enter_newline && !key.mods.ctrl && !key.mods.alt
     }
 
     /// Handle events in text-entry mode.
     ///
     /// A read-only editor ignores edit input, so application bindings see it.
     fn handle_text_entry_event(&mut self, event: &Event, ctx: &mut dyn Context) -> EventOutcome {
-        if self.config.read_only && Self::is_text_edit(event) {
-            return EventOutcome::Ignore;
-        }
         match event {
-            Event::Key(key::Key {
-                key: key::KeyCode::Char(c),
-                mods,
-            }) if !mods.ctrl && !mods.alt => {
-                self.begin_text_entry_transaction();
-                self.handle_insert_text(c.encode_utf8(&mut [0; 4]));
-                self.ensure_cursor_visible(ctx);
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Backspace,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                if self.handle_delete_backward() {
+            Event::Key(key) => match self.text_command(*key, ctx.view().view_rect().w) {
+                Some(TextCommand::Insert(character)) => {
+                    self.begin_text_entry_transaction();
+                    self.handle_insert_text(character.encode_utf8(&mut [0; 4]));
                     self.ensure_cursor_visible(ctx);
+                    EventOutcome::Handle
                 }
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Delete,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                if self.handle_delete_forward() {
+                Some(TextCommand::Backspace) => {
+                    self.commit_text_entry_transaction();
+                    if self.handle_delete_backward() {
+                        self.ensure_cursor_visible(ctx);
+                    }
+                    EventOutcome::Handle
+                }
+                Some(TextCommand::Delete) => {
+                    self.commit_text_entry_transaction();
+                    if self.handle_delete_forward() {
+                        self.ensure_cursor_visible(ctx);
+                    }
+                    EventOutcome::Handle
+                }
+                Some(TextCommand::Move(TextMove::Left)) => {
+                    self.commit_text_entry_transaction();
+                    let moved = self.buffer.move_left(self.config.multiline);
+                    if moved {
+                        self.update_preferred_column();
+                        self.ensure_cursor_visible(ctx);
+                    }
+                    EventOutcome::Handle
+                }
+                Some(TextCommand::Move(TextMove::Right)) => {
+                    self.commit_text_entry_transaction();
+                    let moved = self.buffer.move_right(self.config.multiline);
+                    if moved {
+                        self.update_preferred_column();
+                        self.ensure_cursor_visible(ctx);
+                    }
+                    EventOutcome::Handle
+                }
+                Some(TextCommand::Move(TextMove::Up)) => {
+                    self.commit_text_entry_transaction();
+                    self.move_row(-1, ctx);
                     self.ensure_cursor_visible(ctx);
+                    EventOutcome::Handle
                 }
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Left,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                let moved = self.buffer.move_left(self.config.multiline);
-                if moved {
+                Some(TextCommand::Move(TextMove::Down)) => {
+                    self.commit_text_entry_transaction();
+                    self.move_row(1, ctx);
+                    self.ensure_cursor_visible(ctx);
+                    EventOutcome::Handle
+                }
+                Some(TextCommand::Move(TextMove::Home)) => {
+                    self.commit_text_entry_transaction();
+                    self.buffer.move_line_start();
                     self.update_preferred_column();
                     self.ensure_cursor_visible(ctx);
+                    EventOutcome::Handle
                 }
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Right,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                let moved = self.buffer.move_right(self.config.multiline);
-                if moved {
+                Some(TextCommand::Move(TextMove::End)) => {
+                    self.commit_text_entry_transaction();
+                    self.buffer.move_line_end();
                     self.update_preferred_column();
                     self.ensure_cursor_visible(ctx);
+                    EventOutcome::Handle
                 }
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Up,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                self.move_vertical(-1);
-                self.ensure_cursor_visible(ctx);
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Down,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                self.move_vertical(1);
-                self.ensure_cursor_visible(ctx);
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Home,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                self.buffer.move_line_start();
-                self.update_preferred_column();
-                self.ensure_cursor_visible(ctx);
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::End,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                self.buffer.move_line_end();
-                self.update_preferred_column();
-                self.ensure_cursor_visible(ctx);
-                EventOutcome::Handle
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Enter,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                if self.config.multiline {
+                Some(TextCommand::Newline) => {
+                    self.commit_text_entry_transaction();
                     self.handle_insert_text("\n");
                     self.ensure_cursor_visible(ctx);
                     EventOutcome::Handle
-                } else {
+                }
+                None => {
+                    // Every other key commits the active transaction before it
+                    // bubbles, including Esc. A read-only edit key returns
+                    // before the commit.
+                    if !(self.config.interaction.read_only() && Self::is_text_edit_key(*key)) {
+                        self.commit_text_entry_transaction();
+                    }
                     EventOutcome::Ignore
                 }
-            }
-            Event::Key(key::Key {
-                key: key::KeyCode::Esc,
-                ..
-            }) => {
-                self.commit_text_entry_transaction();
-                EventOutcome::Ignore
-            }
+            },
+            Event::Paste(_) if self.config.interaction.read_only() => EventOutcome::Ignore,
             Event::Paste(content) => {
                 self.begin_text_entry_transaction();
                 self.handle_insert_text(content);
@@ -654,9 +750,9 @@ impl Editor {
         let content_point = view.viewport_to_content(event.location)?.clamped_point();
         let mut text_point = content_point;
         text_point.x = text_point.x.saturating_sub(gutter_width);
-        let pos = self
-            .layout
-            .position_for_point(&self.buffer, text_point, self.config.tab_stop);
+        let pos =
+            self.layout
+                .position_in_row(&self.buffer, text_point.y as usize, text_point.x as usize);
 
         Ok(match event.action {
             mouse::Action::Down if event.button == mouse::Button::Left => {
@@ -712,7 +808,7 @@ impl Editor {
     ) -> Result<()> {
         let line_y = ctx.origin.y.saturating_add(y);
         let line_rect = Rect::new(ctx.origin.x, line_y, ctx.view_rect.w, 1);
-        ctx.r.fill("editor/text", line_rect, ' ')?;
+        ctx.r.fill("text", line_rect, ' ')?;
 
         if ctx.gutter_width > 0 {
             let gutter_line = Line::new(ctx.origin.x, line_y, ctx.gutter_width);
@@ -722,11 +818,15 @@ impl Editor {
                 self.buffer.cursor().line,
                 ctx.gutter_width,
             );
-            let style = if line_idx == self.buffer.cursor().line {
-                "editor/line-number/current"
-            } else {
-                "editor/line-number"
-            };
+            // The cursor marks the line the user would edit. An editor that
+            // declines focus is a display with no cursor to place, so its
+            // gutter marks no current line.
+            let style =
+                if self.config.interaction.focusable() && line_idx == self.buffer.cursor().line {
+                    "line-number/current"
+                } else {
+                    "line-number"
+                };
             ctx.r.text(style, gutter_line, &number_text)?;
         }
 
@@ -771,87 +871,54 @@ impl Editor {
             TextPosition::new(line_idx, segment.end_char),
         ));
 
-        let mut col = segment.start_col;
-        let mut char_index = segment.start_char;
-        for grapheme in segment_text.graphemes(true) {
-            let grapheme_chars = grapheme.chars().count();
-            let width = display_width(grapheme, col, self.config.tab_stop);
+        let text_style = ctx.styles.text.clone();
+        let selection_style = ctx.styles.selection.clone();
+        let search_current_style = ctx.styles.search_current.clone();
+        let search_match_style = ctx.styles.search_match.clone();
 
-            let g_start = char_index;
-            let g_end = char_index.saturating_add(grapheme_chars);
-
-            let draw_col = col
-                .saturating_sub(segment.start_col)
-                .saturating_add(ctx.gutter_width as usize);
-            let view_start = ctx.view_rect.tl.x as usize;
-            let view_end = view_start.saturating_add(ctx.view_rect.w as usize);
-            if draw_col.saturating_add(width) <= view_start {
-                col = col.saturating_add(width);
-                char_index = g_end;
-                continue;
-            }
-            if draw_col >= view_end {
-                break;
-            }
-
-            let mut style = &ctx.styles.text;
-
-            if selection_on_line && g_start < line_end_sel && g_end > line_start_sel {
-                style = &ctx.styles.selection;
-            } else if current_search_range
-                .is_some_and(|(start, end)| g_start < end && g_end > start)
-            {
-                style = &ctx.styles.search_current;
-            } else if search_ranges
-                .iter()
-                .any(|range| g_start < range.end.column && g_end > range.start.column)
-            {
-                style = &ctx.styles.search_match;
-            } else {
-                while let Some(span) = highlight_spans.get(span_idx) {
-                    if span.range.end <= g_start {
-                        span_idx = span_idx.saturating_add(1);
-                        span_style = None;
-                        continue;
+        run_paint::paint_run(
+            ctx.r,
+            &segment_text,
+            run_paint::column(segment.start_col),
+            ctx.gutter_width,
+            segment.start_char,
+            self.config.tab_stop,
+            ctx.view_rect.tl.x,
+            ctx.view_rect.w,
+            ctx.origin.x,
+            line_y,
+            line_rect,
+            |render, g_start, g_end| {
+                if selection_on_line && g_start < line_end_sel && g_end > line_start_sel {
+                    selection_style.clone()
+                } else if current_search_range
+                    .is_some_and(|(start, end)| g_start < end && g_end > start)
+                {
+                    search_current_style.clone()
+                } else if search_ranges
+                    .iter()
+                    .any(|range| g_start < range.end.column && g_end > range.start.column)
+                {
+                    search_match_style.clone()
+                } else {
+                    let mut chosen = text_style.clone();
+                    while let Some(span) = highlight_spans.get(span_idx) {
+                        if span.range.end <= g_start {
+                            span_idx = span_idx.saturating_add(1);
+                            span_style = None;
+                            continue;
+                        }
+                        if span.range.start < g_end && span.range.end > g_start {
+                            let resolved = span_style
+                                .get_or_insert_with(|| span.paint_style(render, &text_style));
+                            chosen = resolved.clone();
+                        }
+                        break;
                     }
-                    if span.range.start < g_end && span.range.end > g_start {
-                        let resolved = span_style.get_or_insert_with(|| {
-                            let mut merged = span.style.clone();
-                            merged.bg = ctx.styles.text.bg.clone();
-                            ctx.r.apply_effects(merged)
-                        });
-                        style = resolved;
-                    }
-                    break;
+                    chosen
                 }
-            }
-
-            if grapheme == "\t" {
-                let start = draw_col;
-                let end = draw_col.saturating_add(width);
-                for offset in start..end {
-                    let x = offset.saturating_sub(view_start) as u32;
-                    let p = Point {
-                        x: ctx.origin.x.saturating_add(x),
-                        y: line_y,
-                    };
-                    ctx.r.put_cell(style.resolve_at(line_rect, p), p, ' ')?;
-                }
-            } else {
-                let x = draw_col.saturating_sub(view_start) as u32;
-                let p = Point {
-                    x: ctx.origin.x.saturating_add(x),
-                    y: line_y,
-                };
-                ctx.r
-                    .put_grapheme(style.resolve_at(line_rect, p), p, grapheme)?;
-            }
-
-            col = col.saturating_add(width);
-            char_index = g_end;
-        }
-
-        Ok(())
+            },
+        )
     }
 
     /// Move the cursor.
@@ -875,6 +942,73 @@ impl Editor {
             }
         }
         self.ensure_cursor_visible(ctx);
+    }
+
+    /// Insert `text` at the cursor, as a paste does. A vi editor takes the
+    /// text only in insert mode, and a read-only editor never takes it.
+    /// @param text Text to insert.
+    #[command]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "command arguments are owned values"
+    )]
+    pub fn insert(&mut self, ctx: &mut dyn Context, text: String) {
+        match self.config.mode {
+            EditMode::Text => {
+                self.begin_text_entry_transaction();
+                self.handle_insert_text(&text);
+            }
+            EditMode::Vi => {
+                if self.vi.mode() != ViMode::Insert || self.prompt.is_some() {
+                    return;
+                }
+                let inserted = self.handle_insert_text(&text);
+                self.vi.push_inserted(&inserted);
+            }
+        }
+        self.ensure_cursor_visible(ctx);
+    }
+
+    /// Return the cursor position.
+    pub fn cursor(&self) -> TextPosition {
+        self.buffer.cursor()
+    }
+
+    /// Move the cursor to `position`, and scroll it into view. A position
+    /// past the end of its line or of the text clamps to that end.
+    pub fn set_cursor(&mut self, ctx: &mut dyn Context, position: TextPosition) {
+        self.buffer.set_cursor(position);
+        self.update_preferred_column();
+        self.ensure_cursor_visible(ctx);
+    }
+
+    /// Return the vi mode, or `None` for a text editor.
+    pub fn vi_mode(&self) -> Option<ViMode> {
+        (self.config.mode == EditMode::Vi).then(|| self.vi.mode())
+    }
+
+    /// Switch a vi editor to `mode`, as its keys would. Leaving insert mode
+    /// records the insert for repetition. A text editor ignores the call.
+    pub fn set_vi_mode(&mut self, mode: ViMode) {
+        if self.config.mode != EditMode::Vi || self.vi.mode() == mode {
+            return;
+        }
+        match self.vi.mode() {
+            ViMode::Insert => {
+                self.commit_text_entry_transaction();
+                self.vi.end_insert();
+            }
+            ViMode::Visual(_) => self.exit_visual(),
+            ViMode::Normal => {}
+        }
+        match mode {
+            ViMode::Insert => {
+                self.begin_text_entry_transaction();
+                self.vi.begin_insert();
+            }
+            ViMode::Visual(visual) => self.enter_visual(visual),
+            ViMode::Normal => {}
+        }
     }
 
     /// Undo the last edit.
@@ -920,10 +1054,10 @@ impl Editor {
     ///
     /// The first match at or below the top of the view becomes current, and
     /// the view scrolls to it. Ranges must arrive in ascending order without
-    /// spanning lines; see [`SearchState::set_matches`]. An empty set clears
-    /// the search. Unlike [`Self::search`], the ranges need not come from a
-    /// literal query, so callers can highlight regular-expression matches.
-    pub fn highlight_matches(&mut self, ctx: &mut dyn Context, matches: Vec<TextRange>) {
+    /// spanning lines. An empty set clears the search. Unlike [`Self::search`],
+    /// the ranges need not come from a literal query, so callers can
+    /// highlight regular-expression matches.
+    pub fn set_matches(&mut self, ctx: &mut dyn Context, matches: Vec<TextRange>) {
         if matches.is_empty() {
             self.search = SearchState::new();
             return;
@@ -998,14 +1132,10 @@ impl Editor {
             }
             return rows;
         }
-        let gutter = self.gutter_width();
-        let wrap_width = content.w.saturating_sub(gutter).max(1) as usize;
-        let (wrap, tab_stop) = (self.config.wrap, self.config.tab_stop);
+        let wrap = self.wrap(content.w);
         let layout = &self.layout;
         let buffer = &self.buffer;
-        let cached = layout
-            .metrics_for(buffer, wrap_width, wrap, tab_stop)
-            .is_some();
+        let cached = layout.metrics_for(buffer, wrap).is_some();
         let mut memo: Option<(usize, LineLayout)> = None;
         let mut layout_of = |index: usize| -> LineLayout {
             if let Some((line, laid_out)) = &memo
@@ -1018,7 +1148,7 @@ impl Editor {
             } else {
                 None
             }
-            .unwrap_or_else(|| layout_line(&buffer.line_text(index), wrap, wrap_width, tab_stop));
+            .unwrap_or_else(|| layout_line(&buffer.line_text(index), wrap));
             memo = Some((index, laid_out.clone()));
             laid_out
         };
@@ -1034,7 +1164,7 @@ impl Editor {
                 row = row.saturating_add(layout_of(line_idx).display_lines() as u32);
                 line_idx += 1;
             }
-            let column = buffer.column_for_position(range.start, tab_stop);
+            let column = buffer.column_for_position(range.start, wrap.tab_stop);
             let segment = layout_of(line).segment_for_column(column) as u32;
             let mark = row.saturating_add(segment);
             if rows.last() != Some(&mark) {
@@ -1060,24 +1190,27 @@ impl Editor {
     }
 }
 
+impl Editor {
+    /// Return the cursor role of the current editing mode.
+    fn cursor_role(&self) -> &'static str {
+        match self.config.mode {
+            EditMode::Text => cursor::TEXT,
+            EditMode::Vi => match self.vi.mode() {
+                ViMode::Insert => cursor::VI_INSERT,
+                ViMode::Normal => cursor::VI_NORMAL,
+                ViMode::Visual(_) => cursor::VI_VISUAL,
+            },
+        }
+    }
+}
+
 impl Widget for Editor {
     fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
-        self.config.focusable
-    }
-
-    fn cursor(&self) -> Option<cursor::Cursor> {
-        let location = self.cursor_view_point?;
-        let shape = match self.config.mode {
-            EditMode::Text => cursor::CursorShape::Line,
-            EditMode::Vi => match self.vi.mode() {
-                ViMode::Insert => cursor::CursorShape::Line,
-                _ => cursor::CursorShape::Block,
-            },
-        };
-        Some(cursor::Cursor { location, shape })
+        self.config.interaction.focusable()
     }
 
     fn render(&mut self, r: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
+        r.push_layer("editor");
         let view = ctx.view();
         let view_rect = view.view_rect();
         let origin = view.content_origin();
@@ -1112,21 +1245,27 @@ impl Widget for Editor {
         }
 
         self.render_prompt(r, view_rect, origin)?;
+        if ctx.is_focused()
+            && let Some(point) = self.cursor_view_point
+        {
+            let location = Point {
+                x: origin.x.saturating_add(point.x),
+                y: origin.y.saturating_add(point.y),
+            };
+            r.cursor(location, CursorRequest::new(self.cursor_role()));
+        }
         Ok(())
     }
 
     fn measure(&self, c: MeasureConstraints) -> Measurement {
         let mut width = match c.width {
             Constraint::Exact(n) | Constraint::AtMost(n) => n.max(1),
-            Constraint::Unbounded => self.layout.max_line_width() as u32,
+            Constraint::Unbounded => self.natural_width(),
         };
         width = width.max(1);
 
-        let gutter = self.gutter_width();
-        let wrap_width = width.saturating_sub(gutter).max(1) as usize;
-
         let mut height = if self.config.auto_grow {
-            self.display_metrics(wrap_width).0 as u32
+            self.display_metrics(self.wrap(width)).0 as u32
         } else {
             self.config.min_height.max(1)
         };
@@ -1167,8 +1306,7 @@ impl Widget for Editor {
 
     fn canvas(&self, view: Size, _ctx: &CanvasContext) -> Size {
         let gutter = self.gutter_width();
-        let wrap_width = view.w.saturating_sub(gutter).max(1) as usize;
-        let (line_count, max_line_width) = self.display_metrics(wrap_width);
+        let (line_count, max_line_width) = self.display_metrics(self.wrap(view.w));
         let width = match self.config.wrap {
             // One more column holds the caret after the longest line.
             WrapMode::None => (max_line_width as u32)
@@ -1195,8 +1333,41 @@ impl Widget for Editor {
         })
     }
 
+    fn key_outcome(&self, key: key::Key, context: &dyn ViewContext) -> EventOutcome {
+        let handled = match self.config.mode {
+            EditMode::Text => self
+                .text_command(key, context.view().view_rect().w)
+                .is_some(),
+            EditMode::Vi => self.vi_command(key).is_some(),
+        };
+        if handled {
+            EventOutcome::Handle
+        } else {
+            EventOutcome::Ignore
+        }
+    }
+
+    fn accepts_intent(&self, intent: &str, _context: &dyn ViewContext) -> bool {
+        intent == CLEAR_INTENT && !self.config.interaction.read_only()
+    }
+
+    fn on_intent(&mut self, intent: &str, context: &mut dyn Context) -> Result<EventOutcome> {
+        if intent == CLEAR_INTENT && self.clear(context) {
+            Ok(EventOutcome::Handle)
+        } else {
+            Ok(EventOutcome::Ignore)
+        }
+    }
+
     fn name(&self) -> NodeName {
         NodeName::convert("editor")
+    }
+}
+
+impl Register for Editor {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        register_clear_intent(setup)
     }
 }
 
@@ -1206,7 +1377,7 @@ impl MouseState {
         Self {
             selecting: false,
             anchor: None,
-            click_state: ClickTracker::new(Duration::from_millis(DOUBLE_CLICK_MS)),
+            click_state: ClickTracker::default(),
         }
     }
 }

@@ -13,7 +13,8 @@ use crate::{
 /// Monotonic clock advanced by the test instead of elapsed wall time.
 ///
 /// Share it through an `Arc` and install it before preparing the application.
-/// Advancing time does not run callbacks; deliver `Work::Wake` to service them.
+/// Advancing time does not run callbacks; deliver `TurnInput::Wake` to service
+/// them.
 #[derive(Debug)]
 pub struct ManualClock {
     /// Current test instant, changed only by explicit advancement.
@@ -44,10 +45,10 @@ impl ManualClock {
         let mut now = self
             .now
             .lock()
-            .map_err(|_| Error::InvalidOperation("manual clock lock poisoned".into()))?;
+            .map_err(|_| Error::Invalid("manual clock lock poisoned".into()))?;
         *now = now
             .checked_add(duration)
-            .ok_or_else(|| Error::InvalidOperation("manual clock overflow".into()))?;
+            .ok_or_else(|| Error::Invalid("manual clock overflow".into()))?;
         Ok(())
     }
 }

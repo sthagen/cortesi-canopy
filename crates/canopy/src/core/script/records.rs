@@ -7,25 +7,33 @@ use ruau::vm::Scope;
 use super::{
     ArgValue, AttrSet, Canopy, Cell, Color, CoreViewContext, NodeId, Point, RectI32, Result,
     ViewContext, commands, error, inputmap, node_list_to_arg, point_to_arg, rect_to_arg,
-    size_to_arg, widget_access,
+    size_to_arg,
 };
-use crate::{FrameSnapshot, NodeSnapshot, core::termbuf::TermBuf, help};
+use crate::{
+    core::termbuf::TermBuf,
+    input,
+    input::{KeyRouteExplanation, KeyRouteStep, RouteOutcome, key::Key},
+    render::cursor::{CursorMotion, CursorShape, CursorSnapshot},
+    runtime::{FrameSnapshot, NodeSnapshot},
+    widget::EventOutcome,
+};
 
 /// Convert a publication without consulting live widget or node state.
 pub(super) fn snapshot_to_arg(frame: &FrameSnapshot) -> ArgValue {
-    let mut rows = Vec::with_capacity(frame.viewport.h as usize);
-    for y in 0..frame.viewport.h {
-        let row = (0..frame.viewport.w)
-            .map(|x| {
-                let index = y as usize * frame.viewport.w as usize + x as usize;
-                cell_to_arg(x, y, &frame.cells[index])
+    let size = frame.size();
+    let mut rows = Vec::with_capacity(size.h as usize);
+    for y in 0..size.h {
+        let row = (0..size.w)
+            .filter_map(|x| {
+                let cell = frame.buffer.get(Point { x, y })?;
+                Some(cell_to_arg(x, y, cell))
             })
             .collect();
         rows.push(ArgValue::Array(row));
     }
     ArgValue::Map(BTreeMap::from([
         ("frame_id".into(), ArgValue::UInt(frame.frame_id.0)),
-        ("viewport".into(), size_to_arg(frame.viewport)),
+        ("size".into(), size_to_arg(size)),
         (
             "focus".into(),
             frame.focus.map(ArgValue::Node).unwrap_or(ArgValue::Null),
@@ -35,14 +43,55 @@ pub(super) fn snapshot_to_arg(frame: &FrameSnapshot) -> ArgValue {
             ArgValue::Array(frame.nodes.iter().map(snapshot_node_to_arg).collect()),
         ),
         ("cells".into(), ArgValue::Array(rows)),
+        (
+            "cursors".into(),
+            ArgValue::Array(frame.cursors.iter().map(cursor_to_arg).collect()),
+        ),
     ]))
+}
+
+/// Convert one painted cursor.
+fn cursor_to_arg(cursor: &CursorSnapshot) -> ArgValue {
+    ArgValue::Map(BTreeMap::from([
+        ("node".into(), ArgValue::Node(cursor.node)),
+        ("x".into(), ArgValue::UInt(u64::from(cursor.location.x))),
+        ("y".into(), ArgValue::UInt(u64::from(cursor.location.y))),
+        ("role".into(), ArgValue::String(cursor.role.clone())),
+        (
+            "shape".into(),
+            ArgValue::String(cursor_shape_name(cursor.look.shape).into()),
+        ),
+        ("color".into(), color_to_arg(cursor.look.color)),
+        (
+            "motion".into(),
+            ArgValue::String(cursor_motion_name(cursor.look.motion).into()),
+        ),
+        ("primary".into(), ArgValue::Bool(cursor.primary)),
+    ]))
+}
+
+/// Return the script name of a cursor shape.
+pub(super) fn cursor_shape_name(shape: CursorShape) -> &'static str {
+    match shape {
+        CursorShape::Block => "block",
+        CursorShape::Underline => "underline",
+    }
+}
+
+/// Return the script name of a cursor motion.
+pub(super) fn cursor_motion_name(motion: CursorMotion) -> &'static str {
+    match motion {
+        CursorMotion::Steady => "steady",
+        CursorMotion::Blink { .. } => "blink",
+        CursorMotion::Pulse { .. } => "pulse",
+    }
 }
 
 /// Serialize owned semantic and geometry data, including expired node tokens.
 fn snapshot_node_to_arg(node: &NodeSnapshot) -> ArgValue {
     let semantics = &node.semantics;
-    let action_status = semantics
-        .action_status
+    let activation_status = semantics
+        .activation_status
         .as_ref()
         .map(|status| {
             let reason = match status {
@@ -81,8 +130,8 @@ fn snapshot_node_to_arg(node: &NodeSnapshot) -> ArgValue {
         ),
         ("name".into(), ArgValue::String(node.name.to_string())),
         (
-            "semantic_identity".into(),
-            node.semantic_identity
+            "identity".into(),
+            node.identity
                 .as_ref()
                 .map(|identity| {
                     ArgValue::Map(BTreeMap::from([
@@ -141,7 +190,11 @@ fn snapshot_node_to_arg(node: &NodeSnapshot) -> ArgValue {
                     "selected_keys".into(),
                     ArgValue::Array(semantics.selected_keys.clone()),
                 ),
-                ("action_status".into(), action_status),
+                (
+                    "checked_keys".into(),
+                    ArgValue::Array(semantics.checked_keys.clone()),
+                ),
+                ("activation_status".into(), activation_status),
             ])),
         ),
     ]))
@@ -166,14 +219,18 @@ pub(super) fn node_info_to_arg(
     } else {
         rect_to_arg(node.view.content)
     };
-    let accept_focus = widget_access::accepts_focus(&canopy.core, node_id);
+    let accept_focus = canopy.core.accepts_focus(node_id);
     Ok(BTreeMap::from([
         ("id".to_string(), ArgValue::Node(node_id)),
+        (
+            "parent".to_string(),
+            node.parent.map_or(ArgValue::Null, ArgValue::Node),
+        ),
         ("name".to_string(), ArgValue::String(node.name.to_string())),
         (
-            "semantic_identity".to_string(),
+            "identity".to_string(),
             root_ctx
-                .semantic_identity(node_id)
+                .identity(node_id)
                 .map(|identity| {
                     ArgValue::Map(BTreeMap::from([
                         ("scope".to_string(), ArgValue::Node(identity.scope)),
@@ -184,11 +241,11 @@ pub(super) fn node_info_to_arg(
         ),
         (
             "focused".to_string(),
-            ArgValue::Bool(root_ctx.is_focused_of(node_id)),
+            ArgValue::Bool(root_ctx.focused_node() == Some(node_id)),
         ),
         (
             "on_focus_path".to_string(),
-            ArgValue::Bool(root_ctx.is_on_focus_path_of(node_id)),
+            ArgValue::Bool(root_ctx.is_on_focus_path(node_id)),
         ),
         ("hidden".to_string(), ArgValue::Bool(node.hidden)),
         (
@@ -201,22 +258,6 @@ pub(super) fn node_info_to_arg(
         ("scroll".to_string(), point_to_arg(node.scroll)),
         ("accept_focus".to_string(), ArgValue::Bool(accept_focus)),
     ]))
-}
-
-/// Convert a node into a recursive tree record.
-pub(super) fn tree_node_to_arg(canopy: &Canopy, node_id: NodeId) -> Result<ArgValue> {
-    let mut info = node_info_to_arg(canopy, node_id)?;
-    let Some(node) = canopy.core.nodes.get(node_id) else {
-        return Err(error::Error::NotFound(format!("node {node_id:?}")));
-    };
-    let children = node
-        .children
-        .iter()
-        .copied()
-        .map(|child_id| tree_node_to_arg(canopy, child_id))
-        .collect::<Result<Vec<_>>>()?;
-    info.insert("children".to_string(), ArgValue::Array(children));
-    Ok(ArgValue::Map(info))
 }
 
 /// Convert registered fixtures into a scripting array.
@@ -264,14 +305,6 @@ pub(super) fn binding_info_to_arg(binding: &inputmap::BindingRecord) -> ArgValue
         ),
         ("id".to_string(), ArgValue::UInt(binding.id.as_u64())),
         (
-            "owner".to_string(),
-            ArgValue::String(owner_label(binding.owner)),
-        ),
-        (
-            "scope".to_string(),
-            ArgValue::String(binding.scope.label().to_string()),
-        ),
-        (
             "path".to_string(),
             ArgValue::String(binding.path_filter().to_string()),
         ),
@@ -280,19 +313,27 @@ pub(super) fn binding_info_to_arg(binding: &inputmap::BindingRecord) -> ArgValue
             ArgValue::String(binding.description.clone()),
         ),
         (
-            "target".to_string(),
-            ArgValue::String(binding.target.label().to_string()),
+            "show_in_help".to_string(),
+            ArgValue::Bool(binding.show_in_help),
+        ),
+        (
+            "action".to_string(),
+            ArgValue::String(binding.action.label().to_string()),
+        ),
+        (
+            "phase".to_string(),
+            ArgValue::String(binding.phase.label().to_string()),
         ),
     ]);
-    record.insert(
-        "phase".to_string(),
-        ArgValue::String(binding.phase.label().to_string()),
-    );
-    if let inputmap::BindingTarget::Command(action) = &binding.target {
-        insert_command_action(&mut record, action);
+    insert_tier(&mut record, &binding.tier);
+    if let Some(intent) = binding.action.intent() {
+        record.insert("intent".to_string(), ArgValue::String(intent.to_string()));
     }
-    if let Some(mode) = binding.scope.mode() {
-        record.insert("mode".to_string(), ArgValue::String(mode.to_string()));
+    if let inputmap::BindingAction::Command(call) = &binding.action {
+        insert_command_call(&mut record, call);
+    }
+    if let inputmap::BindingAction::Menu(mode) = &binding.action {
+        record.insert("menu".to_string(), ArgValue::String(mode.clone()));
     }
     if let Some(source) = &binding.source {
         record.insert("source".to_string(), ArgValue::String(source.clone()));
@@ -300,23 +341,39 @@ pub(super) fn binding_info_to_arg(binding: &inputmap::BindingRecord) -> ArgValue
     ArgValue::Map(record)
 }
 
-/// Add a stored command's arguments and target policy to an observation record.
-fn insert_command_action(
-    record: &mut BTreeMap<String, ArgValue>,
-    action: &commands::CommandAction,
-) {
+/// Add a binding tier, with its mode or framework group, to an observation
+/// record.
+fn insert_tier(record: &mut BTreeMap<String, ArgValue>, tier: &inputmap::BindingTier) {
+    record.insert(
+        "tier".to_string(),
+        ArgValue::String(tier.label().to_string()),
+    );
+    match tier {
+        inputmap::BindingTier::Framework(group) => {
+            record.insert("group".to_string(), ArgValue::String(group.to_string()));
+        }
+        inputmap::BindingTier::Mode(mode) => {
+            record.insert("mode".to_string(), ArgValue::String(mode.clone()));
+        }
+        inputmap::BindingTier::Global | inputmap::BindingTier::Default => {}
+    }
+}
+
+/// Add a stored command call's arguments and target policy to an observation
+/// record.
+fn insert_command_call(record: &mut BTreeMap<String, ArgValue>, call: &commands::CommandCall) {
     record.insert(
         "command".to_string(),
-        ArgValue::String(action.invocation.id.0.to_string()),
+        ArgValue::String(call.id.0.to_string()),
     );
     record.insert(
         "arguments".to_string(),
-        match &action.invocation.args {
+        match &call.args {
             commands::CommandArgs::Positional(values) => ArgValue::Array(values.clone()),
             commands::CommandArgs::Named(fields) => ArgValue::Map(fields.clone()),
         },
     );
-    let (kind, node) = match action.target {
+    let (kind, node) = match call.target {
         None => ("route", None),
         Some(commands::CommandTarget::Exact(node)) => ("exact", Some(node)),
         Some(commands::CommandTarget::From(node)) => ("from", Some(node)),
@@ -331,15 +388,22 @@ fn insert_command_action(
 
 /// Add availability and eligibility without conflating them with target
 /// resolution or missing context.
+///
+/// An unregistered command has no availability, and reports itself as
+/// unavailable.
 fn insert_command_availability(
     record: &mut BTreeMap<String, ArgValue>,
-    status: Option<&commands::CommandStatus>,
-    missing: &[commands::CommandRequirement],
-    available: bool,
-    target: Option<NodeId>,
+    availability: Option<&commands::CommandAvailability>,
 ) {
-    record.insert("available".to_string(), ArgValue::Bool(available));
-    if let Some(status) = status {
+    let resolution = availability.and_then(|availability| availability.resolution);
+    let missing = availability.map_or(&[][..], |availability| {
+        availability.missing_requirements.as_slice()
+    });
+    record.insert(
+        "available".to_string(),
+        ArgValue::Bool(resolution.is_some()),
+    );
+    if let Some(status) = availability.and_then(|availability| availability.status.as_ref()) {
         record.insert(
             "status".to_string(),
             ArgValue::String(status.label().to_string()),
@@ -360,8 +424,8 @@ fn insert_command_availability(
                 .collect(),
         ),
     );
-    if let Some(target) = target {
-        record.insert("target".to_string(), ArgValue::Node(target));
+    if let Some(resolution) = resolution {
+        record.insert("target".to_string(), ArgValue::Node(resolution.target()));
     }
 }
 
@@ -402,17 +466,14 @@ fn command_param_to_arg(param: &commands::CommandParamSpec) -> ArgValue {
 }
 
 /// Convert a command specification into its scripting record.
-pub(super) fn command_info_to_arg(availability: commands::CommandAvailability<'_>) -> ArgValue {
-    let commands::CommandAvailability {
-        spec,
-        resolution,
-        status,
-        missing_requirements,
-    } = availability;
-    let owner = spec.dispatch.owner().unwrap_or("");
+pub(super) fn command_info_to_arg(availability: &commands::CommandAvailability) -> ArgValue {
+    let spec = availability.spec;
     let mut record = BTreeMap::from([
         ("name".to_string(), ArgValue::String(spec.name.to_string())),
-        ("owner".to_string(), ArgValue::String(owner.to_string())),
+        (
+            "owner".to_string(),
+            ArgValue::String(spec.owner.to_string()),
+        ),
         (
             "params".to_string(),
             ArgValue::Array(spec.params.iter().map(command_param_to_arg).collect()),
@@ -425,13 +486,7 @@ pub(super) fn command_info_to_arg(availability: commands::CommandAvailability<'_
             }),
         ),
     ]);
-    insert_command_availability(
-        &mut record,
-        status.as_ref(),
-        &missing_requirements,
-        resolution.is_some(),
-        resolution.and_then(commands::CommandResolution::target),
-    );
+    insert_command_availability(&mut record, Some(availability));
     if let Some(doc) = spec.doc {
         record.insert("doc".to_string(), ArgValue::String(doc.to_string()));
     }
@@ -445,40 +500,10 @@ pub(super) fn command_info_to_arg(availability: commands::CommandAvailability<'_
 
 /// Refresh the app snapshot and borrow its rendered buffer.
 fn rendered_buffer(canopy: &mut Canopy) -> Result<&TermBuf> {
-    canopy.flush()?;
+    canopy.prepare()?;
     canopy
-        .buf()
+        .published_buf()
         .ok_or_else(|| error::Error::script("screen unavailable before render"))
-}
-
-/// Convert the current rendered screen buffer into its scripting record.
-pub(super) fn screen_to_arg(canopy: &mut Canopy) -> Result<ArgValue> {
-    let buffer = rendered_buffer(canopy)?;
-    Ok(ArgValue::Array(
-        buffer
-            .rows()
-            .into_iter()
-            .map(|row| ArgValue::Array(row.into_iter().map(ArgValue::String).collect()))
-            .collect(),
-    ))
-}
-
-/// Convert the current rendered screen buffer into styled cell records.
-pub(super) fn screen_cells_to_arg(canopy: &mut Canopy) -> Result<ArgValue> {
-    let buffer = rendered_buffer(canopy)?;
-    let size = buffer.size();
-    let mut rows = Vec::with_capacity(size.h as usize);
-    for y in 0..size.h {
-        let mut row = Vec::with_capacity(size.w as usize);
-        for x in 0..size.w {
-            let cell = buffer
-                .get(Point { x, y })
-                .expect("buffer coordinates should always be valid");
-            row.push(cell_to_arg(x, y, cell));
-        }
-        rows.push(ArgValue::Array(row));
-    }
-    Ok(ArgValue::Array(rows))
 }
 
 /// Convert one terminal cell into a scripting record.
@@ -505,26 +530,14 @@ fn color_to_arg(color: Color) -> ArgValue {
 
 /// Convert text attributes to stable lowercase names.
 fn attrs_to_arg(attrs: AttrSet) -> ArgValue {
-    let mut names = Vec::new();
-    if attrs.bold {
-        names.push(ArgValue::String("bold".to_string()));
-    }
-    if attrs.crossedout {
-        names.push(ArgValue::String("crossedout".to_string()));
-    }
-    if attrs.dim {
-        names.push(ArgValue::String("dim".to_string()));
-    }
-    if attrs.italic {
-        names.push(ArgValue::String("italic".to_string()));
-    }
-    if attrs.overline {
-        names.push(ArgValue::String("overline".to_string()));
-    }
-    if attrs.underline {
-        names.push(ArgValue::String("underline".to_string()));
-    }
-    ArgValue::Array(names)
+    ArgValue::Array(
+        attrs
+            .named()
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| ArgValue::String(name.to_owned()))
+            .collect(),
+    )
 }
 
 /// Return the rendered screen text inside a signed rectangle, clipped to the
@@ -548,10 +561,46 @@ pub(super) fn screen_text_for_rect(canopy: &mut Canopy, rect: RectI32) -> Result
     Ok(rows.join("\n"))
 }
 
+/// Return the rendered screen as styled text.
+pub(super) fn screen_capture(canopy: &mut Canopy) -> Result<ArgValue> {
+    let capture = rendered_buffer(canopy)?.capture();
+    Ok(commands::SerdeArg(capture).try_to_arg_value()?)
+}
+
 /// Return the rendered screen as plain text.
 pub(super) fn screen_text(canopy: &mut Canopy) -> Result<String> {
     let buffer = rendered_buffer(canopy)?;
     Ok(buffer.screen_text())
+}
+
+/// Convert the retained notices to scripting records, oldest first.
+pub(super) fn notices_to_arg(canopy: &Canopy) -> ArgValue {
+    ArgValue::Array(
+        canopy
+            .notices()
+            .iter()
+            .map(|notice| {
+                let mut record = BTreeMap::from([
+                    (
+                        "message".to_string(),
+                        ArgValue::String(notice.message.clone()),
+                    ),
+                    (
+                        "kind".to_string(),
+                        ArgValue::String(notice.kind.as_str().to_string()),
+                    ),
+                    (
+                        "source".to_string(),
+                        ArgValue::String(notice.source.label().to_string()),
+                    ),
+                ]);
+                if let Some(node) = notice.node {
+                    record.insert("node".to_string(), ArgValue::Node(node));
+                }
+                ArgValue::Map(record)
+            })
+            .collect(),
+    )
 }
 
 /// Convert the most recent route trace to scripting records.
@@ -563,8 +612,8 @@ pub(super) fn route_trace_to_arg(canopy: &Canopy) -> ArgValue {
             .map(|entry| {
                 let mut record = BTreeMap::from([
                     (
-                        "phase".to_string(),
-                        ArgValue::String(entry.phase.as_str().to_string()),
+                        "kind".to_string(),
+                        ArgValue::String(entry.kind.label().to_string()),
                     ),
                     ("path".to_string(), ArgValue::String(entry.path.clone())),
                     ("detail".to_string(), ArgValue::String(entry.detail.clone())),
@@ -578,19 +627,11 @@ pub(super) fn route_trace_to_arg(canopy: &Canopy) -> ArgValue {
     )
 }
 
-/// Render a binding owner as its script-visible label.
-fn owner_label(owner: inputmap::BindingOwner) -> String {
-    match owner {
-        inputmap::BindingOwner::Application => "application".to_string(),
-        inputmap::BindingOwner::Framework(group) => format!("framework:{group}"),
-    }
-}
-
 /// Convert one effective binding to a scripting record.
 ///
 /// Key and mouse records carry the same fields, so one conversion serves both
 /// and the two lists cannot drift apart.
-fn available_binding_to_arg<I: ToString>(binding: help::AvailableBinding<I>) -> ArgValue {
+fn available_binding_to_arg<I: ToString>(binding: input::AvailableBinding<I>) -> ArgValue {
     let mut record = BTreeMap::from([
         ("id".to_string(), ArgValue::UInt(binding.id.as_u64())),
         (
@@ -602,12 +643,8 @@ fn available_binding_to_arg<I: ToString>(binding: help::AvailableBinding<I>) -> 
             ArgValue::String(binding.description),
         ),
         (
-            "owner".to_string(),
-            ArgValue::String(owner_label(binding.owner)),
-        ),
-        (
-            "scope".to_string(),
-            ArgValue::String(binding.scope.label().to_string()),
+            "show_in_help".to_string(),
+            ArgValue::Bool(binding.show_in_help),
         ),
         ("path".to_string(), ArgValue::String(binding.path_filter)),
         (
@@ -615,26 +652,23 @@ fn available_binding_to_arg<I: ToString>(binding: help::AvailableBinding<I>) -> 
             ArgValue::String(binding.route_path.to_string()),
         ),
         (
+            "action".to_string(),
+            ArgValue::String(binding.action.label().to_string()),
+        ),
+        (
             "phase".to_string(),
             ArgValue::String(binding.phase.label().to_string()),
         ),
     ]);
+    insert_tier(&mut record, &binding.tier);
+    if let Some(intent) = binding.intent {
+        record.insert("intent".to_string(), ArgValue::String(intent.to_string()));
+    }
     if let Some(command) = binding.command {
         let mut detail = BTreeMap::new();
-        insert_command_action(&mut detail, &command.action);
-        insert_command_availability(
-            &mut detail,
-            command.status.as_ref(),
-            &command.missing_requirements,
-            command.resolution.is_some(),
-            command
-                .resolution
-                .and_then(commands::CommandResolution::target),
-        );
+        insert_command_call(&mut detail, &command.call);
+        insert_command_availability(&mut detail, command.availability.as_ref());
         record.insert("command".to_string(), ArgValue::Map(detail));
-    }
-    if let Some(mode) = binding.scope.mode() {
-        record.insert("mode".to_string(), ArgValue::String(mode.to_string()));
     }
     if let Some(source) = binding.source {
         record.insert("source".to_string(), ArgValue::String(source));
@@ -691,8 +725,8 @@ pub(super) fn available_bindings_to_arg(
                 .map_or(ArgValue::Null, ArgValue::String),
         ),
         (
-            "exclusive_group".to_string(),
-            snapshot.exclusive_group.map_or(ArgValue::Null, |group| {
+            "framework_group".to_string(),
+            snapshot.framework_group.map_or(ArgValue::Null, |group| {
                 ArgValue::String(group.as_str().to_string())
             }),
         ),
@@ -749,4 +783,118 @@ pub(super) fn script_journal_to_arg(canopy: &Canopy) -> ArgValue {
             })
             .collect(),
     )
+}
+
+/// Convert one prospective key-route explanation to a scripting record.
+pub(super) fn key_explanation_to_arg(
+    canopy: &Canopy,
+    requested: Option<NodeId>,
+    key: Key,
+) -> Result<ArgValue> {
+    let explanation = canopy.explain_key(requested, key)?;
+    Ok(key_route_explanation_to_arg(explanation))
+}
+
+/// Convert an owned explanation into its stable scripting shape.
+fn key_route_explanation_to_arg(explanation: KeyRouteExplanation) -> ArgValue {
+    ArgValue::Map(BTreeMap::from([
+        (
+            "key".to_string(),
+            ArgValue::String(explanation.key.to_string()),
+        ),
+        ("focus".to_string(), ArgValue::Node(explanation.focus)),
+        (
+            "focus_path".to_string(),
+            ArgValue::String(explanation.focus_path.to_string()),
+        ),
+        (
+            "steps".to_string(),
+            ArgValue::Array(
+                explanation
+                    .steps
+                    .iter()
+                    .map(key_route_step_to_arg)
+                    .collect(),
+            ),
+        ),
+        (
+            "outcome".to_string(),
+            key_route_outcome_to_arg(explanation.outcome),
+        ),
+    ]))
+}
+
+/// Convert one examined route step.
+fn key_route_step_to_arg(step: &KeyRouteStep) -> ArgValue {
+    let mut record = BTreeMap::from([
+        ("node".to_string(), ArgValue::Node(step.node)),
+        ("path".to_string(), ArgValue::String(step.path.to_string())),
+        (
+            "widget".to_string(),
+            ArgValue::String(event_outcome_label(step.widget).to_string()),
+        ),
+    ]);
+    if let Some(binding) = step.binding {
+        record.insert(
+            "binding".to_string(),
+            ArgValue::Map(BTreeMap::from([
+                ("id".to_string(), ArgValue::UInt(binding.id.as_u64())),
+                (
+                    "action".to_string(),
+                    ArgValue::String(binding.kind.label().to_string()),
+                ),
+                (
+                    "phase".to_string(),
+                    ArgValue::String(binding.phase.label().to_string()),
+                ),
+            ])),
+        );
+    }
+    ArgValue::Map(record)
+}
+
+/// Return the script label for a widget event outcome.
+fn event_outcome_label(outcome: EventOutcome) -> &'static str {
+    match outcome {
+        EventOutcome::Handle => "handle",
+        EventOutcome::Ignore => "ignore",
+    }
+}
+
+/// Convert the decisive route outcome.
+fn key_route_outcome_to_arg(outcome: RouteOutcome) -> ArgValue {
+    let (kind, winner, widget) = match outcome {
+        RouteOutcome::Binding(winner) => ("binding", Some(winner), None),
+        RouteOutcome::Transient(winner) => ("transient", Some(winner), None),
+        RouteOutcome::Widget { node, path } => ("widget", None, Some((node, path))),
+        RouteOutcome::TransientDismiss => ("transient_dismiss", None, None),
+        RouteOutcome::Unhandled => ("unhandled", None, None),
+    };
+    let mut record = BTreeMap::from([("kind".to_string(), ArgValue::String(kind.to_string()))]);
+    if let Some(winner) = winner {
+        record.extend([
+            (
+                "binding".to_string(),
+                ArgValue::UInt(winner.binding.as_u64()),
+            ),
+            ("node".to_string(), ArgValue::Node(winner.node)),
+            (
+                "path".to_string(),
+                ArgValue::String(winner.path.to_string()),
+            ),
+            (
+                "action".to_string(),
+                ArgValue::String(winner.kind.label().to_string()),
+            ),
+            (
+                "phase".to_string(),
+                ArgValue::String(winner.phase.label().to_string()),
+            ),
+        ]);
+    }
+    if let Some((node, path)) = widget {
+        record.insert("node".to_string(), ArgValue::Node(node));
+        record.insert("path".to_string(), ArgValue::String(path.to_string()));
+    }
+    ArgValue::Map(record)
 }

@@ -1,24 +1,23 @@
 use std::mem;
 
 use canopy::{
-    BindingId, BindingOwner, BindingPhase, BindingScope, Context, ContextExt, Loader, NodeId,
-    ViewContext, Widget, buf,
-    commands::{
-        CommandAction, CommandArgs, CommandId, CommandInvocation, CommandResolution, CommandStatus,
-    },
+    CanopyBuilder, Context, ContextExt, NodeId, ViewContext, Widget, buf,
+    commands::{CommandArgs, CommandAvailability, CommandCall, CommandId, CommandStatus},
     error::Result,
-    event::{key, mouse},
     geom::{Point, PointI32, Size},
-    help::{AvailableBinding, BindingCommand, BindingSnapshot},
-    layout::Layout,
+    input::{
+        AvailableBinding, BindingActionKind, BindingCommand, BindingId, BindingPhase,
+        BindingSnapshot, BindingTier, key, mouse,
+    },
+    layout::{Layout, ScrollOp},
     path::Path,
+    style::themes,
     testing::harness::Harness,
+    text,
 };
 
-use super::{binding_list::BindingList, panel::ControlFooter};
+use super::binding_list::BindingList;
 use crate::Frame;
-
-impl Loader for ControlFooter {}
 
 fn binding(
     id: u64,
@@ -27,13 +26,15 @@ fn binding(
     phase: BindingPhase,
 ) -> AvailableBinding<key::Key> {
     AvailableBinding {
+        show_in_help: true,
         id: BindingId::from_u64(id),
         input: key.into(),
         description: description.to_string(),
-        owner: BindingOwner::Application,
-        scope: BindingScope::Default,
+        tier: BindingTier::Default,
         path_filter: String::new(),
         route_path: Path::from("/root/editor"),
+        action: BindingActionKind::Script,
+        intent: None,
         phase,
         command: None,
         source: Some("test".to_string()),
@@ -46,7 +47,7 @@ fn snapshot(focus: NodeId, bindings: Vec<AvailableBinding<key::Key>>) -> Binding
         focus_path: Path::from("/root/editor"),
         active_modes: vec!["insert".to_string()],
         transient_mode: None,
-        exclusive_group: None,
+        framework_group: None,
         bindings,
         mouse_bindings: Vec::new(),
     }
@@ -55,13 +56,15 @@ fn snapshot(focus: NodeId, bindings: Vec<AvailableBinding<key::Key>>) -> Binding
 /// Build one effective mouse binding record.
 fn mouse_binding(id: u64, spec: &str, description: &str) -> AvailableBinding<mouse::Mouse> {
     AvailableBinding {
+        show_in_help: true,
         id: BindingId::from_u64(id),
         input: mouse::Mouse::parse_spec(spec).expect("valid mouse spec"),
         description: description.to_string(),
-        owner: BindingOwner::Application,
-        scope: BindingScope::Default,
+        tier: BindingTier::Default,
         path_filter: String::new(),
         route_path: Path::from("/root/editor"),
+        action: BindingActionKind::Script,
+        intent: None,
         phase: BindingPhase::AfterWidget,
         command: None,
         source: Some("test".to_string()),
@@ -74,7 +77,10 @@ fn list_with_mice(
     mice: Vec<AvailableBinding<mouse::Mouse>>,
 ) -> BindingList {
     let mut list = BindingList::new();
-    let focus = canopy::Canopy::new().root_id();
+    let focus = CanopyBuilder::new()
+        .build()
+        .expect("an empty application builds")
+        .root_id();
     let mut captured = snapshot(focus, bindings);
     captured.mouse_bindings = mice;
     drop(list.replace_snapshot(Some(captured)));
@@ -83,7 +89,10 @@ fn list_with_mice(
 
 fn list_with(bindings: Vec<AvailableBinding<key::Key>>) -> BindingList {
     let mut list = BindingList::new();
-    let focus = canopy::Canopy::new().root_id();
+    let focus = CanopyBuilder::new()
+        .build()
+        .expect("an empty application builds")
+        .root_id();
     drop(list.replace_snapshot(Some(snapshot(focus, bindings))));
     list
 }
@@ -94,6 +103,7 @@ fn harness_with(
     bindings: Vec<AvailableBinding<key::Key>>,
 ) -> Result<Harness> {
     let mut harness = Harness::builder(BindingList::new())
+        .register::<BindingList>()
         .size(width, height)
         .build()?;
     let focus = harness.root;
@@ -115,9 +125,33 @@ fn wide_keys_align_descriptions_by_display_columns() {
     let widths = lines
         .iter()
         .filter_map(|line| line.key.as_deref())
-        .map(unicode_width::UnicodeWidthStr::width)
+        .map(text::width)
         .collect::<Vec<_>>();
     assert_eq!(widths, [6, 6, 6]);
+}
+
+#[test]
+fn hidden_keys_and_mouse_inputs_are_omitted_before_grouping() {
+    let mut hidden = binding(1, 'x', "Activate", BindingPhase::AfterWidget);
+    hidden.show_in_help = false;
+    let mut hidden_mouse = mouse_binding(3, "LeftDown", "Activate");
+    hidden_mouse.show_in_help = false;
+    let list = list_with_mice(
+        vec![
+            hidden,
+            binding(2, 'y', "Activate", BindingPhase::AfterWidget),
+        ],
+        vec![hidden_mouse],
+    );
+    let lines = list.display_lines(60);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].key.as_deref().map(str::trim), Some("y"));
+    assert_eq!(lines[0].text, "Activate");
+    assert_eq!(
+        super::binding_list::key_rows_of(&list.snapshot().unwrap().bindings).len(),
+        1,
+        "transient menu help applies the same visibility option"
+    );
 }
 
 #[test]
@@ -145,7 +179,7 @@ fn mouse_rows_follow_the_keys_and_share_an_action_with_them() {
     assert_eq!(
         rows,
         [
-            ("a LeftDown", "Activate"),
+            ("a, LeftDown", "Activate"),
             ("z", "Something else"),
             ("ScrollUp", "Scroll up"),
         ],
@@ -158,16 +192,17 @@ fn mouse_rows_follow_the_keys_and_share_an_action_with_them() {
 fn a_disabled_mouse_binding_shows_its_reason() {
     let mut click = mouse_binding(1, "LeftDown", "Activate");
     click.command = Some(BindingCommand {
-        action: CommandAction {
-            invocation: CommandInvocation {
-                id: CommandId("button::press"),
-                args: CommandArgs::default(),
-            },
+        call: CommandCall {
+            id: CommandId("button::press"),
+            args: CommandArgs::default(),
             target: None,
         },
-        resolution: Some(CommandResolution::Free),
-        status: Some(CommandStatus::Disabled("nothing selected".into())),
-        missing_requirements: Vec::new(),
+        availability: Some(CommandAvailability {
+            spec: crate::Button::spec_press(),
+            resolution: None,
+            status: Some(CommandStatus::Disabled("nothing selected".into())),
+            missing_requirements: Vec::new(),
+        }),
     });
     let list = list_with_mice(Vec::new(), vec![click]);
     let lines = list.display_lines(60);
@@ -205,8 +240,92 @@ fn rows_sort_by_key_category_without_routing_details() {
         .iter()
         .filter_map(|line| line.key.as_deref().map(str::trim))
         .collect::<Vec<_>>();
-    assert_eq!(keys, ["a", "z", "B", "2", "↓", "Ctrl+a"]);
+    assert_eq!(keys, ["a", "z", "B", "2", "↓", "ctrl+a"]);
     assert_eq!(lines.len(), 6);
+}
+
+#[test]
+fn modified_keys_group_by_modifier_then_sort_by_name() {
+    let spec = |spec: &str| key::Key::parse_spec(spec).expect("valid key");
+    let list = list_with(vec![
+        binding(
+            1,
+            spec("shift-space"),
+            "Shift space",
+            BindingPhase::BeforeWidget,
+        ),
+        binding(
+            2,
+            spec("ctrl-right"),
+            "Ctrl right",
+            BindingPhase::BeforeWidget,
+        ),
+        binding(
+            3,
+            spec("shift-pageup"),
+            "Shift page",
+            BindingPhase::BeforeWidget,
+        ),
+        binding(4, spec("ctrl-r"), "Ctrl r", BindingPhase::BeforeWidget),
+        binding(5, spec("alt-x"), "Alt x", BindingPhase::BeforeWidget),
+        binding(
+            6,
+            spec("ctrl-shift-right"),
+            "Ctrl shift right",
+            BindingPhase::BeforeWidget,
+        ),
+        binding(7, spec("ctrl-a"), "Ctrl a", BindingPhase::BeforeWidget),
+        binding(8, spec("esc"), "Plain", BindingPhase::BeforeWidget),
+    ]);
+    let lines = list.display_lines(60);
+    let keys = lines
+        .iter()
+        .filter_map(|line| line.key.as_deref().map(str::trim))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            "esc",
+            "alt+x",
+            "ctrl+a",
+            "ctrl+r",
+            "ctrl+→",
+            "ctrl+shift+→",
+            "shift+pgup",
+            "shift+space",
+        ]
+    );
+}
+
+#[test]
+fn a_shared_action_sorts_by_its_first_key() {
+    let spec = |spec: &str| key::Key::parse_spec(spec).expect("valid key");
+    let list = list_with(vec![
+        binding(
+            1,
+            spec("shift-pageup"),
+            "Page up",
+            BindingPhase::BeforeWidget,
+        ),
+        binding(
+            2,
+            spec("shift-space"),
+            "Page down",
+            BindingPhase::BeforeWidget,
+        ),
+        binding(3, spec("space"), "Page down", BindingPhase::BeforeWidget),
+        binding(4, spec("ctrl-f"), "Find", BindingPhase::BeforeWidget),
+    ]);
+    let lines = list.display_lines(60);
+    let keys = lines
+        .iter()
+        .filter_map(|line| line.key.as_deref().map(str::trim))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        ["space, shift+space", "ctrl+f", "shift+pgup"],
+        "the plain key leads its line, which sorts with the plain keys"
+    );
 }
 
 #[test]
@@ -218,7 +337,7 @@ fn narrow_and_long_rows_use_indented_wrapped_continuations() {
         BindingPhase::BeforeWidget,
     )]);
     let lines = list.display_lines(12);
-    assert_eq!(lines[0].text, "Ctrl+Shift+x");
+    assert_eq!(lines[0].text, "ctrl+shift+x");
     assert!(lines[1].text.starts_with("  "));
     assert!(lines.len() > 3);
     assert!(lines.iter().all(|line| line.key.is_none()));
@@ -227,7 +346,7 @@ fn narrow_and_long_rows_use_indented_wrapped_continuations() {
 #[test]
 fn normal_and_empty_buffers_are_stable() -> Result<()> {
     let normal = harness_with(
-        32,
+        34,
         5,
         vec![
             binding(1, 'a', "Alpha", BindingPhase::BeforeWidget),
@@ -235,44 +354,44 @@ fn normal_and_empty_buffers_are_stable() -> Result<()> {
         ],
     )?;
     normal.tbuf().assert_matches(buf![
-        "a  Alpha"
-        "b  Beta"
+        " a  Alpha"
+        " b  Beta"
         ""
         ""
         ""
     ]);
 
-    let empty = harness_with(32, 2, Vec::new())?;
+    let empty = harness_with(34, 2, Vec::new())?;
     empty
         .tbuf()
-        .assert_matches(buf!["No key bindings in this context" ""]);
+        .assert_matches(buf![" No key bindings in this context" ""]);
     Ok(())
 }
 
 #[test]
 fn tiny_and_wide_key_buffers_do_not_overflow() -> Result<()> {
     let tiny = harness_with(
-        1,
+        3,
         1,
         vec![binding(1, 'a', "Alpha", BindingPhase::BeforeWidget)],
     )?;
-    tiny.tbuf().assert_matches(buf!["a"]);
+    tiny.tbuf().assert_matches(buf![" a"]);
 
     let wide = harness_with(
-        12,
+        14,
         3,
         vec![binding(1, '界', "Wide key", BindingPhase::BeforeWidget)],
     )?;
-    // The key and its action fit the twelve columns exactly, so they share a
-    // row rather than stacking.
-    wide.tbuf().assert_matches(buf!["界X  Wide key" "" ""]);
+    // The key and its action fit the twelve content columns exactly, so they
+    // share a row rather than stacking.
+    wide.tbuf().assert_matches(buf![" 界X  Wide key" "" ""]);
     Ok(())
 }
 
 #[test]
 fn narrow_long_buffer_wraps_to_exact_rows() -> Result<()> {
     let narrow = harness_with(
-        12,
+        14,
         4,
         vec![binding(
             1,
@@ -283,7 +402,7 @@ fn narrow_long_buffer_wraps_to_exact_rows() -> Result<()> {
     )?;
     narrow
         .tbuf()
-        .assert_matches(buf!["Ctrl+Shift+x" "  Long text" "  wraps here" ""]);
+        .assert_matches(buf![" ctrl+shift+x" "   Long text" "   wraps here" ""]);
     Ok(())
 }
 
@@ -295,7 +414,7 @@ fn scrolled_and_resized_buffers_have_exact_rows() -> Result<()> {
         binding(3, 'c', "Gamma", BindingPhase::BeforeWidget),
         binding(4, 'd', "Delta", BindingPhase::BeforeWidget),
     ];
-    let mut harness = harness_with(16, 3, bindings)?;
+    let mut harness = harness_with(18, 3, bindings)?;
     harness.mouse(mouse::MouseEvent {
         action: mouse::Action::ScrollDown,
         button: mouse::Button::None,
@@ -306,15 +425,15 @@ fn scrolled_and_resized_buffers_have_exact_rows() -> Result<()> {
     // and the wheel stops one row down rather than three.
     harness
         .tbuf()
-        .assert_matches(buf!["b  Beta" "c  Gamma" "d  Delta"]);
+        .assert_matches(buf![" b  Beta" " c  Gamma" " d  Delta"]);
 
-    harness.canopy.set_root_size(Size::new(16, 8))?;
+    harness.canopy.set_screen_size(Size::new(18, 8))?;
     harness.render()?;
     harness.tbuf().assert_matches(buf![
-        "a  Alpha"
-        "b  Beta"
-        "c  Gamma"
-        "d  Delta"
+        " a  Alpha"
+        " b  Beta"
+        " c  Gamma"
+        " d  Delta"
         ""
         ""
         ""
@@ -348,8 +467,8 @@ fn wheel_and_resize_keep_scroll_within_the_exact_canvas() -> Result<()> {
         .with_root_view(|context| context.view_of(harness.root).expect("list view"));
     assert_eq!(after_wheel.scroll.y, 3);
 
-    harness.with_root_context(|list: &mut BindingList, context| {
-        list.scroll_to_bottom(context);
+    harness.with_root_widget_context(|_list: &mut BindingList, context| {
+        let _ = context.scroll(ScrollOp::To(Point { x: 0, y: u32::MAX }));
         Ok(())
     })?;
     harness.render()?;
@@ -361,7 +480,7 @@ fn wheel_and_resize_keep_scroll_within_the_exact_canvas() -> Result<()> {
         at_bottom.canvas.h.saturating_sub(at_bottom.content.h)
     );
 
-    harness.canopy.set_root_size(Size::new(10, 40))?;
+    harness.canopy.set_screen_size(Size::new(10, 40))?;
     harness.render()?;
     let resized = harness
         .canopy
@@ -376,7 +495,7 @@ fn wheel_and_resize_keep_scroll_within_the_exact_canvas() -> Result<()> {
 #[test]
 fn a_scrolling_list_wraps_actions_across_its_full_width() -> Result<()> {
     let harness = harness_with(
-        32,
+        34,
         2,
         vec![
             binding(
@@ -390,44 +509,36 @@ fn a_scrolling_list_wraps_actions_across_its_full_width() -> Result<()> {
         ],
     )?;
     harness.tbuf().assert_matches(buf![
-        "a  12345678901234567890123456789"
-        "b  Another action"
+        " a  12345678901234567890123456789"
+        " b  Another action"
     ]);
     Ok(())
 }
 
 #[test]
-fn footer_groups_navigation_and_keeps_close_guide_visible() -> Result<()> {
-    let mut wide = Harness::builder(ControlFooter::new()).size(70, 1).build()?;
-    wide.render()?;
-    assert!(wide.tbuf().contains_text("↑/↓ Scroll"));
-    assert!(wide.tbuf().contains_text("PgUp/PgDn Page"));
-    assert!(wide.tbuf().contains_text("Home/End First/last"));
-    assert!(wide.tbuf().contains_text("Esc Close"));
-    let key_style = wide
-        .buf()
-        .get(Point { x: 0, y: 0 })
-        .expect("first footer key")
-        .style;
-    let label_style = wide
-        .buf()
-        .get(Point { x: 5, y: 0 })
-        .expect("first footer label")
-        .style;
-    assert!(key_style.attrs.bold);
-    assert!(!label_style.attrs.bold);
-    assert_ne!(key_style.fg, label_style.fg);
-
-    let mut narrow = Harness::builder(ControlFooter::new()).size(20, 1).build()?;
-    narrow.render()?;
-    narrow.tbuf().assert_matches(buf!["           Esc Close"]);
-    for x in 0..70 {
-        assert_eq!(
-            wide.buf().get(Point { x, y: 0 }).unwrap().style.bg,
-            key_style.bg,
-            "footer background must cover gaps at column {x}"
-        );
-    }
+fn separators_read_apart_from_the_keys() -> Result<()> {
+    let harness = harness_with(
+        30,
+        3,
+        vec![
+            binding(1, 'a', "Action", BindingPhase::BeforeWidget),
+            binding(2, 'b', "Action", BindingPhase::BeforeWidget),
+        ],
+    )?;
+    let cell = |x: u32| {
+        harness
+            .buf()
+            .get(Point { x, y: 0 })
+            .expect("the key row")
+            .style
+    };
+    // Column 0 is the widget's own left margin.
+    let key = cell(1);
+    let separator = cell(2);
+    assert!(key.attrs.bold);
+    assert!(!separator.attrs.bold);
+    assert_eq!(separator.fg, themes::default_dark().fg);
+    assert_ne!(key.fg, separator.fg, "the comma is not a key");
     Ok(())
 }
 
@@ -435,24 +546,25 @@ fn footer_groups_navigation_and_keeps_close_guide_visible() -> Result<()> {
 fn command_help_keeps_user_feedback_without_command_diagnostics() {
     use canopy::{
         commands::{
-            ArgValue, CommandAction, CommandArgs, CommandId, CommandInvocation, CommandRequirement,
+            ArgValue, CommandArgs, CommandAvailability, CommandCall, CommandId, CommandRequirement,
             CommandStatus, CommandTarget,
         },
-        help::BindingCommand,
+        input::BindingCommand,
     };
 
     let mut binding = binding(1, 'd', "Delete selection", BindingPhase::BeforeWidget);
     binding.command = Some(BindingCommand {
-        action: CommandAction {
-            invocation: CommandInvocation {
-                id: CommandId("todo::delete_item"),
-                args: CommandArgs::Positional(vec![ArgValue::Int(7)]),
-            },
+        call: CommandCall {
+            id: CommandId("todo::delete_item"),
+            args: CommandArgs::Positional(vec![ArgValue::Int(7)]),
             target: Some(CommandTarget::Focus),
         },
-        resolution: None,
-        status: Some(CommandStatus::Disabled("no selection".into())),
-        missing_requirements: vec![CommandRequirement::ListRow],
+        availability: Some(CommandAvailability {
+            spec: crate::Button::spec_press(),
+            resolution: None,
+            status: Some(CommandStatus::Disabled("no selection".into())),
+            missing_requirements: vec![CommandRequirement::Mouse],
+        }),
     });
     let list = list_with(vec![binding.clone()]);
     let text = list
@@ -463,8 +575,13 @@ fn command_help_keeps_user_feedback_without_command_diagnostics() {
         .join(" ");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert_eq!(text, "Delete selection — Unavailable: no selection");
-    // Input dispatch supplies event/row context that passive discovery lacks.
-    binding.command.as_mut().unwrap().status = Some(CommandStatus::Enabled);
+    // Input dispatch supplies event context that passive discovery lacks.
+    binding
+        .command
+        .as_mut()
+        .and_then(|command| command.availability.as_mut())
+        .unwrap()
+        .status = Some(CommandStatus::Enabled);
     let list = list_with(vec![binding]);
     assert_eq!(list.display_lines(100)[0].text, "Delete selection");
 }
@@ -489,7 +606,7 @@ fn bindings_with_one_action_share_a_row() {
     assert_eq!(
         rows(&list, 60),
         [
-            (Some("j ↓".to_string()), "Next entry".to_string()),
+            (Some("j, ↓".to_string()), "Next entry".to_string()),
             (Some("k".to_string()), "Previous entry".to_string()),
         ]
     );
@@ -511,8 +628,8 @@ fn long_key_runs_continue_on_rows_below_the_action() {
     assert_eq!(
         rows(&list, 60),
         [
-            (Some("PageDown Space".to_string()), "Page down".to_string()),
-            (Some("Shift+PageDown".to_string()), String::new()),
+            (Some("pgdown, space".to_string()), "Page down".to_string()),
+            (Some("shift+pgdown".to_string()), String::new()),
         ]
     );
 }
@@ -537,7 +654,7 @@ fn arrow_keys_show_as_single_arrows() {
         .into_iter()
         .filter_map(|(key, _)| key)
         .collect::<Vec<_>>();
-    assert_eq!(keys, ["←", "Ctrl+→"]);
+    assert_eq!(keys, ["←", "ctrl+→"]);
 }
 
 #[test]
@@ -549,7 +666,7 @@ fn arrows_keep_a_blank_cell_for_glyphs_wider_than_one() {
         binding(3, '[', "Previous tab", BindingPhase::BeforeWidget),
     ]);
     let lines = list.display_lines(60);
-    assert_eq!(lines[0].key.as_deref(), Some("h ←  ["));
+    assert_eq!(lines[0].key.as_deref(), Some("h, ← , ["));
 }
 
 #[test]
@@ -580,8 +697,8 @@ fn scroll_thumb_spans_the_visible_fraction() -> Result<()> {
         let root = context.node_id();
         let frame = ViewContext::children_of(context, root)[0];
         let list = ViewContext::children_of(context, frame)[0];
-        context.with_widget_mut(list, |list: &mut BindingList, context| {
-            list.scroll_to_bottom(context);
+        context.with_widget_mut(list, |_list: &mut BindingList, context| {
+            let _ = context.scroll(ScrollOp::To(Point { x: 0, y: u32::MAX }));
             Ok(())
         })
     })?;
@@ -600,8 +717,8 @@ impl Widget for FramedList {
 
     fn on_mount(&mut self, context: &mut dyn Context) -> Result<()> {
         let root = context.node_id();
-        let frame = context.add_child_to(root, Frame::new())?;
-        let list = context.add_child_to(frame, BindingList::new())?;
+        let frame = context.add_child(root, Frame::new())?;
+        let list = context.add_child(frame, BindingList::new())?;
         let bindings = mem::take(&mut self.0);
         context.with_widget_mut(list, |list: &mut BindingList, _| {
             drop(list.replace_snapshot(Some(snapshot(root, bindings))));
@@ -609,5 +726,3 @@ impl Widget for FramedList {
         })
     }
 }
-
-impl Loader for FramedList {}

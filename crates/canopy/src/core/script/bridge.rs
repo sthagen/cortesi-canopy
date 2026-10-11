@@ -1,54 +1,17 @@
 //! Guards and the bridge between a running script scope and the live `Canopy`.
 
-use std::{fmt, mem, result::Result as StdResult};
+use std::{fmt, result::Result as StdResult};
 
 use ruau::vm::{
     HostType, HostTypeBuilder, MarshaledPair, RuntimeError, Scope, ScopedValue, ScriptErrorField,
     ValueSnapshot,
 };
 
-use super::{
-    Canopy, ClosureRegistry, Core, LuauFunctionId, LuauState, NodeId, NonNull, Rc, RefCell, Result,
-    ScriptCache, commands, error,
-};
+use super::{Canopy, Core, LuauState, NodeId, NonNull, Rc, RefCell, Result, commands, error};
 
 thread_local! {
     /// Stack of canopy pointers made available to reentrant host calls.
     pub(super) static REENTRANT_CANOPY: RefCell<Vec<NonNull<Canopy>>> = const { RefCell::new(Vec::new()) };
-}
-
-impl LuauState {
-    /// Construct empty script host state.
-    pub(super) fn new() -> Self {
-        Self {
-            scripts: ScriptCache::new(),
-            closures: ClosureRegistry::new(),
-            startup_requirements: vec![StartupRequirement {
-                name: "setup".to_string(),
-                type_text: "() -> ()".to_string(),
-            }],
-            ..Self::default()
-        }
-    }
-
-    /// Mark a fully prepared script API as ready.
-    pub(super) fn publish(&mut self) {
-        self.finalized = true;
-    }
-
-    /// Drain deferred `on_start` hooks in registration order.
-    pub(super) fn drain_on_start_hooks(&mut self) -> Vec<LuauFunctionId> {
-        mem::take(&mut self.on_start_hooks)
-    }
-}
-
-/// One required global definition for startup script roots.
-#[derive(Clone)]
-pub(super) struct StartupRequirement {
-    /// Global name the root script must define.
-    pub(super) name: String,
-    /// Luau type text the definition must satisfy.
-    pub(super) type_text: String,
 }
 
 /// Clears the retained VM active-eval flag when a top-level async eval exits.
@@ -63,24 +26,24 @@ impl Drop for ActiveEvalGuard {
     }
 }
 
-/// Stack guard for the script dispatch anchor inside the borrowed Canopy
+/// Stack guard for the script dispatch origin inside the borrowed Canopy
 /// context.
-pub(super) struct ScriptAnchorGuard<'a, 's> {
+pub(super) struct ScriptOriginGuard<'a, 's> {
     /// Scope that owns the Canopy context borrow.
     scope: &'a Scope<'s>,
 }
 
-impl<'a, 's> ScriptAnchorGuard<'a, 's> {
-    /// Push the active command dispatch anchor for this script call.
+impl<'a, 's> ScriptOriginGuard<'a, 's> {
+    /// Push the active command dispatch origin for this script call.
     pub(super) fn push(scope: &'a Scope<'s>, node_id: NodeId) -> StdResult<Self, RuntimeError> {
-        push_script_anchor(scope, node_id)?;
+        push_script_origin(scope, node_id)?;
         Ok(Self { scope })
     }
 }
 
-impl Drop for ScriptAnchorGuard<'_, '_> {
+impl Drop for ScriptOriginGuard<'_, '_> {
     fn drop(&mut self) {
-        pop_script_anchor(self.scope);
+        pop_script_origin(self.scope);
     }
 }
 
@@ -127,18 +90,18 @@ fn with_canopy<R>(scope: &Scope<'_>, f: impl FnOnce(&mut Canopy) -> Result<R>) -
         .unwrap_or_else(|| Err(error::Error::script("no active canopy context")))
 }
 
-/// Push the active script anchor.
-fn push_script_anchor(scope: &Scope<'_>, node_id: NodeId) -> StdResult<(), RuntimeError> {
+/// Push the active script origin.
+fn push_script_origin(scope: &Scope<'_>, node_id: NodeId) -> StdResult<(), RuntimeError> {
     Ok(with_canopy(scope, |canopy| {
-        canopy.script_context_stack.push(node_id);
+        canopy.script.context_stack.push(node_id);
         Ok(())
     })?)
 }
 
-/// Pop the active script anchor.
-fn pop_script_anchor(scope: &Scope<'_>) {
+/// Pop the active script origin.
+fn pop_script_origin(scope: &Scope<'_>) {
     with_canopy(scope, |canopy| {
-        canopy.script_context_stack.pop();
+        canopy.script.context_stack.pop();
         Ok(())
     })
     .ok();
@@ -149,7 +112,7 @@ fn pop_script_anchor(scope: &Scope<'_>) {
 /// True means the current Rust code was reached from inside a running script,
 /// so any script execution started now is nested within that evaluation.
 pub fn in_live_scope(canopy: &Canopy) -> bool {
-    !canopy.script_context_stack.is_empty()
+    !canopy.script.context_stack.is_empty()
 }
 
 /// Execute a closure with mutable access to the active canopy instance.
@@ -159,7 +122,8 @@ pub(super) fn with_current_canopy<R>(
 ) -> Result<R> {
     with_canopy(scope, |canopy| {
         let node_id = canopy
-            .script_context_stack
+            .script
+            .context_stack
             .last()
             .copied()
             .ok_or_else(|| error::Error::script("no active script context"))?;
@@ -177,15 +141,15 @@ pub(super) fn node_handle_type() -> HostType {
         .build()
 }
 
-/// Script-held command value: a command with checked arguments that a binding
-/// runs later.
+/// Script-held command value: a command call with checked arguments that a
+/// binding runs later.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct ScriptCommandCall(pub(super) commands::CommandAction);
+pub(super) struct ScriptCommandCall(pub(super) commands::CommandCall);
 
 impl fmt::Display for ScriptCommandCall {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}(", self.0.invocation.id.0)?;
-        match &self.0.invocation.args {
+        write!(formatter, "{}(", self.0.id.0)?;
+        match &self.0.args {
             commands::CommandArgs::Positional(values) => {
                 for (index, value) in values.iter().enumerate() {
                     if index > 0 {
@@ -239,6 +203,40 @@ pub(super) fn command_call_type() -> HostType {
         .marshal(|call| ValueSnapshot::String(call.to_string().into_bytes()))
         .tostring(ToString::to_string)
         .build()
+}
+
+/// Script-held menu value: the mode a binding opens as a menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ScriptMenu(pub(super) String);
+
+impl fmt::Display for ScriptMenu {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "menu({:?})", self.0)
+    }
+}
+
+/// Build the host userdata descriptor for `MenuAction` values.
+pub(super) fn menu_type() -> HostType {
+    HostTypeBuilder::<ScriptMenu>::new("MenuAction")
+        .class(&commands::declaration::Class::new("MenuAction"))
+        .eq_by(|left, right| left == right)
+        .marshal(|menu| ValueSnapshot::String(menu.to_string().into_bytes()))
+        .tostring(ToString::to_string)
+        .build()
+}
+
+/// Convert a script value into a menu, when it is one.
+pub(super) fn menu_from_value<'s>(
+    scope: &Scope<'s>,
+    value: &ScopedValue<'s>,
+) -> Option<ScriptMenu> {
+    match value {
+        ScopedValue::Userdata(userdata) => userdata
+            .borrow::<ScriptMenu>(scope)
+            .ok()
+            .map(|menu| menu.clone()),
+        _ => None,
+    }
 }
 
 /// Convert a script value into a command call, or report the value's type.

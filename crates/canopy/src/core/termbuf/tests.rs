@@ -8,9 +8,9 @@ use super::*;
 use crate::{
     backend::crossterm::CrosstermRender,
     buf,
-    core::{testing::model::trace_result, text::grapheme_width},
+    core::{cursor::CursorShape, testing::model::trace_result, text::grapheme_width},
     geom::Line,
-    style::{AttrSet, Color, PartialStyle, StyleBuilder},
+    style::{AttrSet, Color, PartialStyle},
     testing::buf::BufTest,
 };
 
@@ -67,6 +67,25 @@ fn basic_fill() {
         " xx "
         " xx "
     ]);
+}
+
+#[test]
+fn fill_clears_wide_glyphs_at_both_edges() -> Result<()> {
+    let mut buffer = TermBuf::new(Size::new(6, 1), '.', def_style())?;
+    buffer.text(&def_style(), Line::new(0, 0, 6), "界ab界")?;
+    let mut style = def_style();
+    style.bg = Color::Red;
+    // The fill starts on a continuation and ends on a wide base.
+    buffer.fill(&style, Rect::new(1, 0, 4, 1), 'x')?;
+    buffer.validate_canonical()?;
+    assert!(buffer.get(Point { x: 0, y: 0 }).unwrap().is_empty());
+    assert!(buffer.get(Point { x: 5, y: 0 }).unwrap().is_empty());
+    for x in 1..5 {
+        let cell = buffer.get(Point { x, y: 0 }).unwrap();
+        assert_eq!(cell.ch, 'x');
+        assert_eq!(cell.style, style);
+    }
+    Ok(())
 }
 
 #[test]
@@ -156,15 +175,20 @@ fn cursor_overlay_styles_complete_graphemes() -> Result<()> {
     let style = def_style();
     let mut buf = TermBuf::new(Size::new(2, 1), '\0', def_style())?;
     buf.put_grapheme(Point::ZERO, "界", style)?;
-    buf.overlay_cursor(Point { x: 1, y: 0 }, cursor::CursorShape::Block);
+    let paint = buf
+        .paint_cursor(Point { x: 1, y: 0 }, CursorShape::Block, Color::Red)
+        .expect("cursor paints the wide grapheme");
 
     let base = buf.get(Point::ZERO).expect("missing wide base");
     let continuation = buf.get(Point { x: 1, y: 0 }).expect("missing continuation");
     assert_eq!(base.ch, '界');
     assert!(continuation.continuation);
     assert_eq!(base.style, continuation.style);
-    assert_eq!(base.style.fg, style.bg);
-    assert_eq!(base.style.bg, style.fg);
+    assert_eq!(base.style, paint.on);
+    assert_eq!(paint.off, style);
+    // Black text contrasts more with red than white does.
+    assert_eq!(base.style.fg, Color::Black);
+    assert_eq!(base.style.bg, Color::Red);
     buf.validate_canonical()
 }
 
@@ -173,14 +197,11 @@ fn rendering_rejects_noncanonical_buffers() -> Result<()> {
     let mut buf = TermBuf::new(Size::new(1, 1), '\0', def_style())?;
     buf.cells[0] = Cell::continuation(def_style());
     let mut backend = RecBackend::new();
-    assert!(matches!(buf.render(&mut backend), Err(Error::Invariant(_))));
+    assert!(matches!(buf.emit(&mut backend), Err(Error::Internal(_))));
 
     let mut ragged = TermBuf::new(Size::new(2, 1), '\0', def_style())?;
     ragged.cells.pop();
-    assert!(matches!(
-        ragged.render(&mut backend),
-        Err(Error::Invariant(_))
-    ));
+    assert!(matches!(ragged.emit(&mut backend), Err(Error::Internal(_))));
     Ok(())
 }
 
@@ -189,8 +210,8 @@ fn canonical_buffer_renders_through_crossterm_backend() -> Result<()> {
     let style = def_style();
     let mut buf = TermBuf::new(Size::new(4, 1), ' ', style)?;
     buf.text(&style, Line::new(0, 0, 4), "a界")?;
-    buf.overlay_cursor(Point { x: 2, y: 0 }, cursor::CursorShape::Underscore);
-    buf.render(&mut CrosstermRender::default())
+    buf.paint_cursor(Point { x: 2, y: 0 }, CursorShape::Underline, Color::Red);
+    buf.emit(&mut CrosstermRender::default())
 }
 
 #[test]
@@ -508,7 +529,7 @@ impl ModelBuffer {
         }
     }
 
-    fn overlay_cursor(&mut self, point: Point, shape: cursor::CursorShape) {
+    fn paint_cursor(&mut self, point: Point, shape: CursorShape, color: Color) {
         let Some(index) = self.index(point) else {
             return;
         };
@@ -516,15 +537,9 @@ impl ModelBuffer {
             self.cells[index].grapheme = Some(" ".into());
         }
         let (start, end) = self.grapheme_range(index);
+        let on = motion::cursor_style(self.cells[start].style, shape, color);
         for cell in &mut self.cells[start..end] {
-            match shape {
-                cursor::CursorShape::Underscore => {
-                    cell.style.attrs = cell.style.attrs.with(Attr::Underline);
-                }
-                cursor::CursorShape::Block | cursor::CursorShape::Line => {
-                    mem::swap(&mut cell.style.fg, &mut cell.style.bg);
-                }
-            }
+            cell.style = on;
         }
     }
 
@@ -678,7 +693,7 @@ enum BufferOperation {
     Cursor {
         x: u32,
         y: u32,
-        shape: cursor::CursorShape,
+        shape: CursorShape,
     },
     Resize {
         width: u32,
@@ -734,11 +749,7 @@ fn buffer_operation_strategy() -> impl Strategy<Value = BufferOperation> {
         (
             0u32..8,
             0u32..5,
-            prop::sample::select(vec![
-                cursor::CursorShape::Block,
-                cursor::CursorShape::Line,
-                cursor::CursorShape::Underscore,
-            ]),
+            prop::sample::select(vec![CursorShape::Block, CursorShape::Underline]),
         )
             .prop_map(|(x, y, shape)| BufferOperation::Cursor { x, y, shape }),
         (0u32..7, 0u32..5).prop_map(|(width, height)| BufferOperation::Resize { width, height }),
@@ -783,8 +794,8 @@ fn apply_buffer_operation(
         }
         BufferOperation::Cursor { x, y, shape } => {
             let point = Point { x: *x, y: *y };
-            actual.overlay_cursor(point, *shape);
-            model.overlay_cursor(point, *shape);
+            actual.paint_cursor(point, *shape, Color::Red);
+            model.paint_cursor(point, *shape, Color::Red);
         }
         BufferOperation::Resize { width, height } => {
             let size = Size::new(*width, *height);
@@ -803,7 +814,7 @@ fn diff_no_change() {
     let tb2 =
         TermBuf::new(Size::new(3, 1), ' ', style).expect("test render target should allocate");
     let mut be = RecBackend::new();
-    tb2.diff(&tb1, &mut be).unwrap();
+    tb2.emit_diff(&tb1, &mut be).unwrap();
     assert!(be.ops.is_empty());
 }
 
@@ -838,7 +849,7 @@ proptest! {
                     model: replay_model,
                     style: base_style,
                 };
-                actual.diff(&previous_actual, &mut backend)?;
+                actual.emit_diff(&previous_actual, &mut backend)?;
                 backend.model.assert_matches(&actual)
             })();
             trace_result(result, &operations, index)?;
@@ -851,7 +862,7 @@ fn diff_vertical_shift_uses_scroll() {
     let prev = buf_from_rows(&["aaa", "bbb", "ccc"]);
     let cur = buf_from_rows(&["xxx", "aaa", "bbb"]);
     let mut be = RegionShiftBackend::default();
-    cur.diff(&prev, &mut be).unwrap();
+    cur.emit_diff(&prev, &mut be).unwrap();
     assert_eq!(be.shift, Some((0, 2, 1)));
     assert_eq!(be.text_ops, 1);
 }
@@ -861,7 +872,7 @@ fn diff_vertical_shift_uses_scroll_interior() {
     let prev = buf_from_rows(&["#####", "#abc#", "#def#", "#ghi#", "#####"]);
     let cur = buf_from_rows(&["#####", "#xxx#", "#abc#", "#def#", "#####"]);
     let mut be = RegionShiftBackend::default();
-    cur.diff(&prev, &mut be).unwrap();
+    cur.emit_diff(&prev, &mut be).unwrap();
     assert_eq!(be.shift, Some((1, 3, 1)));
     assert_eq!(be.text_ops, 1);
 }
@@ -875,8 +886,8 @@ fn diff_interior_shift_replays_to_the_full_repaint() {
         model: ModelBuffer::new(Size::new(5, 5), style),
         style,
     };
-    prev.render(&mut backend).unwrap();
-    cur.diff(&prev, &mut backend).unwrap();
+    prev.emit(&mut backend).unwrap();
+    cur.emit_diff(&prev, &mut backend).unwrap();
     backend.model.assert_matches(&cur).unwrap();
 }
 
@@ -889,8 +900,8 @@ fn diff_skips_the_interior_shift_when_a_side_column_varies() {
         model: ModelBuffer::new(Size::new(5, 5), style),
         style,
     };
-    prev.render(&mut backend).unwrap();
-    cur.diff(&prev, &mut backend).unwrap();
+    prev.emit(&mut backend).unwrap();
+    cur.emit_diff(&prev, &mut backend).unwrap();
     backend.model.assert_matches(&cur).unwrap();
 }
 
@@ -904,7 +915,7 @@ fn diff_single_run() {
     cur.text(&style, Line::new(0, 0, 3), "ab")
         .expect("test buffer mutation should succeed");
     let mut be = RecBackend::new();
-    cur.diff(&prev, &mut be).unwrap();
+    cur.emit_diff(&prev, &mut be).unwrap();
     assert_eq!(be.ops.len(), 2);
     assert_eq!(be.ops[0], format!("style {style:?}"));
     assert_eq!(be.ops[1], "text 0 0 ab");
@@ -926,7 +937,7 @@ fn diff_style_changes() {
         .expect("test buffer mutation should succeed");
 
     let mut be = RecBackend::new();
-    cur.diff(&prev, &mut be).unwrap();
+    cur.emit_diff(&prev, &mut be).unwrap();
 
     assert_eq!(be.ops.len(), 4);
     assert_eq!(be.ops[0], format!("style {style2:?}"));
@@ -945,7 +956,7 @@ fn diff_multi_line() {
     cur.fill(&style, Rect::new(0, 1, 2, 1), 'x')
         .expect("test buffer mutation should succeed");
     let mut be = RecBackend::new();
-    cur.diff(&prev, &mut be).unwrap();
+    cur.emit_diff(&prev, &mut be).unwrap();
     assert_eq!(be.ops.len(), 2);
     assert_eq!(be.ops[0], format!("style {style:?}"));
     assert_eq!(be.ops[1], "text 0 1 xx");
@@ -959,7 +970,7 @@ fn render_whole_buffer() {
     tb.text(&style, Line::new(0, 0, 3), "ab")
         .expect("test buffer mutation should succeed");
     let mut be = RecBackend::new();
-    tb.render(&mut be).unwrap();
+    tb.emit(&mut be).unwrap();
     assert_eq!(
         be.ops,
         vec![format!("style {style:?}"), "text 0 0 ab ".to_string(),]
@@ -977,7 +988,7 @@ fn render_repositions_after_wide_graphemes() {
         .expect("test buffer mutation should succeed");
 
     let mut backend = ReplayBackend::blank(Size::new(8, 1));
-    tb.render(&mut backend).unwrap();
+    tb.emit(&mut backend).unwrap();
 
     assert_eq!(backend.screen_text(), "a界 bc  |");
 }
@@ -1019,7 +1030,7 @@ fn diff_size_change_rerender() {
     cur.text(&style, Line::new(0, 0, 3), "abc")
         .expect("test buffer mutation should succeed");
     let mut be = RecBackend::new();
-    cur.diff(&prev, &mut be).unwrap();
+    cur.emit_diff(&prev, &mut be).unwrap();
     assert_eq!(
         be.ops,
         vec![format!("style {style:?}"), "text 0 0 abc".to_string(),]
@@ -1046,11 +1057,11 @@ fn contains_text_style() {
         .expect("test buffer mutation should succeed");
 
     // Test with foreground color partial style
-    assert!(BufTest::new(&tb).contains_text_style("hello", &PartialStyle::fg(Color::Red)));
-    assert!(!BufTest::new(&tb).contains_text_style("world", &PartialStyle::fg(Color::Red)));
+    assert!(BufTest::new(&tb).contains_text_style("hello", &PartialStyle::new().fg(Color::Red)));
+    assert!(!BufTest::new(&tb).contains_text_style("world", &PartialStyle::new().fg(Color::Red)));
 
-    assert!(BufTest::new(&tb).contains_text_style("world", &PartialStyle::fg(Color::Blue)));
-    assert!(!BufTest::new(&tb).contains_text_style("hello", &PartialStyle::fg(Color::Blue)));
+    assert!(BufTest::new(&tb).contains_text_style("world", &PartialStyle::new().fg(Color::Blue)));
+    assert!(!BufTest::new(&tb).contains_text_style("hello", &PartialStyle::new().fg(Color::Blue)));
 
     // Test with empty partial style (matches any style)
     let partial_any = PartialStyle::default();
@@ -1059,8 +1070,7 @@ fn contains_text_style() {
     assert!(BufTest::new(&tb).contains_text_style("test", &partial_any));
 
     // Test with multiple style attributes
-    let partial_white_bg =
-        PartialStyle::from(StyleBuilder::new().fg(Color::White).bg(Color::Black));
+    let partial_white_bg = PartialStyle::new().fg(Color::White).bg(Color::Black);
     assert!(BufTest::new(&tb).contains_text_style("test", &partial_white_bg));
 }
 
@@ -1082,7 +1092,7 @@ fn identical_multirow_buffers_emit_no_operations() -> Result<()> {
         let current = buf_from_rows(&rows);
         let previous = current.clone();
         let mut backend = RegionShiftBackend::default();
-        current.diff(&previous, &mut backend)?;
+        current.emit_diff(&previous, &mut backend)?;
         assert_eq!(backend.shift, None);
         assert_eq!(backend.text_ops, 0);
         assert_eq!(backend.style_ops, 0);
@@ -1092,7 +1102,7 @@ fn identical_multirow_buffers_emit_no_operations() -> Result<()> {
     invalid.cells[0] = Cell::continuation(def_style());
     assert!(
         invalid
-            .diff(&invalid, &mut RegionShiftBackend::default())
+            .emit_diff(&invalid, &mut RegionShiftBackend::default())
             .is_err()
     );
     Ok(())

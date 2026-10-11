@@ -1,8 +1,8 @@
 mod logs;
 
 use canopy::{
-    Canopy, Context, ContextExt, Loader, NodeId, NodeName, Render, ViewContext, Widget,
-    derive_commands, error::Result, layout::Layout,
+    Context, ContextExt, NodeId, NodeName, Register, Setup, ViewContext, Widget, derive_commands,
+    error::Result, layout::Layout, render::Render,
 };
 use logs::Logs;
 
@@ -26,8 +26,8 @@ canopy.keymap({
     },
     { key = "g", description = "First log entry", action = command.logs.select_first() },
     { key = "G", description = "Last log entry", action = command.logs.select_last() },
-    { key = { "Space", "PageDown" }, description = "Page down", action = command.logs.page(1) },
-    { key = "PageUp", description = "Page up", action = command.logs.page(-1) },
+    { key = { "Space", "PageDown" }, description = "Page down", action = "canopy.nav.page_down" },
+    { key = "PageUp", description = "Page up", action = "canopy.nav.page_up" },
 })
 "#;
 
@@ -47,10 +47,10 @@ impl Inspector {
     pub(crate) fn install(context: &mut dyn Context) -> Result<NodeId> {
         let logs_id = context.create_detached(Logs::new())?;
         let frame_id = context.create_detached(frame::Frame::new())?;
-        context.set_children_of(frame_id.into(), vec![logs_id.into()])?;
+        context.set_children(frame_id.into(), vec![logs_id.into()])?;
 
         let inspector_id = context.create_detached(Self::new())?;
-        context.set_children_of(inspector_id.into(), vec![frame_id.into()])?;
+        context.set_children(inspector_id.into(), vec![frame_id.into()])?;
 
         Ok(inspector_id.into())
     }
@@ -71,11 +71,11 @@ impl Widget for Inspector {
     }
 }
 
-impl Loader for Inspector {
-    fn load(c: &mut Canopy) -> Result<()> {
-        c.add_commands::<Self>()?;
-        c.register_default_bindings("inspector", DEFAULT_BINDINGS)?;
-        Logs::load(c)?;
+impl Register for Inspector {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        setup.register_default_bindings("inspector", DEFAULT_BINDINGS)?;
+        Logs::register(setup)?;
         Ok(())
     }
 }

@@ -1,19 +1,27 @@
+use std::cell::RefCell;
+
 use canopy::{
-    Render, ViewContext, Widget,
+    ViewContext, Widget,
     error::Result,
     geom::{Point, Rect, Size},
-    layout::Layout,
-    style::ResolvedStyle,
+    layout::{Constraint, Layout, MeasureConstraints, Measurement},
+    render::Render,
+    style::Coverage,
 };
 
 use crate::font::{FontEffects, FontLayout, FontRenderer, LayoutOptions, align_offset};
 
 /// Render large ASCII-font text into a bounded region.
+///
+/// The text scales to the height of the banner. A banner fills its area, and
+/// a layout override that measures its width gives it the width of its text
+/// at its height instead.
 pub struct FontBanner {
     /// Current banner text.
     text: String,
-    /// Renderer used to rasterize the font.
-    renderer: FontRenderer,
+    /// Renderer used to rasterize the font. Measuring lays the text out from
+    /// a shared borrow, and the renderer caches glyphs as it lays out.
+    renderer: RefCell<FontRenderer>,
     /// Style path for text rendering.
     style: String,
     /// Layout configuration for the banner.
@@ -43,7 +51,7 @@ impl FontBanner {
     pub fn new(text: impl Into<String>, renderer: FontRenderer) -> Self {
         Self {
             text: text.into(),
-            renderer,
+            renderer: RefCell::new(renderer),
             style: String::from("text"),
             options: LayoutOptions::default(),
             effects: FontEffects::default(),
@@ -58,23 +66,26 @@ impl FontBanner {
 
     /// Update the banner renderer.
     pub fn set_renderer(&mut self, renderer: FontRenderer) {
-        self.renderer = renderer;
+        self.renderer = RefCell::new(renderer);
         self.cache = None;
     }
 
     /// Configure the banner style path.
+    #[must_use]
     pub fn with_style(mut self, style: impl Into<String>) -> Self {
         self.style = style.into();
         self
     }
 
     /// Configure layout options for the banner.
+    #[must_use]
     pub fn with_layout_options(mut self, options: LayoutOptions) -> Self {
         self.options = options;
         self
     }
 
     /// Configure rendering effects for the banner.
+    #[must_use]
     pub fn with_effects(mut self, effects: FontEffects) -> Self {
         self.effects = effects;
         self
@@ -98,9 +109,10 @@ impl FontBanner {
             None => true,
         };
         if rebuild {
-            let layout = self
-                .renderer
-                .layout(&self.text, size, self.options, self.effects);
+            let layout =
+                self.renderer
+                    .borrow_mut()
+                    .layout(&self.text, size, self.options, self.effects);
             self.cache = Some(LayoutCache {
                 text: self.text.clone(),
                 size,
@@ -115,6 +127,26 @@ impl FontBanner {
 impl Widget for FontBanner {
     fn layout(&self) -> Layout {
         Layout::fill()
+    }
+
+    /// Measure the text at the offered height, shrunk to the offered width
+    /// when it is wider. Without a bound on the height the text has no
+    /// scale, so the banner wraps.
+    fn measure(&self, c: MeasureConstraints) -> Measurement {
+        let (Constraint::Exact(height) | Constraint::AtMost(height)) = c.height else {
+            return c.wrap();
+        };
+        let width = match c.width {
+            Constraint::Exact(width) | Constraint::AtMost(width) => width,
+            Constraint::Unbounded => u32::MAX,
+        };
+        let content = self.renderer.borrow_mut().content_size(
+            &self.text,
+            Size::new(width, height),
+            self.options,
+            self.effects,
+        );
+        c.clamp(Size::new(content.w, height))
     }
 
     fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
@@ -144,22 +176,15 @@ impl Widget for FontBanner {
                     continue;
                 }
                 let point = Point { x, y };
-                let resolved = rndr.resolve_style(style).resolve_at(bounds, point);
-                let blended = blend_style(resolved, cell.fg_coverage, cell.bg_coverage);
-                rndr.put_cell(blended, point, cell.ch)?;
+                let coverage = Coverage {
+                    fg: cell.fg_coverage,
+                    bg: cell.bg_coverage,
+                };
+                rndr.put_covered(style, bounds, point, cell.ch, coverage)?;
             }
         }
         Ok(())
     }
-}
-
-/// Blend a resolved style by coverage weights.
-fn blend_style(resolved: ResolvedStyle, fg_cov: u8, bg_cov: u8) -> ResolvedStyle {
-    let fg_weight = f32::from(fg_cov) / 255.0;
-    let bg_weight = f32::from(bg_cov) / 255.0;
-    let fg = resolved.bg.blend(resolved.fg, fg_weight);
-    let bg = resolved.bg.blend(resolved.fg, bg_weight);
-    ResolvedStyle::new(fg, bg, resolved.attrs)
 }
 
 /// Compute a gradient bounds rect aligned to the rendered content.
@@ -177,4 +202,62 @@ fn content_rect(view_rect: Rect, layout: &FontLayout, options: LayoutOptions) ->
         layout.content_size.w,
         layout.content_size.h,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::font::Font;
+
+    const TEST_FONT: &[u8] = include_bytes!("../assets/fonts/Bungee-Regular.ttf");
+
+    /// Measure `text` at `height` rows, with room for any width.
+    fn measured(text: &str, height: Constraint) -> Result<Measurement> {
+        let banner = FontBanner::new(text, FontRenderer::new(Font::from_bytes(TEST_FONT)?));
+        Ok(banner.measure(MeasureConstraints {
+            width: Constraint::AtMost(500),
+            height,
+        }))
+    }
+
+    #[test]
+    fn a_banner_measures_its_text_at_its_height() -> Result<()> {
+        let Measurement::Fixed(short) = measured("ab", Constraint::Exact(6))? else {
+            panic!("a bounded height measures");
+        };
+        let Measurement::Fixed(long) = measured("abab", Constraint::Exact(6))? else {
+            panic!("a bounded height measures");
+        };
+        let Measurement::Fixed(tall) = measured("ab", Constraint::Exact(12))? else {
+            panic!("a bounded height measures");
+        };
+        assert_eq!(short.h, 6);
+        assert!(short.w > 0 && long.w > short.w, "{short:?} {long:?}");
+        assert!(tall.w > short.w, "the text scales with the height");
+        assert_eq!(measured("ab", Constraint::Unbounded)?, Measurement::Wrap);
+        Ok(())
+    }
+
+    #[test]
+    fn a_banner_narrower_than_its_text_shrinks_the_text() -> Result<()> {
+        let banner = |width| -> Result<Measurement> {
+            let banner = FontBanner::new("abab", FontRenderer::new(Font::from_bytes(TEST_FONT)?));
+            Ok(banner.measure(MeasureConstraints {
+                width,
+                height: Constraint::Exact(6),
+            }))
+        };
+        let Measurement::Fixed(natural) = banner(Constraint::Unbounded)? else {
+            panic!("a bounded height measures");
+        };
+        let room = natural.w / 2;
+        let Measurement::Fixed(shrunk) = banner(Constraint::AtMost(room))? else {
+            panic!("a bounded height measures");
+        };
+        assert!(
+            shrunk.w <= room && shrunk.w > room / 2,
+            "{natural:?} {shrunk:?}"
+        );
+        Ok(())
+    }
 }

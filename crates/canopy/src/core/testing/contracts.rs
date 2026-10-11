@@ -1,22 +1,29 @@
-//! A small shared R27 trace for native, terminal, MCP, proxy, and replay tests.
+//! A small shared script trace that native, terminal, MCP, proxy, and replay
+//! tests all run, so every driver is held to the same observable result.
 
 use std::collections::BTreeMap;
 
 use crate::{
-    Canopy, Context, EventOutcome, ViewContext, Widget, WidgetSemantics,
+    Canopy, CanopyBuilder, Context, EventOutcome, NodeName, ViewContext, Widget,
     commands::ArgValue,
     derive_commands,
     error::Result,
-    event::{Event, key::KeyCode},
     geom::Size,
+    input::{
+        Event,
+        key::{Key, KeyCode},
+    },
     layout::Layout,
     render::Render,
-    state::NodeName,
+    runtime::WidgetSemantics,
 };
 
-/// R06/R07 argument shapes and exact targeting, R18 waits, and R19
-/// observations. The result omits opaque node tokens and absolute frame
-/// generations.
+/// The shared trace script.
+///
+/// It calls a command with positional arguments on an exact target and with
+/// named arguments, checks that a snapshot stays unchanged until the next
+/// prepare, waits for a published value, and reads semantic observations. The
+/// result omits opaque node tokens and absolute frame generations.
 pub const SCRIPT: &str = r#"
 local old = canopy.snapshot()
 if old == nil then error("initial publication missing") end
@@ -26,7 +33,7 @@ canopy.call_named("contract::set", { value = 7, extra = 2 })
 local pending = canopy.snapshot()
 if pending == nil then error("publication disappeared") end
 canopy.assert(pending.frame_id == old.frame_id)
-canopy.flush()
+canopy.prepare()
 canopy.wait_for(function()
     local frame = canopy.snapshot()
     return frame ~= nil and frame.nodes[1].semantics.value == "9"
@@ -78,6 +85,14 @@ impl Widget for Contract {
         Ok(EventOutcome::Ignore)
     }
 
+    fn key_outcome(&self, key: Key, _ctx: &dyn ViewContext) -> EventOutcome {
+        if key.key == KeyCode::Char('x') {
+            EventOutcome::Handle
+        } else {
+            EventOutcome::Ignore
+        }
+    }
+
     fn render(&mut self, render: &mut Render, view: &dyn ViewContext) -> Result<()> {
         let glyph = char::from_digit(self.value.rem_euclid(10) as u32, 10).expect("decimal digit");
         render.fill("", view.view().outer_rect_local(), glyph)
@@ -95,12 +110,14 @@ impl Widget for Contract {
 
 /// Create a finalized, unprepared fixture with a fixed 12 by 3 viewport.
 pub fn app() -> Result<Canopy> {
-    let mut app = Canopy::new();
-    app.add_commands::<Contract>()?;
-    app.replace_root(Contract { value: 0 })?;
-    app.with_root_context(|ctx| ctx.set_semantic_key(ctx.root_id(), ctx.root_id(), "contract"))?;
-    app.set_root_size(Size::new(12, 3))?;
-    app.finalize_api()?;
+    let mut app = CanopyBuilder::new()
+        .configure(|setup| setup.add_commands::<Contract>())
+        .assemble(|app| {
+            app.replace_root(Contract { value: 0 })?;
+            app.with_root_context(|ctx| ctx.set_identity(ctx.root_id(), ctx.root_id(), "contract"))
+        })
+        .build()?;
+    app.set_screen_size(Size::new(12, 3))?;
     Ok(app)
 }
 

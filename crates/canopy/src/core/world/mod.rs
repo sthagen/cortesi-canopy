@@ -7,46 +7,46 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
+    sync::Arc,
 };
 
-use self::focus::FocusRecoveryHint;
+use self::focus::DeferredFocusRepair;
 use super::{
     inputmap::InputMap,
+    notice::Notices,
+    poll::{Clock, SystemClock},
     wake::WakeRegistry,
-    widget_access::{WidgetMutGuard, WidgetReadGuard, WidgetSlotGuard},
+    widget_access::{WidgetCellGuard, WidgetMutGuard, WidgetReadGuard},
 };
 use crate::{
-    ChangeOutcome,
-    commands::{CommandScopeFrame, CommandSet},
-    core::{
-        context::CoreContext,
-        id::{NodeArena, NodeId},
-        node::Node,
-        path::Path,
-    },
+    ChangeOutcome, NodeId, NodeName,
+    commands::CommandSet,
+    core::{context::CoreContext, id::NodeArena, node::Node, path::Path},
     error::{Error, NodeOperationKind, Result},
+    input::Event,
     layout::Layout,
-    state::NodeName,
-    style::StyleMap,
+    style::StyleChange,
     widget::Widget,
 };
 
 #[cfg(test)]
 mod change_tests;
+/// Dispatch boundaries, deferred removals and modal closes, and wake handles.
+mod completion;
+#[cfg(test)]
+pub use completion::MAX_POSTED_CALLS;
 /// Event dispatch and bubbling helpers.
 mod dispatch;
 /// Focus and mouse-capture management.
 mod focus;
-/// Modal interaction scopes and retirement.
-pub mod interaction;
 /// Layout traversal, measurement, and hit-testing.
 pub mod layout_driver;
+/// Open modals, their input admission, and retirement.
+pub mod modal;
 /// Viewport scroll mutation and default input actions.
 pub mod scroll;
 /// Scoped application identity and index invariants.
 mod semantic;
-/// Removal requests completed after callback restoration.
-mod teardown;
 /// Widgets and node builders shared by the world test modules.
 #[cfg(test)]
 pub mod test_support;
@@ -63,8 +63,8 @@ pub struct Core {
     pub(crate) nodes: NodeArena<Node>,
     /// Application keys unique within explicit arena scopes.
     semantic_keys: HashMap<(NodeId, String), NodeId>,
-    /// Runtime-owned modal interaction scopes.
-    interaction: interaction::InteractionState,
+    /// Open modals, innermost last.
+    modals: modal::ModalStack,
     /// Root node ID.
     pub(crate) root: NodeId,
     /// Currently focused node.
@@ -72,21 +72,22 @@ pub struct Core {
     /// Exit code requested by a widget or command, if any.
     pub(crate) exit_requested: Option<i32>,
     /// Pending style map to be applied before next render.
-    pub(crate) pending_style: Option<StyleMap>,
+    pub(crate) pending_style: Option<StyleChange>,
     /// Node that captures mouse events regardless of cursor position.
     pub(crate) mouse_capture: Option<NodeId>,
-    /// Focus recovery hint for the most recent structural removal.
-    pub(crate) focus_hint: Option<FocusRecoveryHint>,
+    /// Focus repair waiting for mutable callbacks to return their widget
+    /// cells.
+    deferred_focus_repair: Option<DeferredFocusRepair>,
     /// Active tree edit and its rollback state.
     tree_edit: Option<TreeEditJournal>,
     /// Monotonic widget and attachment generation source, outside rollback.
     next_generation: u64,
     /// Last call-order stamp given to a scroll or reveal, outside rollback.
     scroll_stamp: u64,
-    /// Widget slots currently extracted by mutation callbacks.
+    /// Widget cells currently extracted by mutation callbacks.
     pub(crate) callback_depth: usize,
     /// Completion-boundary removal queue and dispatch nesting.
-    completion: teardown::CompletionBatch,
+    completion: completion::CompletionBatch,
     /// Cross-thread work handles synchronized with committed structural state.
     pub(crate) wake_registry: WakeRegistry,
     /// Whether lifecycle cleanup is unwinding a failed tree edit.
@@ -95,10 +96,15 @@ pub struct Core {
     pub(crate) commands: CommandSet,
     /// Application and framework input bindings.
     pub(crate) input_map: InputMap,
-    /// Command scope stack for injection.
-    command_scope: Vec<CommandScopeFrame>,
-    /// Pending diagnostic dump request.
-    pub(crate) pending_diagnostic_dump: Option<NodeId>,
+    /// Events in scope for command injection, innermost last.
+    event_scope: Vec<Event>,
+    /// Recoverable failures and the one the application shows.
+    pub(crate) notices: Notices,
+    /// Driver clock that widgets read through [`crate::ViewContext::now`].
+    pub(crate) clock: Arc<dyn Clock>,
+    /// Whether cells move: the motion settings allow it, and the adapter
+    /// shows it.
+    pub(crate) motion_active: bool,
 }
 
 /// Journal for one outermost tree edit and all nested edits it performs.
@@ -115,7 +121,7 @@ struct TreeEditJournal {
 struct MountedWidget {
     /// Node that owned the widget when its mount completed.
     node_id: NodeId,
-    /// Stable widget slot identity across node snapshots and replacement.
+    /// Stable widget cell identity across node snapshots and replacement.
     widget: Rc<RefCell<Option<Box<dyn Widget>>>>,
 }
 
@@ -123,7 +129,7 @@ struct MountedWidget {
 struct RemovalPlan {
     /// Root whose lifecycle initiated the plan.
     root: NodeId,
-    /// Nodes in deterministic pre-order with their original widget slots.
+    /// Nodes in deterministic pre-order with their original widget cells.
     pre_order: Vec<RemovalEntry>,
     /// Nodes in deterministic post-order.
     post_order: Vec<NodeId>,
@@ -146,7 +152,7 @@ struct TreeStateSnapshot {
     /// Scoped identities captured with arena metadata.
     semantic_keys: HashMap<(NodeId, String), NodeId>,
     /// Modal scopes captured with structural state.
-    interaction: interaction::InteractionState,
+    modals: modal::ModalStack,
     /// Root node ID.
     root: NodeId,
     /// Focus target.
@@ -154,13 +160,11 @@ struct TreeStateSnapshot {
     /// Requested process exit.
     exit_requested: Option<i32>,
     /// Pending style replacement.
-    pending_style: Option<StyleMap>,
+    pending_style: Option<StyleChange>,
     /// Mouse capture target.
     mouse_capture: Option<NodeId>,
-    /// Focus recovery candidates.
-    focus_hint: Option<FocusRecoveryHint>,
-    /// Pending diagnostic target.
-    pending_diagnostic_dump: Option<NodeId>,
+    /// Deferred focus repair.
+    deferred_focus_repair: Option<DeferredFocusRepair>,
 }
 
 /// Widget operation whose failures should carry node context.
@@ -210,24 +214,26 @@ impl Core {
             changes: crate::ChangeSet::default(),
             nodes,
             semantic_keys: HashMap::new(),
-            interaction: interaction::InteractionState::default(),
+            modals: modal::ModalStack::default(),
             root,
             focus: None,
             exit_requested: None,
             pending_style: None,
             mouse_capture: None,
-            focus_hint: None,
+            deferred_focus_repair: None,
             tree_edit: None,
             next_generation: 2,
             scroll_stamp: 0,
             callback_depth: 0,
-            completion: teardown::CompletionBatch::default(),
+            completion: completion::CompletionBatch::default(),
             wake_registry: WakeRegistry::default(),
             rolling_back_tree_edit: false,
             commands: CommandSet::default(),
             input_map: InputMap::new(),
-            command_scope: Vec::new(),
-            pending_diagnostic_dump: None,
+            event_scope: Vec::new(),
+            notices: Notices::default(),
+            clock: Arc::new(SystemClock),
+            motion_active: false,
         }
     }
 
@@ -238,21 +244,22 @@ impl Core {
         }
     }
 
-    /// Return the current command-scope frame, if any.
-    pub(crate) fn current_command_scope(&self) -> Option<&CommandScopeFrame> {
-        self.command_scope.last()
+    /// Return the innermost event in scope for command injection, if any.
+    pub(crate) fn current_event(&self) -> Option<&Event> {
+        self.event_scope.last()
     }
 
-    /// Push a command-scope frame and return the previous depth.
-    pub(crate) fn push_command_scope(&mut self, frame: CommandScopeFrame) -> usize {
-        let depth = self.command_scope.len();
-        self.command_scope.push(frame);
+    /// Put an event in scope for command injection and return the previous
+    /// depth.
+    pub(crate) fn push_event_scope(&mut self, event: &Event) -> usize {
+        let depth = self.event_scope.len();
+        self.event_scope.push(event.clone());
         depth
     }
 
-    /// Restore the command-scope stack to a previous depth.
-    pub(crate) fn pop_command_scope(&mut self, depth: usize) {
-        self.command_scope.truncate(depth);
+    /// Restore the event scope to a previous depth.
+    pub(crate) fn pop_event_scope(&mut self, depth: usize) {
+        self.event_scope.truncate(depth);
     }
 
     /// Return the root node id.
@@ -266,12 +273,16 @@ impl Core {
     }
 
     /// Take a mutable reference to a widget for a single call.
+    ///
+    /// The widget's cell is empty during the call. Once the outermost call
+    /// returns every cell, a focus repair that edits inside the calls deferred
+    /// runs.
     pub(crate) fn with_widget_dyn_mut<R>(
         &mut self,
         node_id: NodeId,
         f: impl FnOnce(&mut dyn Widget, &mut Self) -> R,
     ) -> Result<R> {
-        let mut guard = WidgetSlotGuard::take(self, node_id).map_err(|error| {
+        let mut guard = WidgetCellGuard::take(self, node_id).map_err(|error| {
             self.widget_operation_error(
                 WidgetOperation::access("mutation callback"),
                 node_id,
@@ -286,6 +297,9 @@ impl Core {
         let result = f(guard.widget_mut(), self);
         drop(guard);
         self.callback_depth -= 1;
+        if self.callback_depth == 0 {
+            self.run_deferred_focus_repair()?;
+        }
         Ok(result)
     }
 

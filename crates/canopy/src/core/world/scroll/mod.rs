@@ -7,10 +7,12 @@
 
 use super::{Core, WidgetOperation, layout_driver::clamp_scroll};
 use crate::{
-    ChangeOutcome, RevealAlign,
-    core::{id::NodeId, node::Node},
+    ChangeOutcome, NodeId,
+    core::node::Node,
     error::{Error, Result},
     geom::{Point, PointI32, Rect},
+    input::NavIntent,
+    layout::{RevealAlign, ScrollDirection, ScrollOp},
 };
 
 /// Runtime behavior applied to a route node that no widget or binding handled.
@@ -47,11 +49,14 @@ pub struct NodeReveal {
     pub align: RevealAlign,
     /// Call-order stamp.
     pub order: u64,
+    /// The part of the node to show, from its top left, or `None` for the
+    /// whole node.
+    pub area: Option<Rect>,
 }
 
 /// The slot a queued request occupies.
 #[derive(Clone, Copy)]
-enum Slot {
+enum RevealScope {
     /// The node's own viewport.
     Local,
     /// The node's ancestor viewports.
@@ -65,10 +70,59 @@ impl Core {
         self.scroll_stamp
     }
 
-    /// Scroll an attached node to an offset, clamped to its canvas.
-    pub(crate) fn scroll_to_of(&mut self, node: NodeId, x: u32, y: u32) -> Result<ChangeOutcome> {
+    /// Apply a scroll operation to a node, clamped to its canvas.
+    pub(crate) fn scroll(&mut self, node_id: NodeId, op: ScrollOp) -> ChangeOutcome {
+        let Some(size) = self.nodes.get(node_id).map(|node| node.content_size) else {
+            return ChangeOutcome::Unchanged;
+        };
+        self.update_scroll(node_id, |scroll| op.target(scroll, size))
+    }
+
+    /// Apply a scroll operation to an attached node, clamped to its canvas.
+    pub(crate) fn scroll_node(&mut self, node: NodeId, op: ScrollOp) -> Result<ChangeOutcome> {
         self.validate_attached_node(node)?;
-        Ok(self.update_scroll(node, |_| Point { x, y }))
+        Ok(self.scroll(node, op))
+    }
+
+    /// Return the scroll a navigation intent applies to `node_id`, when its
+    /// view can move that way.
+    pub(crate) fn nav_scroll(&self, node_id: NodeId, nav: NavIntent) -> Option<ScrollOp> {
+        let node = self.nodes.get(node_id)?;
+        let before = node.scroll;
+        let op = match nav {
+            NavIntent::Up => ScrollOp::Lines(ScrollDirection::Up, 1),
+            NavIntent::Down => ScrollOp::Lines(ScrollDirection::Down, 1),
+            NavIntent::Left => ScrollOp::Lines(ScrollDirection::Left, 1),
+            NavIntent::Right => ScrollOp::Lines(ScrollDirection::Right, 1),
+            NavIntent::PageUp => ScrollOp::Pages(ScrollDirection::Up, 1),
+            NavIntent::PageDown => ScrollOp::Pages(ScrollDirection::Down, 1),
+            NavIntent::First => ScrollOp::To(Point { x: before.x, y: 0 }),
+            NavIntent::Last => ScrollOp::To(Point {
+                x: before.x,
+                y: u32::MAX,
+            }),
+        };
+        let mut target = op.target(before, node.content_size);
+        clamp_scroll(&mut target, node.content_size, node.canvas);
+        (target != before).then_some(op)
+    }
+
+    /// Return what applying `op` to `node_id` would change, without mutating
+    /// the tree.
+    ///
+    /// This mirrors [`Core::scroll`] for the same start state, including the
+    /// change a cancelled pending reveal produces. It returns `None` when the
+    /// node is missing.
+    pub(crate) fn scroll_outcome(&self, node_id: NodeId, op: ScrollOp) -> Option<ChangeOutcome> {
+        let node = self.nodes.get(node_id)?;
+        let before = node.scroll;
+        let mut target = op.target(before, node.content_size);
+        clamp_scroll(&mut target, node.content_size, node.canvas);
+        Some(if target != before || node.reveal.is_some() {
+            ChangeOutcome::Changed
+        } else {
+            ChangeOutcome::Unchanged
+        })
     }
 
     /// Move a viewport by an explicit scroll, clamped to its canvas.
@@ -136,7 +190,24 @@ impl Core {
         if !self.nodes.contains_key(node_id) {
             return Err(Error::NodeNotFound(node_id));
         }
-        Ok(self.queue_node_reveal(node_id, align))
+        Ok(self.queue_node_reveal(node_id, align, None))
+    }
+
+    /// Queue a reveal of one rectangle of an existing node, from its top
+    /// left, in its ancestor viewports.
+    pub(crate) fn reveal_node_area(
+        &mut self,
+        node_id: NodeId,
+        area: Rect,
+        align: RevealAlign,
+    ) -> Result<ChangeOutcome> {
+        if !self.nodes.contains_key(node_id) {
+            return Err(Error::NodeNotFound(node_id));
+        }
+        if area.is_empty() {
+            return Ok(ChangeOutcome::Unchanged);
+        }
+        Ok(self.queue_node_reveal(node_id, align, Some(area)))
     }
 
     /// Queue a reveal of a node in its ancestor viewports, replacing a pending
@@ -145,6 +216,7 @@ impl Core {
         &mut self,
         node_id: NodeId,
         align: RevealAlign,
+        area: Option<Rect>,
     ) -> ChangeOutcome {
         let order = self.next_scroll_stamp();
         let Some(node) = self.nodes.get_mut(node_id) else {
@@ -152,8 +224,8 @@ impl Core {
         };
         let changed = node
             .reveal_in_ancestors
-            .is_none_or(|pending| pending.align != align);
-        node.reveal_in_ancestors = Some(NodeReveal { align, order });
+            .is_none_or(|pending| (pending.align, pending.area) != (align, area));
+        node.reveal_in_ancestors = Some(NodeReveal { align, order, area });
         self.invalidate(crate::Invalidation::Layout);
         outcome(changed)
     }
@@ -188,10 +260,10 @@ impl Core {
         let mut pending = Vec::new();
         for (node_id, node) in self.nodes.iter() {
             if let Some(request) = node.reveal {
-                pending.push((request.order, node_id, Slot::Local));
+                pending.push((request.order, node_id, RevealScope::Local));
             }
             if let Some(request) = node.reveal_in_ancestors {
-                pending.push((request.order, node_id, Slot::Ancestors));
+                pending.push((request.order, node_id, RevealScope::Ancestors));
             }
         }
         if pending.is_empty() {
@@ -204,8 +276,8 @@ impl Core {
                 continue;
             }
             match slot {
-                Slot::Local => self.apply_local_reveal(node_id)?,
-                Slot::Ancestors => self.apply_node_reveal(node_id, boundary),
+                RevealScope::Local => self.apply_local_reveal(node_id)?,
+                RevealScope::Ancestors => self.apply_node_reveal(node_id, boundary),
             }
         }
         Ok(true)
@@ -251,8 +323,29 @@ impl Core {
         let Some(node) = self.nodes.get(node_id) else {
             return;
         };
-        let (Some(request), mut area) = (node.reveal_in_ancestors, node.rect) else {
+        let Some(request) = node.reveal_in_ancestors else {
             return;
+        };
+        // A part of the node lies within the node. A part wholly outside it
+        // has nothing to reveal.
+        let mut area = match request.area {
+            Some(part) => {
+                let part = Rect::new(
+                    node.rect.tl.x.saturating_add(part.tl.x),
+                    node.rect.tl.y.saturating_add(part.tl.y),
+                    part.w,
+                    part.h,
+                );
+                match part.intersect(node.rect) {
+                    Some(area) => area,
+                    None if node.rect.is_empty() => return,
+                    None => {
+                        self.nodes[node_id].reveal_in_ancestors = None;
+                        return;
+                    }
+                }
+            }
+            None => node.rect,
         };
         if node_id != boundary && area.is_empty() {
             return;

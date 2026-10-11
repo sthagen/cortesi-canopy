@@ -1,0 +1,138 @@
+use canopy::{
+    CanopyBuilder, Context, ContextExt, NodeId, ViewContext, Widget,
+    error::Result,
+    layout::{Edges, Layout, LayoutOverride},
+};
+use canopy_widgets::{CanvasWidth, Container, Frame, Selectable, Text};
+
+/// Text sample using the default tab stop.
+const DEFAULT_TEXT: &str = concat!(
+    "col1\tcol2\tcol3\n",
+    "wide\t界\twide\n",
+    "align\tcols\tmore\n",
+    "final\trow\tend",
+);
+/// Text sample exercising wrap width and custom style.
+const WRAP_TEXT: &str = concat!(
+    "alpha\tbeta\tgamma delta epsilon zeta eta theta iota kappa lambda mu\n",
+    "nu xi omicron pi rho sigma tau upsilon phi chi psi omega",
+);
+/// Text sample exercising intrinsic canvas width and a custom tab stop.
+const INTRINSIC_TEXT: &str = concat!(
+    "col1\tcol2\tcol3\n",
+    "tab8\twide\tcolumns\n",
+    "longer\trow\tfor scroll",
+);
+/// Text sample exercising fixed canvas width and selected styling.
+const FIXED_TEXT: &str = concat!(
+    "selected style enabled\n",
+    "0123456789\tabcdef\n",
+    "wrapless\tline\tcontent",
+);
+
+/// Demo node that displays multiple text variants.
+pub struct TextGym;
+
+/// Outer padding around each framed section.
+const OUTER_PADDING: u32 = 1;
+
+impl Default for TextGym {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TextGym {
+    /// Construct a new text gym demo.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Widget for TextGym {
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
+        let default_id = section(
+            c,
+            "Default (tab stop 4)",
+            Text::new(DEFAULT_TEXT).with_canvas_width(CanvasWidth::View),
+            34,
+            6,
+        )?;
+
+        let wrap_id = section(
+            c,
+            "Wrap width 24 + italic",
+            Text::new(WRAP_TEXT)
+                .with_wrap_width(24)
+                .with_style("text/italic"),
+            34,
+            7,
+        )?;
+
+        let intrinsic_id = section(
+            c,
+            "Intrinsic canvas + tab stop 8",
+            Text::new(INTRINSIC_TEXT)
+                .with_canvas_width(CanvasWidth::Intrinsic)
+                .with_tab_stop(8)
+                .with_wrap_width(32),
+            26,
+            6,
+        )?;
+
+        let mut fixed_text = Text::new(FIXED_TEXT)
+            .with_canvas_width(CanvasWidth::Fixed(40))
+            .with_selected_style("text/underline");
+        fixed_text.set_selected(true);
+        let fixed_id = section(c, "Fixed canvas 40 + selected", fixed_text, 26, 6)?;
+
+        let stack_id = c.add_child(c.node_id(), Container::column())?;
+        c.set_children(
+            stack_id.into(),
+            vec![default_id, wrap_id, intrinsic_id, fixed_id],
+        )?;
+        c.set_layout_override(c.node_id(), Layout::fill().into())?;
+        Ok(())
+    }
+}
+
+/// Wrap a text widget in a titled frame that fills a column row of `height`
+/// rows and `width` content columns.
+fn section(
+    c: &mut dyn Context,
+    title: &str,
+    text: Text,
+    width: u32,
+    height: u32,
+) -> Result<NodeId> {
+    let text_id = c.create_detached(text)?;
+    c.set_layout_override(text_id.into(), Layout::fill().into())?;
+    let frame_id = c.wrap_node(text_id, Frame::new().with_title(title))?;
+    let pad_id = c.wrap_node(frame_id, Container::padded(Edges::all(OUTER_PADDING)))?;
+    c.set_layout_override(
+        pad_id.into(),
+        LayoutOverride::from(
+            Layout::column()
+                .flex_horizontal(1)
+                .fixed_width(width.saturating_add(2 * OUTER_PADDING))
+                .fixed_height(height)
+                .padding(Edges::all(OUTER_PADDING)),
+        ),
+    )?;
+    Ok(pad_id.into())
+}
+
+/// Default bindings for the text gym demo.
+const DEFAULT_BINDINGS: &str = r#"
+root.default_bindings()
+"#;
+
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder.script("textgym", DEFAULT_BINDINGS)
+}

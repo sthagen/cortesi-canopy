@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -12,39 +13,108 @@ use futures::{StreamExt, executor::block_on};
 
 use super::*;
 use crate::{
-    Context, FocusDirection, ViewContext,
+    Context, NodeName, ViewContext,
     commands::{CommandNode, CommandSpec, CommandStatus},
-    core::world::test_support::assert_error_context,
+    core::{keyroute::BindingVerdict, world::test_support::assert_error_context},
     derive_commands,
-    error::{Error, NodeOperationKind, Result},
-    event::{Event, key, mouse},
+    error::{Error, NodeOperationKind, Result, ScriptErrorKind},
     geom::{PointI32, RectI32},
+    input::{
+        BindingActionKind, BindingId, BindingPhase, BindingTier, Event, InputSpec, KeyExpectation,
+        ModalBindings, ModalOptions, RouteOutcome, RouteWinner, key, mouse,
+    },
     layout::{Edges, Layout},
     path::Path,
     render::{NopBackend, Render},
-    state::NodeName,
+    runtime::NoticeSource,
+    script::LuauFunctionId,
+    style::Paint,
     testing::{
         backend::TestRender,
         ttree::{Ba, BaLa, BaLb, OutcomeTarget, R, get_state, reset_state, run_ttree},
     },
+    tree::FocusDirection,
     widget::{EventOutcome, Widget},
 };
 
 static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Build an application with no registrations.
+fn app() -> Canopy {
+    CanopyBuilder::new()
+        .build()
+        .expect("an empty application builds")
+}
+
+/// Build an application after one registration callback.
+fn app_with(configure: impl FnOnce(&mut Setup) -> Result<()> + 'static) -> Canopy {
+    CanopyBuilder::new()
+        .configure(configure)
+        .build()
+        .expect("the application builds")
+}
+
+/// Build an application that registers the `test.clear` intent.
+fn clear_intent_app() -> Canopy {
+    app_with(|setup| setup.register_intent(inputmap::IntentSpec::new("test.clear", "Clear")?))
+}
+
+/// Install an application binding on a running application, as a script's
+/// `canopy.bind` does.
+fn bind(
+    canopy: &mut Canopy,
+    input: impl Into<InputSpec>,
+    options: inputmap::BindingOptions,
+    target: inputmap::BindingAction,
+) -> Result<inputmap::BindingId> {
+    let (id, removed) = canopy.core.input_map.bind(input.into(), options, target)?;
+    canopy.release_removed_bindings(removed);
+    Ok(id)
+}
+
+/// Install an application command binding on a running application.
+fn bind_command(
+    canopy: &mut Canopy,
+    input: impl Into<InputSpec>,
+    options: inputmap::BindingOptions,
+    command: commands::CommandCall,
+) -> Result<inputmap::BindingId> {
+    bind(
+        canopy,
+        input,
+        options,
+        inputmap::BindingAction::Command(command),
+    )
+}
+
+/// Install an application intent binding on a running application.
+fn bind_intent(
+    canopy: &mut Canopy,
+    input: impl Into<InputSpec>,
+    options: inputmap::BindingOptions,
+    action: inputmap::IntentName,
+) -> Result<inputmap::BindingId> {
+    bind(
+        canopy,
+        input,
+        options,
+        inputmap::BindingAction::Intent(action),
+    )
+}
+
 #[test]
 fn synchronous_automation_request_rejects_ui_thread() {
-    let canopy = Canopy::new();
+    let canopy = app();
     let error = canopy
         .automation_handle()
         .request(|_| Ok(()))
         .expect_err("UI-thread request should be rejected");
-    assert!(matches!(error, Error::RunLoop(_)));
+    assert!(matches!(error, Error::Driver(_)));
 }
 
 #[test]
 fn read_only_automation_service_is_bounded_without_redraw() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     let handle = canopy.automation_handle();
     let count = Arc::new(AtomicUsize::new(0));
     for _ in 0..=AUTOMATION_SERVICE_BUDGET {
@@ -54,11 +124,9 @@ fn read_only_automation_service_is_bounded_without_redraw() -> Result<()> {
         }))?;
     }
 
-    canopy.render_pending = false;
     canopy.core.changes = crate::ChangeSet::default();
     assert_eq!(canopy.service_automation(), AUTOMATION_SERVICE_BUDGET);
     assert_eq!(count.load(Ordering::Relaxed), AUTOMATION_SERVICE_BUDGET);
-    assert!(!canopy.render_pending);
     assert!(!canopy.core.changes.is_pending());
     assert_eq!(canopy.service_automation(), 1);
     assert_eq!(count.load(Ordering::Relaxed), AUTOMATION_SERVICE_BUDGET + 1);
@@ -67,21 +135,21 @@ fn read_only_automation_service_is_bounded_without_redraw() -> Result<()> {
 
 #[test]
 fn automation_submission_applies_backpressure() -> Result<()> {
-    let canopy = Canopy::new();
+    let canopy = app();
     let handle = canopy.automation_handle();
     for _ in 0..AUTOMATION_QUEUE_CAPACITY {
         handle.submit(Box::new(|_| {}))?;
     }
     assert!(matches!(
         handle.submit(Box::new(|_| {})),
-        Err(Error::RunLoop(_))
+        Err(Error::Driver(_))
     ));
     Ok(())
 }
 
 #[test]
 fn cross_thread_automation_request_completes_via_service_path() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     let mut events = canopy
         .event_rx
         .take()
@@ -96,10 +164,10 @@ fn cross_thread_automation_request_completes_via_service_path() -> Result<()> {
 }
 
 fn canopy_with_binding_order(inputs: [char; 2]) -> Result<Canopy> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     for input in inputs {
         canopy.eval_script(&format!(
-            "canopy.bind({input:?}, {{ description = \"Change mode\" }}, function() canopy.set_mode(\"next\") end)"
+            "canopy.bind({input:?}, {{ description = \"Change mode\" }}, function() canopy.enter_mode(\"next\") end)"
         ))?;
     }
     Ok(canopy)
@@ -130,77 +198,6 @@ fn help_and_diagnostics_use_canonical_binding_order() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn pending_script_finalization_failure_is_atomic_and_retryable() -> Result<()> {
-    let mut canopy = Canopy::new();
-    assert!(canopy.script_api().is_err());
-    let host = canopy.script_host.clone();
-    let first = host.compile("return 1")?;
-    let second = host.compile("return 2")?;
-    host.inject_finalize_failure(script::FinalizeStep::PendingScript(1));
-
-    canopy
-        .finalize_api()
-        .expect_err("pending script load should fail");
-    assert!(canopy.script_api().is_err());
-
-    canopy.finalize_api()?;
-    assert!(canopy.script_api().is_ok());
-    let root = canopy.root_id();
-    assert_eq!(
-        host.execute(&mut canopy, root, first, None)?,
-        commands::ArgValue::Int(1)
-    );
-    assert_eq!(
-        host.execute(&mut canopy, root, second, None)?,
-        commands::ArgValue::Int(2)
-    );
-    Ok(())
-}
-
-#[test]
-fn every_finalization_checkpoint_is_atomic_and_retryable() -> Result<()> {
-    let steps = [
-        script::FinalizeStep::SurfacePrepared,
-        script::FinalizeStep::DeclarationsValidated,
-        script::FinalizeStep::DefaultBindingsCompiled,
-        script::FinalizeStep::StartupScriptsCompiled,
-        script::FinalizeStep::RuntimeBuilt,
-        script::FinalizeStep::PendingScript(1),
-        script::FinalizeStep::BeforePublish,
-    ];
-
-    for step in steps {
-        let mut canopy = Canopy::new();
-        canopy.register_default_bindings("fault_owner", "canopy.log('default')")?;
-        canopy.register_startup_script("fault_startup", "function setup() end")?;
-        let host = canopy.script_host.clone();
-        let first = host.compile("return 1")?;
-        let second = host.compile("return 2")?;
-        host.inject_finalize_failure(step);
-
-        canopy
-            .finalize_api()
-            .expect_err(&format!("{step:?} should fail"));
-        assert!(canopy.script_api().is_err(), "{step:?}");
-        assert_eq!(host.script_ids().len(), 2, "{step:?}");
-
-        canopy.finalize_api()?;
-        assert!(canopy.script_api().is_ok(), "{step:?}");
-        assert_eq!(host.script_ids().len(), 4, "{step:?}");
-        let root = canopy.root_id();
-        assert_eq!(
-            host.execute(&mut canopy, root, first, None)?,
-            commands::ArgValue::Int(1)
-        );
-        assert_eq!(
-            host.execute(&mut canopy, root, second, None)?,
-            commands::ArgValue::Int(2)
-        );
-    }
-    Ok(())
-}
-
 pub struct PollWidget;
 
 #[derive_commands]
@@ -211,9 +208,9 @@ impl PollWidget {
 }
 
 impl Widget for PollWidget {
-    fn poll(&mut self, _ctx: &mut dyn Context) -> Option<Duration> {
+    fn poll(&mut self, _ctx: &mut dyn Context) -> Result<Option<Duration>> {
         POLL_COUNT.fetch_add(1, Ordering::SeqCst);
-        None
+        Ok(None)
     }
 }
 
@@ -314,11 +311,11 @@ fn make_mouse_event(core: &Core, node_id: NodeId) -> mouse::MouseEvent {
 #[test]
 fn render_errors_include_operation_node_and_path() -> Result<()> {
     let mut render = TestRender::new();
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     canopy
         .core
         .replace_subtree(canopy.core.root, FailRenderWidget)?;
-    canopy.set_root_size(Size::new(10, 2))?;
+    canopy.set_screen_size(Size::new(10, 2))?;
     let node_id = canopy.core.root;
     let path = canopy.core.path_of(canopy.core.root, node_id).to_string();
 
@@ -339,12 +336,12 @@ fn render_errors_include_operation_node_and_path() -> Result<()> {
 
 #[test]
 fn ignored_mouse_callback_conservatively_requests_render() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     let app_id = canopy
         .core
         .add_child_to_boxed(canopy.core.root, Box::new(StaticWidget::new()))?;
     canopy.core.set_layout_of(app_id, Layout::fill())?;
-    canopy.set_root_size(Size::new(10, 6))?;
+    canopy.set_screen_size(Size::new(10, 6))?;
 
     let mut render = TestRender::new();
     canopy.render(&mut render)?;
@@ -364,12 +361,12 @@ fn ignored_mouse_callback_conservatively_requests_render() -> Result<()> {
 
 #[test]
 fn mouse_capture_routes_drag_outside() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     let app_id = canopy
         .core
         .add_child_to_boxed(canopy.core.root, Box::new(CaptureWidget::new()))?;
     canopy.core.set_layout_of(app_id, Layout::fill())?;
-    canopy.set_root_size(Size::new(10, 6))?;
+    canopy.set_screen_size(Size::new(10, 6))?;
 
     let mut render = TestRender::new();
     canopy.render(&mut render)?;
@@ -400,7 +397,7 @@ fn mouse_capture_routes_drag_outside() -> Result<()> {
 
 #[test]
 fn mouse_routing_clears_a_stale_internal_capture() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     let stale = canopy.core.create_detached(CaptureWidget::new())?;
     canopy.core.remove_subtree(stale)?;
     canopy.core.mouse_capture = Some(stale);
@@ -419,11 +416,11 @@ fn mouse_routing_clears_a_stale_internal_capture() -> Result<()> {
 #[test]
 fn set_widget_resets_initialization() -> Result<()> {
     POLL_COUNT.store(0, Ordering::SeqCst);
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     let node_id = canopy
         .core
         .add_child_to_boxed(canopy.core.root, Box::new(PollWidget::new()))?;
-    canopy.set_root_size(Size::new(10, 10))?;
+    canopy.set_screen_size(Size::new(10, 10))?;
 
     let mut render = TestRender::new();
     canopy.render(&mut render)?;
@@ -432,31 +429,6 @@ fn set_widget_resets_initialization() -> Result<()> {
     canopy.core.replace_subtree(node_id, PollWidget::new())?;
     canopy.render(&mut render)?;
     assert_eq!(POLL_COUNT.load(Ordering::SeqCst), 2);
-    Ok(())
-}
-
-#[test]
-fn registered_native_modules_appear_once_in_the_api() -> Result<()> {
-    use ruau::module;
-
-    use crate::commands::declaration;
-
-    let mut builder = module::Builder::new("demo_module");
-    builder.constant(
-        "answer",
-        module::Binding::library("demo_module", declaration::Type::Number)
-            .doc("A registered native constant."),
-        42i64,
-    );
-    let demo = builder.build().expect("demo module builds");
-
-    let mut canopy = Canopy::new();
-    canopy.register_script_module(demo)?;
-    canopy.finalize_api()?;
-
-    let api = canopy.script_api()?;
-    assert_eq!(api.matches("declare demo_module").count(), 1);
-    assert!(api.contains("answer: number"));
     Ok(())
 }
 
@@ -508,28 +480,33 @@ fn tbindings() -> Result<()> {
 }
 
 #[test]
-fn framework_command_bindings_share_route_resolution_and_command_scope() -> Result<()> {
+fn framework_command_bindings_share_route_resolution_and_event_scope() -> Result<()> {
     run_ttree(|c, _, tree| {
-        let group = inputmap::FrameworkBindingGroup::new("test.modal");
-        let binding = c.bind_framework(
-            group,
-            'h',
+        const GROUP: inputmap::FrameworkBindingGroup =
+            inputmap::FrameworkBindingGroup::new("test.modal");
+        let group = GROUP;
+        let (binding, _) = c.core.input_map.bind(
+            'h'.into(),
             inputmap::BindingOptions {
+                show_in_help: true,
                 path: Some("/r/**/".parse()?),
-                scope: inputmap::BindingScope::Exclusive(group),
+                tier: inputmap::BindingTier::Framework(group),
                 description: "Framework root command".to_string(),
                 source: None,
-                phase: inputmap::BindingPhase::BeforeWidget,
+                phase: Some(inputmap::BindingPhase::BeforeWidget),
             },
-            R::call_c_root(),
+            inputmap::BindingAction::Command(R::call_c_root()),
         )?;
         c.core
             .input_map
-            .set_modal_bindings(Some(crate::ModalBindings::Framework(group)));
+            .set_modal_bindings(Some(ModalBindings::Framework {
+                groups: &[GROUP],
+                intents: &[],
+            }));
         c.core.set_focus(tree.a_a)?;
 
         let snapshot = c.available_bindings(None)?;
-        assert_eq!(snapshot.exclusive_group, Some(group));
+        assert_eq!(snapshot.framework_group, Some(group));
         assert_eq!(snapshot.bindings.len(), 1);
         assert_eq!(snapshot.bindings[0].id, binding);
 
@@ -538,7 +515,7 @@ fn framework_command_bindings_share_route_resolution_and_command_scope() -> Resu
 
         assert_eq!(get_state().path, ["r.c_root()"]);
         assert!(c.route_trace().iter().any(|entry| {
-            entry.phase == RoutePhase::BindingExecution && entry.detail == "Framework root command"
+            entry.kind == RouteTraceKind::RunBinding && entry.detail == "Framework root command"
         }));
         c.core.input_map.set_modal_bindings(None);
         Ok(())
@@ -553,14 +530,16 @@ fn explicit_binding_phases_override_the_same_selector_and_change_route_trace() -
             inputmap::BindingPhase::BeforeWidget,
             inputmap::BindingPhase::AfterWidget,
         ] {
-            c.bind_command(
+            bind_command(
+                c,
                 'h',
                 inputmap::BindingOptions {
+                    show_in_help: true,
                     path: Some("/r/**/".parse()?),
-                    scope: inputmap::BindingScope::Default,
+                    tier: inputmap::BindingTier::Default,
                     description: "Root action".into(),
                     source: None,
-                    phase,
+                    phase: Some(phase),
                 },
                 R::call_c_root(),
             )?;
@@ -577,17 +556,17 @@ fn explicit_binding_phases_override_the_same_selector_and_change_route_trace() -
             let phases = c
                 .route_trace()
                 .iter()
-                .map(|entry| entry.phase)
+                .map(|entry| entry.kind)
                 .collect::<Vec<_>>();
             if phase == inputmap::BindingPhase::BeforeWidget {
                 assert_eq!(get_state().path, ["r.c_root()"]);
-                assert!(phases.contains(&RoutePhase::PreEventBinding));
-                assert!(!phases.contains(&RoutePhase::WidgetEvent));
+                assert!(phases.contains(&RouteTraceKind::BeforeWidgetBinding));
+                assert!(!phases.contains(&RouteTraceKind::Widget));
             } else {
                 assert_eq!(get_state().path, ["ba_la@key->ignore", "r.c_root()"]);
-                assert!(phases.contains(&RoutePhase::PostEventBinding));
-                assert!(phases.contains(&RoutePhase::WidgetEvent));
-                assert!(!phases.contains(&RoutePhase::PreEventBinding));
+                assert!(phases.contains(&RouteTraceKind::AfterWidgetBinding));
+                assert!(phases.contains(&RouteTraceKind::Widget));
+                assert!(!phases.contains(&RouteTraceKind::BeforeWidgetBinding));
             }
         }
         Ok(())
@@ -602,11 +581,12 @@ fn click_on(core: &Core, node: NodeId) -> mouse::MouseEvent {
 /// Options for one mouse binding on the test tree.
 fn mouse_options(path: &str, phase: inputmap::BindingPhase) -> Result<inputmap::BindingOptions> {
     Ok(inputmap::BindingOptions {
+        show_in_help: true,
         path: Some(path.parse()?),
-        scope: inputmap::BindingScope::Default,
+        tier: inputmap::BindingTier::Default,
         description: "Click action".into(),
         source: None,
-        phase,
+        phase: Some(phase),
     })
 }
 
@@ -619,7 +599,8 @@ fn a_mouse_binding_runs_in_the_phase_it_declares() -> Result<()> {
             inputmap::BindingPhase::BeforeWidget,
             inputmap::BindingPhase::AfterWidget,
         ] {
-            c.bind_command(
+            bind_command(
+                c,
                 click,
                 mouse_options("/r/ba/ba_la/", phase)?,
                 BaLa::call_c_leaf(),
@@ -629,17 +610,17 @@ fn a_mouse_binding_runs_in_the_phase_it_declares() -> Result<()> {
             let phases = c
                 .route_trace()
                 .iter()
-                .map(|entry| entry.phase)
+                .map(|entry| entry.kind)
                 .collect::<Vec<_>>();
             if phase == inputmap::BindingPhase::BeforeWidget {
                 // The early binding takes the click instead of the widget.
                 assert_eq!(get_state().path, ["ba_la.c_leaf()"]);
-                assert!(phases.contains(&RoutePhase::PreEventBinding));
-                assert!(!phases.contains(&RoutePhase::WidgetEvent));
+                assert!(phases.contains(&RouteTraceKind::BeforeWidgetBinding));
+                assert!(!phases.contains(&RouteTraceKind::Widget));
             } else {
                 assert_eq!(get_state().path, ["ba_la@mouse->ignore", "ba_la.c_leaf()"]);
-                assert!(phases.contains(&RoutePhase::PostEventBinding));
-                assert!(!phases.contains(&RoutePhase::PreEventBinding));
+                assert!(phases.contains(&RouteTraceKind::AfterWidgetBinding));
+                assert!(!phases.contains(&RouteTraceKind::BeforeWidgetBinding));
             }
         }
         Ok(())
@@ -654,7 +635,8 @@ fn one_winner_decides_each_route_node_and_phases_stay_local() -> Result<()> {
         // An ancestor's early binding is early only at the ancestor. The leaf's
         // widget still sees the click first, because the route reaches the leaf
         // before the ancestor exists as a route node at all.
-        c.bind_command(
+        bind_command(
+            c,
             click,
             mouse_options("/r/", inputmap::BindingPhase::BeforeWidget)?,
             R::call_c_root(),
@@ -669,7 +651,8 @@ fn one_winner_decides_each_route_node_and_phases_stay_local() -> Result<()> {
         // A more specific path wins at the leaf, and its phase is the one the
         // leaf uses. The ancestor binding never runs, because the route ends at
         // the first node that acts.
-        c.bind_command(
+        bind_command(
+            c,
             click,
             mouse_options("/r/**/ba_la/", inputmap::BindingPhase::BeforeWidget)?,
             BaLa::call_c_leaf(),
@@ -680,7 +663,8 @@ fn one_winner_decides_each_route_node_and_phases_stay_local() -> Result<()> {
 
         // A widget that handles the click ends the route before the winning
         // late binding at that node, and no second binding is tried.
-        c.bind_command(
+        bind_command(
+            c,
             click,
             mouse_options("/r/**/ba_la/", inputmap::BindingPhase::AfterWidget)?,
             BaLa::call_c_leaf(),
@@ -732,13 +716,12 @@ impl Widget for ClickProbe {
 
 #[test]
 fn early_mouse_bindings_keep_capture_and_node_local_coordinates() -> Result<()> {
-    let mut c = Canopy::new();
-    c.add_commands::<ClickProbe>()?;
+    let mut c = app_with(|setup| setup.add_commands::<ClickProbe>());
     let probe = c.core.create_detached(ClickProbe { seen: Vec::new() })?;
     c.core.set_children(c.core.root, vec![probe])?;
     c.core
         .set_layout_of(c.core.root, Layout::fill().padding(Edges::all(4)))?;
-    c.set_root_size(Size::new(40, 20))?;
+    c.set_screen_size(Size::new(40, 20))?;
     c.core.update_layout(Size::new(40, 20))?;
 
     let drag = inputmap::InputSpec::Mouse(
@@ -750,7 +733,8 @@ fn early_mouse_bindings_keep_capture_and_node_local_coordinates() -> Result<()> 
         }
         .into(),
     );
-    c.bind_command(
+    bind_command(
+        &mut c,
         drag,
         mouse_options("/root/click_probe/", inputmap::BindingPhase::BeforeWidget)?,
         ClickProbe::call_note(),
@@ -809,6 +793,8 @@ fn early_mouse_bindings_keep_capture_and_node_local_coordinates() -> Result<()> 
 
 #[test]
 fn an_early_mouse_binding_respects_modal_admission_and_wheel_fallback() -> Result<()> {
+    const GROUP: inputmap::FrameworkBindingGroup =
+        inputmap::FrameworkBindingGroup::new("test.modal");
     run_ttree(|c, mut tr, tree| {
         c.render(&mut tr)?;
         let wheel = inputmap::InputSpec::Mouse(
@@ -822,7 +808,8 @@ fn an_early_mouse_binding_respects_modal_admission_and_wheel_fallback() -> Resul
         );
         // An unbound wheel still reaches its default action rather than an
         // early binding that does not match this route.
-        c.bind_command(
+        bind_command(
+            c,
             wheel,
             mouse_options("/r/bb/**/", inputmap::BindingPhase::BeforeWidget)?,
             R::call_c_root(),
@@ -837,21 +824,24 @@ fn an_early_mouse_binding_respects_modal_admission_and_wheel_fallback() -> Resul
             "a binding outside the route never runs"
         );
 
-        // An exclusive group blocks application bindings whatever their phase.
-        let group = inputmap::FrameworkBindingGroup::new("test.modal");
-        c.bind_command(
+        // A framework group blocks application bindings whatever their phase.
+        bind_command(
+            c,
             inputmap::InputSpec::Mouse(click_on(&c.core, tree.a_a).into()),
             mouse_options("/r/**/", inputmap::BindingPhase::BeforeWidget)?,
             R::call_c_root(),
         )?;
         c.core
             .input_map
-            .set_modal_bindings(Some(crate::ModalBindings::Framework(group)));
+            .set_modal_bindings(Some(ModalBindings::Framework {
+                groups: &[GROUP],
+                intents: &[],
+            }));
         reset_state();
         c.mouse(None, click_on(&c.core, tree.a_a))?;
         assert!(
             !get_state().path.contains(&"r.c_root()".to_string()),
-            "an exclusive group blocks an early application binding"
+            "a framework group blocks an early application binding"
         );
         c.core.input_map.set_modal_bindings(None);
         Ok(())
@@ -906,8 +896,7 @@ impl Widget for Gated {
 
 /// Build a root and one child, both gated, with the child focused.
 fn gated_pair() -> Result<(Canopy, NodeId, NodeId)> {
-    let mut canopy = Canopy::new();
-    canopy.add_commands::<Gated>()?;
+    let mut canopy = app_with(|setup| setup.add_commands::<Gated>());
     canopy.core.replace_subtree(
         canopy.core.root,
         Gated {
@@ -939,23 +928,26 @@ fn gated_runs(canopy: &mut Canopy, nodes: [NodeId; 2]) -> [usize; 2] {
 /// Options for one gated binding.
 fn gated_options(path: &str) -> Result<inputmap::BindingOptions> {
     Ok(inputmap::BindingOptions {
+        show_in_help: true,
         path: Some(path.parse()?),
-        scope: inputmap::BindingScope::Default,
+        tier: inputmap::BindingTier::Default,
         description: "Act".into(),
         source: None,
-        phase: inputmap::BindingPhase::AfterWidget,
+        phase: Some(inputmap::BindingPhase::AfterWidget),
     })
 }
 
 #[test]
 fn a_disabled_declarative_winner_is_consumed_without_running_or_bubbling() -> Result<()> {
     let (mut canopy, root, child) = gated_pair()?;
-    canopy.bind_command(
+    bind_command(
+        &mut canopy,
         'g',
         gated_options("/gated/gated/")?,
         Gated::call_act().with_target(commands::CommandTarget::Exact(child)),
     )?;
-    canopy.bind_command(
+    bind_command(
+        &mut canopy,
         'g',
         gated_options("/gated/")?,
         Gated::call_act().with_target(commands::CommandTarget::Exact(root)),
@@ -975,7 +967,7 @@ fn a_disabled_declarative_winner_is_consumed_without_running_or_bubbling() -> Re
         "the trace names the reason"
     );
     assert!(
-        canopy.core.current_command_scope().is_none(),
+        canopy.core.current_event().is_none(),
         "the skipped binding restored the event scope"
     );
 
@@ -987,12 +979,119 @@ fn a_disabled_declarative_winner_is_consumed_without_running_or_bubbling() -> Re
     })?;
     canopy.key(None, 'g')?;
     assert_eq!(gated_runs(&mut canopy, [root, child]), [0, 1]);
-    assert!(canopy.core.current_command_scope().is_none());
+    assert!(canopy.core.current_event().is_none());
+    Ok(())
+}
+
+/// Focusable widget whose key handler and command fail.
+struct Faulty {
+    /// Whether the failure is a runtime failure rather than the widget's own.
+    fatal: bool,
+}
+
+#[derive_commands]
+impl Faulty {
+    /// Fail as an application does.
+    #[command]
+    fn fail(&self) -> Result<()> {
+        Err(Error::App("command failed".into()))
+    }
+}
+
+/// Build a root holding one focused faulty child.
+fn faulty_app(fatal: bool) -> Result<(Canopy, NodeId)> {
+    let mut canopy = app_with(|setup| setup.add_commands::<Faulty>());
+    let child = canopy.core.create_detached(Faulty { fatal })?;
+    let root = canopy.core.root;
+    canopy.core.set_children(root, vec![child])?;
+    canopy.core.set_focus(child)?;
+    Ok((canopy, child))
+}
+
+impl Widget for Faulty {
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn on_event(&mut self, event: &Event, _ctx: &mut dyn Context) -> Result<EventOutcome> {
+        match event {
+            Event::Key(_) if self.fatal => Err(Error::Internal("handler broke".into())),
+            Event::Key(_) => Err(Error::App("handler failed".into())),
+            _ => Ok(EventOutcome::Ignore),
+        }
+    }
+
+    fn key_outcome(&self, _key: key::Key, _ctx: &dyn ViewContext) -> EventOutcome {
+        EventOutcome::Handle
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("faulty")
+    }
+}
+
+#[test]
+fn a_widget_handler_failure_is_a_notice_unless_it_is_a_runtime_failure() -> Result<()> {
+    let (mut canopy, child) = faulty_app(false)?;
+    canopy.key(None, 'x')?;
+    let notice = canopy
+        .notices()
+        .last()
+        .expect("the handler failure is a notice");
+    assert_eq!(notice.source, NoticeSource::Widget);
+    assert_eq!(notice.node, Some(child));
+    assert_eq!(notice.message, "handler failed");
+    assert_eq!(
+        canopy.route_trace().last().map(|entry| entry.kind),
+        Some(RouteTraceKind::Notice)
+    );
+
+    canopy.core.with_widget_dyn_mut(child, |widget, _| {
+        if let Some(faulty) = (widget as &mut dyn Any).downcast_mut::<Faulty>() {
+            faulty.fatal = true;
+        }
+    })?;
+    assert!(
+        canopy.key(None, 'x').is_err(),
+        "a runtime failure in a handler stays fatal"
+    );
+    assert_eq!(canopy.notices().len(), 1);
     Ok(())
 }
 
 #[test]
-fn binding_failures_propagate_and_still_restore_the_event_scope() -> Result<()> {
+fn a_script_call_still_raises_a_failing_command() -> Result<()> {
+    let (mut canopy, _child) = faulty_app(false)?;
+    assert!(
+        canopy
+            .eval_script(r#"canopy.call_focus("faulty::fail")"#)
+            .is_err(),
+        "a script call raises the failure"
+    );
+    assert!(
+        canopy.notices().is_empty(),
+        "a script call records no notice"
+    );
+
+    // A key a script sends routes as input, so its binding's failure is a
+    // notice the script can read.
+    canopy.eval_script(
+        r#"
+        canopy.bind("g", { description = "Fail", phase = "before_widget" }, command.faulty.fail())
+        canopy.send_key("g")
+        local notices = canopy.notices()
+        canopy.assert(#notices == 1, "one notice")
+        canopy.assert(notices[1].source == "binding", "from a binding")
+        canopy.assert(notices[1].kind == "command_exec", "a command failure")
+        canopy.assert(notices[1].message == "command failed", notices[1].message)
+        canopy.assert(notices[1].node ~= nil, "on a node")
+        "#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn binding_failures_become_notices_and_still_restore_the_event_scope() -> Result<()> {
     let (mut canopy, root, child) = gated_pair()?;
     canopy.core.with_widget_dyn_mut(child, |widget, _| {
         if let Some(gated) = (widget as &mut dyn Any).downcast_mut::<Gated>() {
@@ -1000,55 +1099,83 @@ fn binding_failures_propagate_and_still_restore_the_event_scope() -> Result<()> 
             gated.fail = true;
         }
     })?;
-    canopy.bind_command(
+    bind_command(
+        &mut canopy,
         'g',
         gated_options("/gated/gated/")?,
         Gated::call_act().with_target(commands::CommandTarget::Exact(child)),
     )?;
-    assert!(
-        canopy.key(None, 'g').is_err(),
-        "an executed command's failure is not swallowed"
-    );
+    canopy.key(None, 'g')?;
     assert_eq!(gated_runs(&mut canopy, [root, child]), [0, 1]);
-    assert!(canopy.core.current_command_scope().is_none());
+    assert!(canopy.core.current_event().is_none());
+    let notice = canopy.notices().last().expect("the failure is a notice");
+    assert_eq!(notice.source, NoticeSource::Binding);
+    assert_eq!(notice.node, Some(child));
+    assert_eq!(notice.kind, ScriptErrorKind::CommandExecution);
+    assert_eq!(
+        canopy.route_trace().last().map(|entry| entry.kind),
+        Some(RouteTraceKind::Notice),
+        "the route trace records the notice"
+    );
+    assert!(canopy.core.notices.shown().is_some(), "the notice is shown");
 
-    // An opaque script callback reports its own failure the same way.
+    // An opaque script callback's failure becomes a notice the same way, and
+    // the key dismisses the one shown before it.
     canopy.eval_script(
         r#"canopy.bind("s", { description = "Fail" }, function() error("script failed") end)"#,
     )?;
-    assert!(canopy.key(None, 's').is_err());
-    assert!(canopy.core.current_command_scope().is_none());
+    canopy.key(None, 's')?;
+    assert!(canopy.core.current_event().is_none());
+    assert_eq!(canopy.notices().len(), 2);
+    let notice = canopy
+        .notices()
+        .last()
+        .expect("the script failure is a notice");
+    assert!(
+        notice.message.contains("script failed"),
+        "{}",
+        notice.message
+    );
+
+    // Input with no failure dismisses the shown notice and keeps the record.
+    canopy.key(None, 'z')?;
+    assert!(canopy.core.notices.shown().is_none());
+    assert_eq!(canopy.notices().len(), 2);
     Ok(())
 }
 
 #[test]
-fn input_mode_binding_target_switches_modes() -> Result<()> {
-    let mut canopy = Canopy::new();
-    canopy.eval_script(r#"canopy.bind("i", { description = "Insert mode" }, function() canopy.set_mode("insert") end)"#)?;
+fn mode_binding_target_switches_modes() -> Result<()> {
+    let mut canopy = app();
+    canopy.eval_script(r#"canopy.bind("i", { description = "Insert mode" }, function() canopy.enter_mode("insert") end)"#)?;
 
     canopy.key(None, 'i')?;
 
-    assert_eq!(canopy.input_mode(), "insert");
+    assert_eq!(canopy.mode(), "insert");
     assert!(
         canopy
             .route_trace()
             .iter()
-            .any(|entry| entry.phase == RoutePhase::BindingExecution)
+            .any(|entry| entry.kind == RouteTraceKind::RunBinding)
     );
     Ok(())
 }
 
 #[test]
 fn a_transient_mode_takes_the_next_key_before_widgets() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     canopy.eval_script(
         r#"
-        canopy.bind("z", { description = "Default z" }, function() canopy.set_mode("default") end)
+        canopy.bind("z", { description = "Default z" }, function() canopy.enter_mode("default") end)
         canopy.keymap({
             mode = "prefix",
-            { key = "y", description = "Prefix y", action = function() canopy.push_mode("after") end },
+            { key = "y", description = "Prefix y", action = function() canopy.enter_mode("after") end },
         })
-        canopy.push_mode("prefix", { transient = true })
+        "#,
+    )?;
+    open_menu(&mut canopy, "prefix")?;
+    canopy.eval_script(
+        r#"
         local snapshot = canopy.available_bindings()
         canopy.assert(snapshot.transient_mode == "prefix", "the snapshot names the transient mode")
         "#,
@@ -1057,23 +1184,23 @@ fn a_transient_mode_takes_the_next_key_before_widgets() -> Result<()> {
         canopy
             .route_trace()
             .iter()
-            .map(|entry| entry.phase)
+            .map(|entry| entry.kind)
             .collect::<Vec<_>>()
     };
 
     // The mode pops before its binding runs, so the binding can push a mode.
     canopy.key(None, 'y')?;
     assert_eq!(canopy.core.input_map.active_modes(), ["after"]);
-    assert!(phases(&canopy).contains(&RoutePhase::BindingExecution));
-    assert!(!phases(&canopy).contains(&RoutePhase::WidgetEvent));
+    assert!(phases(&canopy).contains(&RouteTraceKind::RunBinding));
+    assert!(!phases(&canopy).contains(&RouteTraceKind::Widget));
 
     // A key the mode does not bind only pops it.
-    canopy.set_input_mode("");
-    canopy.push_transient_input_mode("prefix");
+    clear_modes(&mut canopy)?;
+    open_menu(&mut canopy, "prefix")?;
     canopy.key(None, 'z')?;
-    assert_eq!(canopy.input_mode(), "");
-    assert!(!phases(&canopy).contains(&RoutePhase::BindingExecution));
-    assert!(!phases(&canopy).contains(&RoutePhase::WidgetEvent));
+    assert_eq!(canopy.mode(), "");
+    assert!(!phases(&canopy).contains(&RouteTraceKind::RunBinding));
+    assert!(!phases(&canopy).contains(&RouteTraceKind::Widget));
     Ok(())
 }
 
@@ -1085,20 +1212,22 @@ fn mode_hooks_run_once_for_each_mode_change() -> Result<()> {
         Ok(())
     }
 
-    let mut canopy = Canopy::new();
-    canopy.set_root_size(Size::new(10, 4))?;
+    let mut canopy = app_with(|setup| {
+        setup.register_mode_hook("test.count", count);
+        Ok(())
+    });
+    canopy.set_screen_size(Size::new(10, 4))?;
     let mut backend = NopBackend::new();
     canopy.render(&mut backend)?;
-    canopy.register_mode_hook("test.count", count);
     canopy.render(&mut backend)?;
     assert_eq!(RUNS.load(Ordering::Relaxed), 0, "no mode change yet");
 
-    canopy.push_transient_input_mode("prefix");
+    open_menu(&mut canopy, "prefix")?;
     canopy.render(&mut backend)?;
     canopy.render(&mut backend)?;
     assert_eq!(RUNS.load(Ordering::Relaxed), 1);
 
-    canopy.pop_input_mode();
+    canopy.core.input_map.close_menu();
     canopy.render(&mut backend)?;
     assert_eq!(RUNS.load(Ordering::Relaxed), 2);
     Ok(())
@@ -1112,13 +1241,13 @@ fn route_trace_records_unhandled_key_pipeline() -> Result<()> {
         let phases = c
             .route_trace()
             .iter()
-            .map(|entry| entry.phase)
+            .map(|entry| entry.kind)
             .collect::<Vec<_>>();
 
-        assert!(phases.contains(&RoutePhase::Target));
-        assert!(phases.contains(&RoutePhase::WidgetEvent));
-        assert!(phases.contains(&RoutePhase::Bubble));
-        assert!(phases.contains(&RoutePhase::Unhandled));
+        assert!(phases.contains(&RouteTraceKind::Start));
+        assert!(phases.contains(&RouteTraceKind::Widget));
+        assert!(phases.contains(&RouteTraceKind::Bubble));
+        assert!(phases.contains(&RouteTraceKind::Unhandled));
         assert!(c.diagnostic_dump(tree.a_a).contains("route trace:"));
         Ok(())
     })?;
@@ -1127,16 +1256,15 @@ fn route_trace_records_unhandled_key_pipeline() -> Result<()> {
 
 #[test]
 fn register_default_bindings_is_idempotent_for_identical_scripts() -> Result<()> {
-    run_ttree(|c, _, _| {
-        c.register_default_bindings("r", "canopy.log(\"once\")")?;
-        c.register_default_bindings("r", "canopy.log(\"once\")")?;
+    let mut setup = Setup::new();
+    setup.add_commands::<R>()?;
+    setup.register_default_bindings("r", "canopy.log(\"once\")")?;
+    setup.register_default_bindings("r", "canopy.log(\"once\")")?;
 
-        let err = c
-            .register_default_bindings("r", "canopy.log(\"twice\")")
-            .unwrap_err();
-        assert!(matches!(err, error::Error::Invalid(_)));
-        Ok(())
-    })?;
+    let err = setup
+        .register_default_bindings("r", "canopy.log(\"twice\")")
+        .unwrap_err();
+    assert!(matches!(err, error::Error::Invalid(_)));
     Ok(())
 }
 
@@ -1302,7 +1430,7 @@ fn tresize() -> Result<()> {
             RectI32::new(half, 0, size / 2, size)
         );
 
-        c.set_root_size(Size::new(50, 50))?;
+        c.set_screen_size(Size::new(50, 50))?;
         c.render(&mut tr)?;
         assert_eq!(c.core.nodes[tree.b].view.outer, RectI32::new(25, 0, 25, 50));
         Ok(())
@@ -1501,26 +1629,29 @@ fn tkey_no_render() -> Result<()> {
             Ok(outcome)
         }
 
+        fn key_outcome(&self, _key: key::Key, _ctx: &dyn ViewContext) -> EventOutcome {
+            EventOutcome::Handle
+        }
+
         fn name(&self) -> NodeName {
             NodeName::convert("n")
         }
     }
 
     let mut tr = TestRender::new();
-    let mut canopy = Canopy::new();
-    canopy.add_commands::<N>()?;
+    let mut canopy = app_with(|setup| setup.add_commands::<N>());
     canopy.core.replace_subtree(canopy.core.root, N)?;
 
-    canopy.set_root_size(Size::new(10, 1))?;
+    canopy.set_screen_size(Size::new(10, 1))?;
     canopy.core.set_focus(canopy.core.root)?;
     canopy.render(&mut tr)?;
     assert!(!tr.buf_empty());
-    let prev_buf = canopy.termbuf.clone().expect("missing termbuf");
+    let prev_buf = canopy.published_buf().cloned().expect("missing buffer");
     tr.text.clear();
 
     canopy.key(None, 'a')?;
     canopy.render(&mut tr)?;
-    let next_buf = canopy.termbuf.clone().expect("missing termbuf");
+    let next_buf = canopy.published_buf().cloned().expect("missing buffer");
     assert_eq!(prev_buf.cells, next_buf.cells);
     Ok(())
 }
@@ -1555,7 +1686,7 @@ fn zero_size_child_ok() -> Result<()> {
 
     let size = Size::new(5, 1);
     let mut cr = NopBackend::new();
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     canopy
         .core
         .replace_subtree(canopy.core.root, Parent::new())?;
@@ -1566,34 +1697,1385 @@ fn zero_size_child_ok() -> Result<()> {
         .core
         .set_layout_of(child, Layout::column().fixed_width(0).fixed_height(0))?;
 
-    canopy.set_root_size(size)?;
+    canopy.set_screen_size(size)?;
     canopy.render(&mut cr)?;
     Ok(())
 }
 
 #[test]
 fn visible_render_limits_reject_sizes_before_publication() -> Result<()> {
-    let mut canopy = Canopy::new();
+    let mut canopy = app();
     assert!(matches!(
-        canopy.set_root_size(Size::new(2049, 1)),
+        canopy.set_screen_size(Size::new(2049, 1)),
         Err(Error::RenderWidthLimit { .. })
     ));
-    assert_eq!(canopy.root_size, None);
+    assert_eq!(canopy.frame.screen_size, None);
 
-    canopy.set_render_limits(RenderLimits::new(4, 4, 15))?;
+    let mut canopy = app_with(|setup| {
+        setup.set_render_limits(RenderLimits::new(4, 4, 15));
+        Ok(())
+    });
     assert!(matches!(
-        canopy.set_root_size(Size::new(4, 4)),
+        canopy.set_screen_size(Size::new(4, 4)),
         Err(Error::RenderCellLimit { .. })
     ));
-    assert_eq!(canopy.root_size, None);
+    assert_eq!(canopy.frame.screen_size, None);
 
     let accepted = RenderLimits::new(4, 4, 16);
-    canopy.set_render_limits(accepted)?;
-    canopy.set_root_size(Size::new(4, 4))?;
-    assert!(matches!(
-        canopy.set_render_limits(RenderLimits::new(3, 4, 16)),
-        Err(Error::RenderWidthLimit { .. })
-    ));
-    assert_eq!(canopy.render_limits, accepted);
+    let mut canopy = app_with(move |setup| {
+        setup.set_render_limits(accepted);
+        Ok(())
+    });
+    canopy.set_screen_size(Size::new(4, 4))?;
+    assert_eq!(canopy.frame.render_limits, accepted);
     Ok(())
+}
+
+/// Handles and predicts `Handle` for `x`, and ignores every other key.
+struct PredictingLeaf;
+
+impl Widget for PredictingLeaf {
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn on_event(&mut self, event: &Event, _ctx: &mut dyn Context) -> Result<EventOutcome> {
+        Ok(match event {
+            Event::Key(key) if *key == 'x' => EventOutcome::Handle,
+            _ => EventOutcome::Ignore,
+        })
+    }
+
+    fn key_outcome(&self, key: key::Key, _context: &dyn ViewContext) -> EventOutcome {
+        if key == 'x' {
+            EventOutcome::Handle
+        } else {
+            EventOutcome::Ignore
+        }
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("predicting_leaf")
+    }
+}
+
+/// Keeps the default prediction and ignores every key.
+struct PlainLeaf;
+
+impl Widget for PlainLeaf {
+    fn name(&self) -> NodeName {
+        NodeName::convert("plain_leaf")
+    }
+}
+
+/// Predicts `Ignore` for every key but handles them anyway.
+struct OverclaimingLeaf;
+
+impl Widget for OverclaimingLeaf {
+    fn on_event(&mut self, event: &Event, _ctx: &mut dyn Context) -> Result<EventOutcome> {
+        Ok(if matches!(event, Event::Key(_)) {
+            EventOutcome::Handle
+        } else {
+            EventOutcome::Ignore
+        })
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("overclaiming_leaf")
+    }
+}
+
+/// Predicts `Handle` for every key but ignores them.
+struct UnderclaimingLeaf;
+
+impl Widget for UnderclaimingLeaf {
+    fn on_event(&mut self, _event: &Event, _ctx: &mut dyn Context) -> Result<EventOutcome> {
+        Ok(EventOutcome::Ignore)
+    }
+
+    fn key_outcome(&self, _key: key::Key, _context: &dyn ViewContext) -> EventOutcome {
+        EventOutcome::Handle
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("underclaiming_leaf")
+    }
+}
+
+/// Attach a leaf and focus it.
+fn focused_leaf<W: Widget + 'static>(canopy: &mut Canopy, widget: W) -> Result<NodeId> {
+    let leaf = canopy.core.create_detached(widget)?;
+    canopy.core.attach(canopy.root_id(), leaf)?;
+    canopy.core.set_focus(leaf)?;
+    Ok(leaf)
+}
+
+/// Bind an opaque script callback to one character.
+fn bind_key(canopy: &mut Canopy, key: char) -> Result<BindingId> {
+    bind_key_phase(canopy, key, BindingPhase::AfterWidget)
+}
+
+/// Bind an opaque script callback with an explicit phase.
+fn bind_key_phase(canopy: &mut Canopy, key: char, phase: BindingPhase) -> Result<BindingId> {
+    use crate::input::{BindingAction, BindingOptions};
+    let (id, _) = canopy.core.input_map.bind(
+        InputSpec::Key(key.into()),
+        BindingOptions {
+            show_in_help: true,
+            path: None,
+            tier: BindingTier::Default,
+            description: "Test binding".to_string(),
+            source: None,
+            phase: Some(phase),
+        },
+        BindingAction::Script(LuauFunctionId::for_test(1)),
+    )?;
+    Ok(id)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "key prediction mismatch")]
+fn an_ignored_prediction_that_handles_panics_in_debug() {
+    let mut canopy = app();
+    focused_leaf(&mut canopy, OverclaimingLeaf).expect("leaf mounted");
+    canopy.key(None, 'x').expect("route dispatched");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "key prediction mismatch")]
+fn a_handled_prediction_that_ignores_panics_in_debug() {
+    let mut canopy = app();
+    focused_leaf(&mut canopy, UnderclaimingLeaf).expect("leaf mounted");
+    canopy.key(None, 'x').expect("route dispatched");
+}
+
+#[test]
+fn a_prediction_mismatch_records_a_route_trace_entry() {
+    let mut canopy = app();
+    focused_leaf(&mut canopy, OverclaimingLeaf).expect("leaf mounted");
+    // A debug build also fails an assertion once the entry is recorded.
+    let _outcome = catch_unwind(AssertUnwindSafe(|| canopy.key(None, 'x')));
+    assert!(canopy.route_trace().iter().any(|entry| {
+        entry.kind == RouteTraceKind::Widget
+            && entry.detail == "key prediction mismatch: predicted Ignore, actual Handle"
+    }));
+}
+
+#[test]
+fn explain_key_reports_a_widget_outcome_for_the_focus() -> Result<()> {
+    let mut canopy = app();
+    let leaf = focused_leaf(&mut canopy, PredictingLeaf)?;
+    let explanation = canopy.explain_key(Some(leaf), 'x'.into())?;
+    assert_eq!(explanation.focus, leaf);
+    assert_eq!(
+        explanation.outcome,
+        RouteOutcome::Widget {
+            node: leaf,
+            path: Path::from("/root/predicting_leaf")
+        }
+    );
+    assert_eq!(explanation.steps.len(), 1);
+    assert_eq!(explanation.steps[0].widget, EventOutcome::Handle);
+    Ok(())
+}
+
+#[test]
+fn a_default_prediction_passes_the_key_to_an_after_widget_binding() -> Result<()> {
+    let mut canopy = app();
+    let leaf = focused_leaf(&mut canopy, PlainLeaf)?;
+    let id = bind_key(&mut canopy, 'q')?;
+    let explanation = canopy.explain_key(Some(leaf), 'q'.into())?;
+    assert_eq!(
+        explanation.outcome.winner().map(|winner| winner.binding),
+        Some(id)
+    );
+    assert_eq!(explanation.steps[0].node, leaf);
+    assert_eq!(explanation.steps[0].widget, EventOutcome::Ignore);
+    assert_eq!(
+        explanation.steps[0].binding.map(|binding| binding.phase),
+        Some(BindingPhase::AfterWidget)
+    );
+    Ok(())
+}
+
+#[test]
+fn send_key_checked_delivers_a_matching_binding_from_a_script() -> Result<()> {
+    let mut canopy = app();
+    // The check runs from evaluated source, so a replay that records the
+    // source repeats it.
+    canopy.eval_script(
+        r#"
+        canopy.bind("x", { description = "Switch" }, function() canopy.enter_mode("ran") end)
+        local active = canopy.available_bindings()
+        canopy.send_key_checked("x", { kind = "binding", binding = active.bindings[1].id })
+        "#,
+    )?;
+    assert_eq!(canopy.mode(), "ran");
+    Ok(())
+}
+
+#[test]
+fn send_key_checked_allows_a_widget_to_suppress_an_after_widget_binding() -> Result<()> {
+    let mut canopy = app();
+    let leaf = focused_leaf(&mut canopy, PredictingLeaf)?;
+    bind_key(&mut canopy, 'x')?;
+
+    canopy.send_key_checked('x', KeyExpectation::Widget(leaf))?;
+
+    assert!(
+        !canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.kind == RouteTraceKind::RunBinding)
+    );
+    Ok(())
+}
+
+#[test]
+fn send_key_checked_accepts_an_unhandled_route_at_a_modal_boundary() -> Result<()> {
+    let mut canopy = app();
+    let modal = focused_leaf(&mut canopy, PredictingLeaf)?;
+    canopy.core.open_modal(ModalOptions {
+        owner: canopy.root_id(),
+        modal,
+        initial_focus: modal,
+        dim_target: None,
+        bindings: ModalBindings::Application,
+    })?;
+
+    canopy.send_key_checked('u', KeyExpectation::Unhandled)?;
+
+    assert!(
+        !canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.kind == RouteTraceKind::RunBinding)
+    );
+    Ok(())
+}
+
+/// Open a modal over a focused leaf and return the leaf.
+fn modal_leaf(canopy: &mut Canopy, bindings: ModalBindings) -> Result<NodeId> {
+    let modal = focused_leaf(canopy, PredictingLeaf)?;
+    canopy.core.open_modal(ModalOptions {
+        owner: canopy.root_id(),
+        modal,
+        initial_focus: modal,
+        dim_target: None,
+        bindings,
+    })?;
+    Ok(modal)
+}
+
+/// Open `mode` as a menu that waits for one key, as a menu binding does.
+fn open_menu(canopy: &mut Canopy, mode: &str) -> Result<()> {
+    canopy.core.input_map.open_menu(mode)
+}
+
+/// Leave every active mode.
+fn clear_modes(canopy: &mut Canopy) -> Result<()> {
+    let modes: Vec<String> = canopy
+        .active_modes()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for mode in modes {
+        canopy.leave_mode(&mode)?;
+    }
+    Ok(())
+}
+
+/// Bind a default-tier `z` and a `prefix` mode `y`, each entering a mode.
+fn bind_prefix_mode(canopy: &mut Canopy) -> Result<()> {
+    canopy.eval_script(
+        r#"
+        canopy.bind("z", { description = "Default z" }, function() canopy.enter_mode("default_ran") end)
+        canopy.keymap({
+            mode = "prefix",
+            { key = "y", description = "Prefix y", action = function() canopy.enter_mode("after") end },
+        })
+        "#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn a_transient_mode_under_an_application_modal_takes_the_next_key() -> Result<()> {
+    let mut canopy = app();
+    modal_leaf(&mut canopy, ModalBindings::Application)?;
+    bind_prefix_mode(&mut canopy)?;
+
+    // Discovery, analysis, and routing agree that the mode takes the key.
+    open_menu(&mut canopy, "prefix")?;
+    let snapshot = canopy.available_bindings(None)?;
+    assert_eq!(snapshot.transient_mode.as_deref(), Some("prefix"));
+    assert_eq!(
+        snapshot
+            .bindings
+            .iter()
+            .map(|binding| binding.description.as_str())
+            .collect::<Vec<_>>(),
+        ["Prefix y"]
+    );
+    assert!(matches!(
+        canopy.explain_key(None, 'y'.into())?.outcome,
+        RouteOutcome::Transient(_)
+    ));
+    canopy.key(None, 'y')?;
+    assert_eq!(
+        canopy.core.input_map.active_modes(),
+        ["after"],
+        "the mode pops before its binding runs"
+    );
+
+    // A key the mode does not bind pops it without reaching the default tier.
+    clear_modes(&mut canopy)?;
+    open_menu(&mut canopy, "prefix")?;
+    assert_eq!(
+        canopy.explain_key(None, 'z'.into())?.outcome,
+        RouteOutcome::TransientDismiss
+    );
+    canopy.key(None, 'z')?;
+    assert!(canopy.core.input_map.active_modes().is_empty());
+
+    // Once the mode has popped, the default tier is reachable again.
+    assert!(matches!(
+        canopy.explain_key(None, 'z'.into())?.outcome,
+        RouteOutcome::Binding(RouteWinner {
+            phase: BindingPhase::AfterWidget,
+            ..
+        })
+    ));
+    canopy.key(None, 'z')?;
+    assert_eq!(canopy.core.input_map.active_modes(), ["default_ran"]);
+    Ok(())
+}
+
+#[test]
+fn a_checked_transient_key_under_an_application_modal_matches_its_analysis() -> Result<()> {
+    let mut canopy = app();
+    modal_leaf(&mut canopy, ModalBindings::Application)?;
+    bind_prefix_mode(&mut canopy)?;
+    open_menu(&mut canopy, "prefix")?;
+    let RouteOutcome::Transient(winner) = canopy.explain_key(None, 'y'.into())?.outcome else {
+        panic!("expected a transient binding");
+    };
+
+    canopy.send_key_checked('y', KeyExpectation::Transient(winner.binding))?;
+    assert_eq!(canopy.core.input_map.active_modes(), ["after"]);
+
+    open_menu(&mut canopy, "prefix")?;
+    canopy.send_key_checked('q', KeyExpectation::TransientDismiss)?;
+    assert_eq!(canopy.core.input_map.active_modes(), ["after"]);
+    Ok(())
+}
+
+#[test]
+fn a_framework_modal_suspends_a_transient_mode() -> Result<()> {
+    const GROUP: inputmap::FrameworkBindingGroup =
+        inputmap::FrameworkBindingGroup::new("test.modal");
+    let mut canopy = app();
+    modal_leaf(
+        &mut canopy,
+        ModalBindings::Framework {
+            groups: &[GROUP],
+            intents: &[],
+        },
+    )?;
+    bind_prefix_mode(&mut canopy)?;
+    open_menu(&mut canopy, "prefix")?;
+
+    let snapshot = canopy.available_bindings(None)?;
+    assert_eq!(snapshot.transient_mode, None);
+    assert!(snapshot.bindings.is_empty());
+    assert_eq!(
+        canopy.explain_key(None, 'y'.into())?.outcome,
+        RouteOutcome::Unhandled
+    );
+    canopy.key(None, 'y')?;
+    assert_eq!(
+        canopy.core.input_map.active_modes(),
+        ["prefix"],
+        "a suspended mode neither runs nor pops"
+    );
+    Ok(())
+}
+
+#[test]
+fn explain_key_reports_before_widget_and_unhandled_outcomes() -> Result<()> {
+    let mut canopy = app();
+    let leaf = focused_leaf(&mut canopy, PredictingLeaf)?;
+    let id = bind_key_phase(&mut canopy, 'b', BindingPhase::BeforeWidget)?;
+
+    let before = canopy.explain_key(Some(leaf), 'b'.into())?;
+    assert_eq!(
+        before.outcome,
+        RouteOutcome::Binding(RouteWinner {
+            binding: id,
+            node: leaf,
+            path: Path::from("/root/predicting_leaf"),
+            kind: BindingActionKind::Script,
+            phase: BindingPhase::BeforeWidget,
+        })
+    );
+
+    let unhandled = canopy.explain_key(Some(leaf), 'u'.into())?;
+    assert_eq!(unhandled.outcome, RouteOutcome::Unhandled);
+    Ok(())
+}
+
+#[test]
+fn explain_key_matches_the_actual_route() -> Result<()> {
+    let mut canopy = app();
+    canopy.eval_script(
+        r#"canopy.bind("q", { description = "Switch" }, function() canopy.enter_mode("ran") end)"#,
+    )?;
+    let id = canopy
+        .core
+        .input_map
+        .bindings()
+        .iter()
+        .find(|record| record.input == InputSpec::Key('q'.into()))
+        .expect("binding")
+        .id;
+
+    let explanation = canopy.explain_key(None, 'q'.into())?;
+    assert_eq!(
+        explanation.outcome,
+        RouteOutcome::Binding(RouteWinner {
+            binding: id,
+            node: canopy.root_id(),
+            path: Path::from("/root"),
+            kind: BindingActionKind::Script,
+            phase: BindingPhase::AfterWidget,
+        })
+    );
+
+    canopy.key(None, 'q')?;
+    assert_eq!(canopy.mode(), "ran");
+    assert!(
+        canopy
+            .route_trace()
+            .iter()
+            .any(|entry| { entry.kind == RouteTraceKind::RunBinding && entry.detail == "Switch" })
+    );
+    Ok(())
+}
+
+#[test]
+fn explain_key_reports_transient_binding_and_dismissal() -> Result<()> {
+    let mut canopy = app();
+    canopy.eval_script(
+        r#"
+        canopy.keymap({
+            mode = "prefix",
+            { key = "y", description = "Prefix y", action = function() canopy.enter_mode("after") end },
+        })
+        "#,
+    )?;
+    open_menu(&mut canopy, "prefix")?;
+    let id = canopy
+        .core
+        .input_map
+        .bindings()
+        .iter()
+        .find(|record| record.tier == BindingTier::Mode("prefix".to_string()))
+        .expect("mode binding")
+        .id;
+
+    let bound = canopy.explain_key(None, 'y'.into())?;
+    assert_eq!(
+        bound.outcome,
+        RouteOutcome::Transient(RouteWinner {
+            binding: id,
+            node: canopy.root_id(),
+            path: Path::from("/root"),
+            kind: BindingActionKind::Script,
+            phase: BindingPhase::AfterWidget,
+        })
+    );
+    assert!(bound.steps.is_empty());
+    assert!(KeyExpectation::Transient(id).matches(&bound.outcome));
+    assert!(!KeyExpectation::TransientDismiss.matches(&bound.outcome));
+
+    let dismissed = canopy.explain_key(None, 'z'.into())?;
+    assert_eq!(dismissed.outcome, RouteOutcome::TransientDismiss);
+    assert!(KeyExpectation::TransientDismiss.matches(&dismissed.outcome));
+    assert!(!KeyExpectation::Transient(id).matches(&dismissed.outcome));
+    Ok(())
+}
+
+#[test]
+fn send_key_checked_rechecks_between_calls() -> Result<()> {
+    let mut canopy = app();
+    canopy.eval_script(
+        r#"canopy.bind("x", { description = "Switch" }, function() canopy.enter_mode("ran") end)"#,
+    )?;
+    let id = canopy
+        .core
+        .input_map
+        .bindings()
+        .iter()
+        .find(|record| record.input == InputSpec::Key('x'.into()))
+        .expect("binding")
+        .id;
+    canopy.send_key_checked('x', KeyExpectation::Binding(id))?;
+    assert_eq!(canopy.mode(), "ran");
+
+    // A later evaluation that removes the winner makes the next check fail.
+    canopy.eval_script(&format!("canopy.unbind({})", id.as_u64()))?;
+    let error = canopy
+        .send_key_checked('x', KeyExpectation::Binding(id))
+        .expect_err("a stale expectation must be rejected");
+    assert!(matches!(error, Error::KeyDispatchDivergence(_)));
+    Ok(())
+}
+
+#[test]
+fn send_key_checked_rechecks_focus_and_tree_changes() -> Result<()> {
+    let mut canopy = app();
+    let first = focused_leaf(&mut canopy, PredictingLeaf)?;
+    let second = canopy.core.create_detached(PredictingLeaf)?;
+    canopy.core.attach(canopy.root_id(), second)?;
+
+    // Focus moving to another consumer invalidates the first expectation.
+    canopy.core.set_focus(second)?;
+    let error = canopy
+        .send_key_checked('x', KeyExpectation::Widget(first))
+        .expect_err("stale focus must be rejected");
+    assert!(matches!(error, Error::KeyDispatchDivergence(_)));
+
+    // A removed node can no longer be the expected consumer.
+    canopy.core.set_focus(first)?;
+    canopy.core.remove_subtree(second)?;
+    let error = canopy
+        .send_key_checked('x', KeyExpectation::Widget(second))
+        .expect_err("a removed node must be rejected");
+    assert!(matches!(error, Error::KeyDispatchDivergence(_)));
+    Ok(())
+}
+
+#[test]
+fn send_key_checked_rejects_a_mismatched_expectation_without_delivery() -> Result<()> {
+    let mut canopy = app();
+    canopy.eval_script(
+        r#"canopy.bind("x", { description = "Switch" }, function() canopy.enter_mode("ran") end)"#,
+    )?;
+    let error = canopy
+        .send_key_checked('x', KeyExpectation::Unhandled)
+        .expect_err("expectation must be rejected");
+    assert!(matches!(error, Error::KeyDispatchDivergence(_)));
+    assert_eq!(canopy.mode(), "");
+    assert!(
+        !canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.kind == RouteTraceKind::RunBinding)
+    );
+    Ok(())
+}
+
+/// A leaf that accepts one intent and records what it receives.
+struct IntentLeaf {
+    /// Intent name this leaf implements.
+    intent: &'static str,
+    /// Whether the pure prediction accepts the intent.
+    accepted: bool,
+    /// Whether `on_intent` honors an accepted intent.
+    honest: bool,
+    /// Number of completed intent calls.
+    calls: Arc<AtomicUsize>,
+    /// Number of raw key events the leaf observed.
+    raw: Arc<AtomicUsize>,
+}
+
+impl Widget for IntentLeaf {
+    fn accept_focus(&self, _context: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn on_event(&mut self, event: &Event, _context: &mut dyn Context) -> Result<EventOutcome> {
+        if matches!(event, Event::Key(_)) {
+            self.raw.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(EventOutcome::Ignore)
+    }
+
+    fn accepts_intent(&self, intent: &str, _context: &dyn ViewContext) -> bool {
+        self.accepted && intent == self.intent
+    }
+
+    fn on_intent(&mut self, intent: &str, _context: &mut dyn Context) -> Result<EventOutcome> {
+        if !self.accepted || !self.honest || intent != self.intent {
+            return Ok(EventOutcome::Ignore);
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(EventOutcome::Handle)
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("intent_leaf")
+    }
+}
+
+/// Mount one action leaf and give it the keyboard.
+fn mount_action_leaf(canopy: &mut Canopy, leaf: IntentLeaf) -> Result<NodeId> {
+    let node = canopy.core.create_detached(leaf)?;
+    canopy.core.attach(canopy.core.root, node)?;
+    canopy.core.set_focus(node)?;
+    Ok(node)
+}
+
+#[test]
+fn the_rendered_api_narrows_the_action_arm_to_registered_names() -> Result<()> {
+    let bare = app();
+    assert!(
+        bare.script_api()?.contains("\"canopy.nav.down\""),
+        "every application binds the built-in navigation intents"
+    );
+
+    let mut canopy = app_with(|setup| {
+        setup.register_intent(inputmap::IntentSpec::new(
+            "test.clear",
+            "Clear the test leaf",
+        )?)
+    });
+    let api = canopy.script_api()?;
+    assert!(
+        api.contains("| \"test.clear\""),
+        "the union holds every registered name: {api}"
+    );
+    assert!(
+        api.contains("`test.clear`: Clear the test leaf"),
+        "the union documents each action: {api}"
+    );
+    let unknown = canopy.check_script(
+        "unknown-action",
+        "--!strict\ncanopy.bind(\"x\", {description = \"x\"}, \"test.other\")",
+    )?;
+    assert!(
+        unknown.has_errors(),
+        "an unregistered action name fails the typechecker: {unknown:?}"
+    );
+    let known = canopy.check_script(
+        "known-action",
+        "--!strict\ncanopy.bind(\"x\", {description = \"x\"}, \"test.clear\")",
+    )?;
+    assert!(
+        !known.has_errors(),
+        "a registered action name typechecks: {known:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_intent_dispatches_to_its_accepting_consumer() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let leaf = mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: true,
+            honest: true,
+            calls: Arc::clone(&calls),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )?;
+    canopy.eval_script(r#"canopy.bind("ctrl-x", {description = "Clear"}, "test.clear")"#)?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    canopy.key(None, key)?;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "the consumer runs once");
+
+    let explanation = canopy.core.explain_key(Some(leaf), key)?;
+    assert!(
+        matches!(
+            explanation.outcome,
+            RouteOutcome::Binding(RouteWinner {
+                kind: BindingActionKind::Intent,
+                phase: BindingPhase::BeforeWidget,
+                ..
+            })
+        ),
+        "the analysis names the action, got {:?}",
+        explanation.outcome
+    );
+    let snapshot = canopy.available_bindings(Some(leaf))?;
+    assert!(
+        snapshot.bindings.iter().any(|binding| {
+            binding.description == "Clear"
+                && binding.action == inputmap::BindingActionKind::Intent
+                && binding
+                    .intent
+                    .as_ref()
+                    .is_some_and(|name| name.as_str() == "test.clear")
+        }),
+        "help shows the exact intent row"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_dormant_action_does_not_shadow_the_next_candidate() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let raw = Arc::new(AtomicUsize::new(0));
+    let leaf = mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: false,
+            honest: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+            raw: Arc::clone(&raw),
+        },
+    )?;
+    canopy.eval_script(
+        r#"
+        canopy.bind("ctrl-x", {description = "Clear", path = "intent_leaf/"}, "test.clear")
+        canopy.bind("ctrl-x", {description = "Fallback"}, function()
+            canopy.enter_mode("fallback")
+        end)
+        "#,
+    )?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    canopy.key(None, key)?;
+    assert_eq!(canopy.mode(), "fallback", "the fallback runs");
+    assert_eq!(
+        raw.load(Ordering::Relaxed),
+        1,
+        "the raw key reaches the widget first"
+    );
+    let explanation = canopy.core.explain_key(Some(leaf), key)?;
+    assert!(matches!(
+        explanation.outcome,
+        RouteOutcome::Binding(RouteWinner {
+            phase: BindingPhase::AfterWidget,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_dormant_global_action_falls_through_to_the_default_tier() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: false,
+            honest: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )?;
+    canopy.eval_script(
+        r#"
+        canopy.bind("ctrl-x", {
+            description = "Global clear",
+            tier = "global",
+            path = "/root/**/",
+        }, "test.clear")
+        canopy.bind("ctrl-x", {description = "Default fallback"}, function()
+            canopy.enter_mode("default_won")
+        end)
+        "#,
+    )?;
+    canopy.key(None, key::Key::parse_spec("ctrl-x")?)?;
+    assert_eq!(
+        canopy.mode(),
+        "default_won",
+        "the dormant global action gives way to the default tier"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_transient_mode_offers_its_action_before_the_raw_key() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let raw = Arc::new(AtomicUsize::new(0));
+    mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: true,
+            honest: true,
+            calls: Arc::clone(&calls),
+            raw: Arc::clone(&raw),
+        },
+    )?;
+    canopy.eval_script(
+        r#"
+        canopy.keymap({
+            mode = "prefix",
+            { key = "ctrl-x", description = "Clear", action = "test.clear" },
+        })
+        "#,
+    )?;
+    open_menu(&mut canopy, "prefix")?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    let explanation = canopy.core.explain_key(None, key)?;
+    assert!(
+        matches!(
+            explanation.outcome,
+            RouteOutcome::Transient(RouteWinner {
+                kind: BindingActionKind::Intent,
+                ..
+            })
+        ),
+        "the transient analysis names the action, got {:?}",
+        explanation.outcome
+    );
+    canopy.key(None, key)?;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(raw.load(Ordering::Relaxed), 0, "no raw key is delivered");
+    assert_eq!(canopy.mode(), "", "the transient mode pops");
+    Ok(())
+}
+
+#[test]
+fn a_transient_mode_dismisses_a_dormant_action() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let raw = Arc::new(AtomicUsize::new(0));
+    mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: false,
+            honest: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+            raw: Arc::clone(&raw),
+        },
+    )?;
+    canopy.eval_script(
+        r#"
+        canopy.keymap({
+            mode = "prefix",
+            { key = "ctrl-x", description = "Clear", action = "test.clear" },
+        })
+        canopy.bind("ctrl-x", {description = "Default"}, function()
+            canopy.enter_mode("default_won")
+        end)
+        "#,
+    )?;
+    open_menu(&mut canopy, "prefix")?;
+    canopy.key(None, key::Key::parse_spec("ctrl-x")?)?;
+    assert_eq!(canopy.mode(), "", "the transient mode dismisses");
+    assert_eq!(
+        raw.load(Ordering::Relaxed),
+        0,
+        "the raw key is not delivered"
+    );
+    Ok(())
+}
+
+#[test]
+fn only_the_first_accepting_consumer_runs() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let leaf_calls = Arc::new(AtomicUsize::new(0));
+    let parent_calls = Arc::new(AtomicUsize::new(0));
+    let parent = canopy.core.create_detached(IntentLeaf {
+        intent: "test.clear",
+        accepted: true,
+        honest: true,
+        calls: Arc::clone(&parent_calls),
+        raw: Arc::new(AtomicUsize::new(0)),
+    })?;
+    canopy.core.attach(canopy.core.root, parent)?;
+    let leaf = canopy.core.create_detached(IntentLeaf {
+        intent: "test.clear",
+        accepted: true,
+        honest: true,
+        calls: Arc::clone(&leaf_calls),
+        raw: Arc::new(AtomicUsize::new(0)),
+    })?;
+    canopy.core.attach(parent, leaf)?;
+    canopy.core.set_focus(leaf)?;
+    canopy.eval_script(r#"canopy.bind("ctrl-x", {description = "Clear"}, "test.clear")"#)?;
+    canopy.key(None, key::Key::parse_spec("ctrl-x")?)?;
+    assert_eq!(leaf_calls.load(Ordering::Relaxed), 1, "the child runs");
+    assert_eq!(
+        parent_calls.load(Ordering::Relaxed),
+        0,
+        "the ancestor does not"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_declining_child_leaves_an_action_to_its_accepting_ancestor() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let parent_calls = Arc::new(AtomicUsize::new(0));
+    let parent = canopy.core.create_detached(IntentLeaf {
+        intent: "test.clear",
+        accepted: true,
+        honest: true,
+        calls: Arc::clone(&parent_calls),
+        raw: Arc::new(AtomicUsize::new(0)),
+    })?;
+    canopy.core.attach(canopy.core.root, parent)?;
+    let leaf = canopy.core.create_detached(IntentLeaf {
+        intent: "test.clear",
+        accepted: false,
+        honest: true,
+        calls: Arc::new(AtomicUsize::new(0)),
+        raw: Arc::new(AtomicUsize::new(0)),
+    })?;
+    canopy.core.attach(parent, leaf)?;
+    canopy.core.set_focus(leaf)?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    let id = bind_intent(
+        &mut canopy,
+        key,
+        default_options(None, "Clear", None)?,
+        inputmap::IntentName::new("test.clear")?,
+    )?;
+    canopy.key(None, key)?;
+    assert_eq!(
+        parent_calls.load(Ordering::Relaxed),
+        1,
+        "the ancestor consumes the action the child declined"
+    );
+    assert_ne!(
+        canopy.core.binding_verdict(id, leaf),
+        BindingVerdict::NoConsumer,
+        "the diagnostic follows the same route as dispatch"
+    );
+    Ok(())
+}
+
+/// A leaf with one command that counts its runs.
+struct CountLeaf {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive_commands]
+impl CountLeaf {
+    #[command]
+    fn count(&self) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Widget for CountLeaf {
+    fn name(&self) -> NodeName {
+        NodeName::convert("count_leaf")
+    }
+}
+
+/// Mount a [`CountLeaf`] under the root, and return it with its run count.
+fn counting_app() -> Result<(Canopy, NodeId, Arc<AtomicUsize>)> {
+    let mut canopy = app();
+    canopy.core.commands.add(CountLeaf::commands())?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let leaf = canopy.core.create_detached(CountLeaf {
+        calls: Arc::clone(&calls),
+    })?;
+    canopy.core.attach(canopy.core.root, leaf)?;
+    Ok((canopy, leaf, calls))
+}
+
+/// Bind `z` to `call`, described as "Count".
+fn bind_count(canopy: &mut Canopy, call: commands::CommandCall) -> Result<()> {
+    bind_command(
+        canopy,
+        key::Key::parse_spec("z")?,
+        default_options(None, "Count", None)?,
+        call,
+    )
+    .map(|_| ())
+}
+
+/// Return whether help lists the count binding.
+fn count_listed(canopy: &Canopy) -> Result<bool> {
+    Ok(canopy
+        .core
+        .available_bindings(None)?
+        .bindings
+        .iter()
+        .any(|binding| binding.description == "Count"))
+}
+
+#[test]
+fn a_command_whose_widget_is_hidden_is_dormant() -> Result<()> {
+    let (mut canopy, leaf, calls) = counting_app()?;
+    bind_count(&mut canopy, CountLeaf::call_count())?;
+    let key = key::Key::parse_spec("z")?;
+    canopy.core.set_hidden(leaf, true)?;
+    canopy.key(None, key)?;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a hidden widget takes no command"
+    );
+    assert!(
+        !count_listed(&canopy)?,
+        "help leaves the dormant binding out"
+    );
+
+    canopy.core.set_hidden(leaf, false)?;
+    assert!(
+        count_listed(&canopy)?,
+        "help lists it once the widget shows"
+    );
+    canopy.key(None, key)?;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "the shown widget runs it");
+    Ok(())
+}
+
+#[test]
+fn an_exact_target_reaches_a_hidden_widget() -> Result<()> {
+    let (mut canopy, leaf, calls) = counting_app()?;
+    bind_count(
+        &mut canopy,
+        CountLeaf::call_count().with_target(commands::CommandTarget::Exact(leaf)),
+    )?;
+    canopy.core.set_hidden(leaf, true)?;
+    assert!(
+        count_listed(&canopy)?,
+        "an exact target names its node outright"
+    );
+    canopy.key(None, key::Key::parse_spec("z")?)?;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+/// Mount a [`DisabledLeaf`] under `parent`, where a command bound at the
+/// parent finds it.
+fn mount_disabled_leaf(canopy: &mut Canopy, parent: NodeId) -> Result<NodeId> {
+    let node = canopy.core.create_detached(DisabledLeaf)?;
+    canopy.core.attach(parent, node)?;
+    Ok(node)
+}
+
+/// A leaf with one command that is always disabled.
+struct DisabledLeaf;
+
+#[derive_commands]
+impl DisabledLeaf {
+    fn ready(&self, _ctx: &dyn ViewContext) -> Result<CommandStatus> {
+        Ok(CommandStatus::Disabled("not ready".into()))
+    }
+
+    #[command(enabled = "ready")]
+    fn fire(&self) {}
+}
+
+impl Widget for DisabledLeaf {
+    fn accept_focus(&self, _context: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("disabled_leaf")
+    }
+}
+
+/// Build binding options for an action or command in the default tier.
+fn default_options(
+    path: Option<&str>,
+    description: &str,
+    phase: Option<inputmap::BindingPhase>,
+) -> Result<inputmap::BindingOptions> {
+    Ok(inputmap::BindingOptions {
+        show_in_help: true,
+        path: path.map(str::parse).transpose()?,
+        tier: inputmap::BindingTier::Default,
+        description: description.to_string(),
+        source: None,
+        phase,
+    })
+}
+
+#[test]
+fn a_disabled_command_claims_the_key_after_a_dormant_action() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    canopy.core.commands.add(DisabledLeaf::commands())?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let leaf = mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: false,
+            honest: true,
+            calls: Arc::clone(&calls),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )?;
+    // The command's widget shows under the focused leaf, so the command
+    // resolves and reports its own disabled status.
+    mount_disabled_leaf(&mut canopy, leaf)?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    bind_intent(
+        &mut canopy,
+        key,
+        default_options(Some("intent_leaf/"), "Dormant clear", None)?,
+        inputmap::IntentName::new("test.clear")?,
+    )?;
+    bind_command(
+        &mut canopy,
+        key,
+        default_options(
+            None,
+            "Disabled fire",
+            Some(inputmap::BindingPhase::AfterWidget),
+        )?,
+        DisabledLeaf::call_fire(),
+    )?;
+    canopy.key(None, key)?;
+    assert!(
+        canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.detail.contains("binding disabled")),
+        "the dormant intent gives way to the disabled command: {:?}",
+        canopy.route_trace()
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "the dormant intent never runs"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_disabled_command_claims_the_key_before_an_accepting_intent() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    canopy.core.commands.add(DisabledLeaf::commands())?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let leaf = mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: true,
+            honest: true,
+            calls: Arc::clone(&calls),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )?;
+    // The command's widget shows under the focused leaf, so the command
+    // resolves and reports its own disabled status.
+    mount_disabled_leaf(&mut canopy, leaf)?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    bind_command(
+        &mut canopy,
+        key,
+        default_options(
+            Some("intent_leaf/"),
+            "Disabled fire",
+            Some(inputmap::BindingPhase::AfterWidget),
+        )?,
+        DisabledLeaf::call_fire(),
+    )?;
+    bind_intent(
+        &mut canopy,
+        key,
+        default_options(None, "Clear", None)?,
+        inputmap::IntentName::new("test.clear")?,
+    )?;
+    canopy.key(None, key)?;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "the higher-ranked disabled command hides the intent"
+    );
+    assert!(
+        canopy
+            .route_trace()
+            .iter()
+            .any(|entry| entry.detail.contains("binding disabled")),
+        "the disabled command claims the key"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_widget_declines_an_action() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let leaf = mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: true,
+            honest: true,
+            calls: Arc::clone(&calls),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    bind_intent(
+        &mut canopy,
+        key,
+        default_options(None, "Clear", None)?,
+        inputmap::IntentName::new("test.clear")?,
+    )?;
+    let path = canopy.core.path_of(canopy.core.root, leaf);
+    canopy
+        .core
+        .with_widget_dyn_mut(leaf, |_, core| -> Result<()> {
+            assert!(
+                core.select_key_binding(leaf, &path, key, leaf, &[])
+                    .is_none(),
+                "a borrowed widget declines the action"
+            );
+            let explanation = core.explain_key(Some(leaf), key)?;
+            assert!(
+                matches!(explanation.outcome, RouteOutcome::Unhandled),
+                "an unreadable consumer is not an action consumer, got {:?}",
+                explanation.outcome
+            );
+            Ok(())
+        })??;
+    canopy.key(None, key)?;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "the action works again");
+    Ok(())
+}
+
+#[test]
+fn checked_dispatch_accepts_an_action_expectation() -> Result<()> {
+    let mut canopy = clear_intent_app();
+    let calls = Arc::new(AtomicUsize::new(0));
+    mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: true,
+            honest: true,
+            calls: Arc::clone(&calls),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )?;
+    let key = key::Key::parse_spec("ctrl-x")?;
+    let id = bind_intent(
+        &mut canopy,
+        key,
+        default_options(None, "Clear", None)?,
+        inputmap::IntentName::new("test.clear")?,
+    )?;
+    canopy.send_key_checked(key, KeyExpectation::Binding(id))?;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let error = canopy
+        .send_key_checked(key, KeyExpectation::Unhandled)
+        .expect_err("a mismatched expectation is rejected");
+    assert!(matches!(error, Error::KeyDispatchDivergence(_)));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a rejected expectation delivers nothing"
+    );
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "accepts_intent promised Handle")]
+fn an_inconsistent_action_consumer_trips_the_debug_assert() {
+    let mut canopy = clear_intent_app();
+    let calls = Arc::new(AtomicUsize::new(0));
+    mount_action_leaf(
+        &mut canopy,
+        IntentLeaf {
+            intent: "test.clear",
+            accepted: true,
+            honest: false,
+            calls: Arc::clone(&calls),
+            raw: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .unwrap();
+    canopy
+        .eval_script(r#"canopy.bind("ctrl-x", {description = "Clear"}, "test.clear")"#)
+        .unwrap();
+    drop(canopy.key(None, key::Key::parse_spec("ctrl-x").unwrap()));
+}
+
+#[test]
+fn widget_styles_follow_theme_switches() -> Result<()> {
+    let mut canopy = CanopyBuilder::new()
+        .configure(|setup| {
+            setup.widget_styles(|palette, rules| rules.fg("app/badge", palette.red).apply());
+            Ok(())
+        })
+        .build()?;
+    let badge = |canopy: &Canopy| canopy.style().resolve("app/badge").fg;
+    assert_eq!(badge(&canopy), Paint::Solid(themes::default_dark().red));
+    canopy.set_theme(themes::dracula());
+    assert_eq!(
+        badge(&canopy),
+        Paint::Solid(themes::dracula().red),
+        "the rule set is reapplied from the new palette"
+    );
+    assert_eq!(canopy.palette().accent, themes::dracula().accent);
+    Ok(())
+}
+
+#[test]
+fn a_menu_action_checks_its_name_when_it_opens() -> Result<()> {
+    let mut canopy = app();
+    // The action is built while no mode named "go" is active, and it runs
+    // only when its key arrives.
+    canopy.eval_script(r#"canopy.bind("g", { description = "Go" }, canopy.menu("go"))"#)?;
+    canopy.enter_mode("go")?;
+    let generation = canopy.core.input_map.mode_generation();
+
+    canopy.key(None, 'g')?;
+    let notice = canopy
+        .notices()
+        .last()
+        .expect("the failed menu is a notice");
+    assert!(notice.message.contains("go"), "{}", notice.message);
+    assert_eq!(canopy.active_modes(), ["go"], "the modes stay as they were");
+    assert_eq!(canopy.core.input_map.mode_generation(), generation);
+    Ok(())
+}
+
+#[test]
+fn the_script_api_declares_named_mode_operations_only() -> Result<()> {
+    let canopy = app();
+    let api = canopy.script_api()?;
+    for name in ["enter_mode", "leave_mode", "active_modes", "menu"] {
+        assert!(api.contains(name), "the API declares {name}");
+    }
+    for name in ["set_mode", "push_mode", "pop_mode", "PushModeOptions"] {
+        assert!(!api.contains(name), "the API omits {name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_mouse_menu_cannot_bury_a_waiting_menu() -> Result<()> {
+    run_ttree(|c, mut tr, tree| {
+        c.render(&mut tr)?;
+        let click = click_on(&c.core, tree.a_a);
+        let mut options = mouse_options("/r/ba/ba_la/", BindingPhase::BeforeWidget)?;
+        options.tier = BindingTier::Global;
+        bind(
+            c,
+            InputSpec::Mouse(click.into()),
+            options,
+            inputmap::BindingAction::Menu("other".into()),
+        )?;
+        open_menu(c, "go")?;
+        let generation = c.core.input_map.mode_generation();
+
+        c.mouse(None, click)?;
+        assert_eq!(c.active_modes(), ["go"], "the waiting menu stays on top");
+        assert_eq!(c.core.input_map.mode_generation(), generation);
+        assert!(
+            c.notices()
+                .last()
+                .expect("the rejected menu reports a notice")
+                .message
+                .contains("go")
+        );
+        c.key(None, 'x')?;
+        assert!(c.active_modes().is_empty(), "one key dismisses the menu");
+        Ok(())
+    })
 }

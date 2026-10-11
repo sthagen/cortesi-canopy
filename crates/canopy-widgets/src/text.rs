@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 
 use canopy::{
-    Context, FocusDirection, NodeName, Render, ViewContext, Widget, derive_commands,
+    NodeName, ViewContext, Widget, derive_commands,
     error::Result,
     geom::{Line, Size},
     layout::{Constraint, MeasureConstraints, Measurement},
+    render::Render,
     text,
 };
 
@@ -39,6 +40,8 @@ pub struct Text {
     tab_stop: usize,
     /// Cached wrapped text for the last wrap width.
     wrap_cache: RefCell<Option<WrapCache>>,
+    /// Whether the text takes focus, so navigation keys scroll it.
+    focusable: bool,
 }
 
 impl Selectable for Text {
@@ -60,10 +63,19 @@ impl Text {
             selected: false,
             tab_stop: 4,
             wrap_cache: RefCell::new(None),
+            focusable: false,
         }
     }
 
+    /// Take focus, so the navigation intents scroll this text.
+    #[must_use]
+    pub fn with_focusable(mut self, focusable: bool) -> Self {
+        self.focusable = focusable;
+        self
+    }
+
     /// Add a fixed width for wrapping.
+    #[must_use]
     pub fn with_wrap_width(mut self, width: u32) -> Self {
         self.wrap_width = Some(width);
         self.wrap_cache.borrow_mut().take();
@@ -71,24 +83,28 @@ impl Text {
     }
 
     /// Configure the canvas width behavior.
+    #[must_use]
     pub fn with_canvas_width(mut self, width: CanvasWidth) -> Self {
         self.canvas_width = width;
         self
     }
 
     /// Set the text rendering style.
+    #[must_use]
     pub fn with_style(mut self, style: impl Into<String>) -> Self {
         self.style = style.into();
         self
     }
 
     /// Set the text rendering style when selected.
+    #[must_use]
     pub fn with_selected_style(mut self, style: impl Into<String>) -> Self {
         self.selected_style = Some(style.into());
         self
     }
 
     /// Set the tab stop width for tab expansion.
+    #[must_use]
     pub fn with_tab_stop(mut self, tab_stop: usize) -> Self {
         self.tab_stop = tab_stop.max(1);
         self.wrap_cache.borrow_mut().take();
@@ -101,44 +117,13 @@ impl Text {
         self.wrap_cache.borrow_mut().take();
     }
 
-    #[command]
-    /// Scroll to an absolute content position.
-    pub fn scroll_to(&mut self, c: &mut dyn Context, x: u32, y: u32) {
-        c.scroll_to(x, y);
-    }
-
-    /// Scroll by one line in the specified direction.
-    /// @param dir The direction to scroll.
-    #[command]
-    pub fn scroll(&mut self, c: &mut dyn Context, dir: FocusDirection) {
-        match dir {
-            FocusDirection::Up | FocusDirection::Prev => c.scroll_up(),
-            FocusDirection::Down | FocusDirection::Next => c.scroll_down(),
-            FocusDirection::Left => c.scroll_left(),
-            FocusDirection::Right => c.scroll_right(),
-        };
-    }
-
-    /// Page vertically through the text.
-    /// Positive values move down; negative values move up.
-    /// @param delta Signed page delta. Positive moves down and negative moves
-    /// up.
-    #[command]
-    pub fn page(&mut self, c: &mut dyn Context, delta: i32) {
-        if delta < 0 {
-            c.page_up();
-        } else if delta > 0 {
-            c.page_down();
-        }
-    }
-
     /// Return the widest unwrapped line, with tabs expanded.
     fn raw_width(&self) -> u32 {
         text::expand_tabs(&self.raw, self.tab_stop)
             .lines()
-            .map(text::display_width)
+            .map(text::width)
             .max()
-            .unwrap_or(0) as u32
+            .unwrap_or(0)
     }
 
     /// Determine the wrapping width for the given available space.
@@ -159,7 +144,7 @@ impl Text {
                 .collect::<Vec<_>>();
             let max_width = lines
                 .iter()
-                .map(|line| text::display_width(line))
+                .map(|line| text::width(line))
                 .max()
                 .unwrap_or(0) as u32;
             *cache = Some(WrapCache {
@@ -183,6 +168,10 @@ struct WrapCache {
 }
 
 impl Widget for Text {
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        self.focusable
+    }
+
     fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
         let view = ctx.view();
         let view_rect = view.view_rect();

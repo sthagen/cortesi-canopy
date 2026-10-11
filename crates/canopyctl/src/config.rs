@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::cargo_env;
+
 /// Parsed `.canopyctl.toml` contents.
 #[derive(Debug, Default, Clone, Deserialize)]
 struct FileConfig {
@@ -18,6 +20,8 @@ struct FileConfig {
     app: Option<AppSection>,
     /// Smoke-runner settings.
     smoke: Option<SmokeSection>,
+    /// Screenshot gallery settings.
+    gallery: Option<GallerySection>,
     /// `canopyctl mcp` server settings.
     mcp: Option<McpSection>,
 }
@@ -47,6 +51,44 @@ struct SmokeSection {
     fail_fast: Option<bool>,
     /// Default per-script timeout in milliseconds.
     timeout_ms: Option<u64>,
+}
+
+/// `[gallery]` section from `.canopyctl.toml`.
+#[derive(Debug, Default, Clone, Deserialize)]
+struct GallerySection {
+    /// Directory of gallery scripts.
+    suite: Option<PathBuf>,
+    /// Directory that receives the images and the viewer.
+    out: Option<PathBuf>,
+    /// Screen sizes as `WIDTHxHEIGHT`.
+    sizes: Option<Vec<String>>,
+    /// Per-script timeout in milliseconds.
+    timeout_ms: Option<u64>,
+    /// Font size in pixels, before the scale.
+    font_size: Option<f32>,
+    /// Image pixels for each pixel of the font size.
+    scale: Option<f32>,
+    /// Title of the viewer.
+    title: Option<String>,
+}
+
+/// Gallery settings after defaults and overrides.
+#[derive(Debug, Clone)]
+pub struct GallerySettings {
+    /// Directory of gallery scripts.
+    pub suite: PathBuf,
+    /// Directory that receives the images and the viewer.
+    pub out: PathBuf,
+    /// Screen sizes as `WIDTHxHEIGHT`.
+    pub sizes: Vec<String>,
+    /// Per-script timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Font size in pixels, before the scale.
+    pub font_size: f32,
+    /// Image pixels for each pixel of the font size.
+    pub scale: f32,
+    /// Title of the viewer.
+    pub title: String,
 }
 
 /// `[mcp]` section from `.canopyctl.toml`.
@@ -193,6 +235,27 @@ impl LoadedConfig {
                 .unwrap_or(false)
     }
 
+    /// Resolve the gallery settings. Paths resolve against the config
+    /// directory.
+    pub fn gallery(&self) -> GallerySettings {
+        let section = self.file.gallery.clone().unwrap_or_default();
+        let title = section.title.unwrap_or_else(|| {
+            self.config_dir.file_name().map_or_else(
+                || "gallery".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
+        GallerySettings {
+            suite: self.resolve_path(&section.suite.unwrap_or_else(|| "gallery".into())),
+            out: self.resolve_path(&section.out.unwrap_or_else(|| "tmp/gallery".into())),
+            sizes: section.sizes.unwrap_or_else(|| vec!["100x30".to_owned()]),
+            timeout_ms: section.timeout_ms,
+            font_size: section.font_size.unwrap_or(14.0),
+            scale: section.scale.unwrap_or(2.0),
+            title,
+        }
+    }
+
     /// Resolve the effective MCP idle timeout.
     pub fn idle_shutdown_after(&self) -> Duration {
         Duration::from_secs(
@@ -227,7 +290,16 @@ impl ResolvedCommand {
 
     /// Convert the resolved command into a `tokio::process::Command`.
     pub fn to_command(&self) -> Command {
-        let mut command = Command::new(&self.argv[0]);
+        let mut command = if Path::new(&self.argv[0]).file_stem().is_some_and(|name| {
+            matches!(
+                name.to_str(),
+                Some("cargo" | "ncode" | "edev" | "canopyctl")
+            )
+        }) {
+            Command::from(cargo_env::command(&self.argv[0]))
+        } else {
+            Command::new(&self.argv[0])
+        };
         command.args(&self.argv[1..]);
         command.current_dir(&self.cwd);
         command.envs(&self.env);

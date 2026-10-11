@@ -1,35 +1,46 @@
 //! A modal list of items, filtered and chosen with the keyboard.
 //!
 //! [`Picker`] is the modal subtree: it centres a titled frame over whatever it
-//! covers, and holds a [`PickerList`] of items above a [`PickerFilter`] field.
-//! The host opens it with Canopy's modal scope, which gives the list the
+//! covers, and holds a [`PickerList`] of items above an [`Input`] filter field.
+//! The host opens it with Canopy's modal, which gives the list the
 //! keyboard and dims the application behind it.
 //!
 //! The widget owns the list and the filter, and nothing else. It never reads
 //! or writes what it shows, so a host can back it with bookmarks, a history, or
 //! anything else that renders as one line. A host that needs more than
-//! choosing, such as a question before a row is removed, adds its own modal
-//! over the dialog with [`Picker::add_overlay`] and opens it with
-//! [`Picker::open_overlay`]: the list keeps its filter and selection under it,
-//! and takes the keyboard back when the overlay closes.
+//! choosing, such as a question before a row is removed, opens its own modal
+//! in the overlay layer (`ContextExt::add_modal`) with the picker as its
+//! owner: the list keeps its filter and selection under it, and takes the
+//! keyboard back when the overlay closes.
 
-use std::borrow::Cow;
+use std::iter;
 
 use canopy::{
-    Context, ContextExt, EventOutcome, InteractionToken, ModalBindings, ModalOptions, NodeId,
-    NodeName, Render, RevealAlign, TypedId, ViewContext, Widget, derive_commands,
+    Context, ContextExt, EventOutcome, NodeId, NodeName, Register, Setup, TypedId, ViewContext,
+    ViewContextExt, Widget,
+    commands::CommandCall,
+    derive_commands,
     error::{Error, Result},
-    event::{Event, key::KeyCode},
-    geom::{Line, Rect, Size},
-    layout::{
-        CanvasContext, Direction, Edges, Layout, LayoutOverride, MeasureConstraints, Measurement,
-        Sizing,
+    geom::{Line, Point, Rect, Size},
+    input::{
+        BindingAction, BindingOptions, BindingPhase, BindingTier, Event, FrameworkBindingGroup,
+        IntentName, NavIntent,
+        key::{self, Key, KeyCode},
     },
+    layout::{
+        CanvasContext, Direction, Edges, Layout, MeasureConstraints, Measurement, ScrollOp, Sizing,
+    },
+    render::Render,
     style::roles,
-    text,
+    text::{self, Truncate},
 };
 
-use crate::{Container, Label, frame::Frame};
+use crate::{
+    Dialog, ItemLabel,
+    frame::Frame,
+    input::{Input, register_clear_intent},
+    row_cursor::{CursorMove, RowCursor, label_rows, widest_label},
+};
 
 /// Columns a row spends on its blank lead column and a trailing gutter.
 const ROW_PADDING: u32 = 2;
@@ -39,38 +50,18 @@ const MIN_FRAME_WIDTH: u32 = 32;
 const FRAME_MARGIN: u32 = 1;
 /// Rows the filter field occupies.
 const FILTER_ROWS: u32 = 1;
-/// Marks where typed text lands while the filter is taking keys.
-const CARET: char = '▏';
-
-/// Which end of a label a row drops when it does not fit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Truncate {
-    /// Drop the tail, which is how ordinary text reads.
-    #[default]
-    End,
-    /// Drop the head, which keeps the last components of a path visible.
-    Start,
-}
-
-impl Truncate {
-    /// Return `label` cut to `budget` columns at this end.
-    fn apply<'a>(self, label: &'a str, budget: usize) -> Cow<'a, str> {
-        match self {
-            Self::End => text::truncate_end(label, budget),
-            Self::Start => text::truncate_start(label, budget),
-        }
-    }
-}
+/// The prompt before the filter, naming the key that opened it.
+const FILTER_PROMPT: &str = " / ";
 
 /// A centred modal holding a filtered list of items.
 ///
 /// The widget draws nothing of its own. It centres its dialog and swallows
 /// mouse input that lands on the margin around it. The root is a stack, so an
-/// overlay a host adds with [`Picker::add_overlay`] draws over the dialog
-/// within the same margin.
+/// overlay a host opens with `ContextExt::add_modal`, with the picker as its
+/// owner, draws over the dialog within the same margin.
 pub struct Picker<T>
 where
-    T: Label,
+    T: ItemLabel,
 {
     /// The framed dialog, once mounted, which an overlay covers and dims.
     dialog: Option<NodeId>,
@@ -81,20 +72,25 @@ where
     filter: Option<NodeId>,
     /// Which end a row drops when it does not fit.
     truncate: Truncate,
+    /// Call that accepting the selection posts.
+    on_accept: Option<CommandCall>,
+    /// Call that closing the picker posts.
+    on_cancel: Option<CommandCall>,
 }
 
 impl<T> Default for Picker<T>
 where
-    T: Label + 'static,
+    T: ItemLabel + 'static,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[derive_commands]
 impl<T> Picker<T>
 where
-    T: Label + 'static,
+    T: ItemLabel + 'static,
 {
     /// Build an empty picker.
     #[must_use]
@@ -104,6 +100,8 @@ where
             list: None,
             filter: None,
             truncate: Truncate::default(),
+            on_accept: None,
+            on_cancel: None,
         }
     }
 
@@ -121,7 +119,7 @@ where
     /// list.
     ///
     /// The filter is dropped, so a picker always opens on the whole list.
-    pub fn show(
+    pub fn set_items(
         &mut self,
         context: &mut dyn Context,
         title: &str,
@@ -131,8 +129,76 @@ where
         let list = self.typed_list()?;
         let title = title.to_owned();
         context.with_widget_mut(list, |list: &mut PickerList<T>, context| {
-            list.show(context, title, placeholder, items)
+            list.set_items(context, title, placeholder, items)
         })
+    }
+
+    /// Show `items` in place of the current items, and keep the filter and
+    /// the selected item. See [`PickerList::update_items`].
+    pub fn update_items(
+        &mut self,
+        context: &mut dyn Context,
+        title: &str,
+        placeholder: &'static str,
+        items: Vec<T>,
+        same: impl Fn(&T, &T) -> bool,
+    ) -> Result<()> {
+        let list = self.typed_list()?;
+        let title = title.to_owned();
+        context.with_widget_mut(list, |list: &mut PickerList<T>, context| {
+            list.update_items(context, title, placeholder, items, same)
+        })
+    }
+
+    /// Return the selected item of the list, cloned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before the picker mounts.
+    pub fn selected(&self, context: &dyn Context) -> Result<Option<T>>
+    where
+        T: Clone,
+    {
+        let list = self.typed_list()?;
+        context.with_widget(list, |list: &PickerList<T>| Ok(list.selected().cloned()))
+    }
+
+    /// The framework group a picker's modal admits.
+    ///
+    /// The arrows, `j` and `k`, the page keys, and Home and End offer the
+    /// navigation intents, `/` opens the filter, Enter accepts, and Esc
+    /// closes. A host admits it beside its own group, which carries keys such
+    /// as a delete.
+    pub const BINDINGS: FrameworkBindingGroup = FrameworkBindingGroup::new("picker");
+
+    /// Set what accepting the selection and closing the picker post.
+    ///
+    /// Both calls usually target the host, which reads the selection and
+    /// closes the modal. The picker posts them with [`Context::post`], so they
+    /// run once the picker's command has returned, and the host may read,
+    /// change, or close the picker. The accept call carries no selection: the
+    /// host reads the list as it is when the call runs.
+    pub fn set_commands(&mut self, accept: CommandCall, cancel: CommandCall) {
+        self.on_accept = Some(accept);
+        self.on_cancel = Some(cancel);
+    }
+
+    /// Accept the selection by posting the host's accept call.
+    #[command]
+    pub fn accept(&mut self, context: &mut dyn Context) -> Result<()> {
+        if let Some(call) = &self.on_accept {
+            context.post(call)?;
+        }
+        Ok(())
+    }
+
+    /// Close the picker by posting the host's cancel call.
+    #[command]
+    pub fn cancel(&mut self, context: &mut dyn Context) -> Result<()> {
+        if let Some(call) = &self.on_cancel {
+            context.post(call)?;
+        }
+        Ok(())
     }
 
     /// Return the list, which takes the keyboard while the modal is open, or
@@ -147,50 +213,6 @@ where
             .ok_or_else(|| Error::NotFound("picker filter".into()))
     }
 
-    /// Add `widget` over the dialog, hidden until [`Self::open_overlay`]
-    /// shows it.
-    ///
-    /// The overlay is a child of the picker, which is what lets a scope show
-    /// it while the picker's own scope is open: Canopy nests a scope only
-    /// inside the modal it covers. Add it after the picker has mounted.
-    pub fn add_overlay<W>(&self, context: &mut dyn Context, widget: W) -> Result<TypedId<W>>
-    where
-        W: Widget + 'static,
-    {
-        let overlay = context.add_child_to(context.node_id(), widget)?;
-        context.set_hidden_of(overlay.into(), true)?;
-        Ok(overlay)
-    }
-
-    /// Open `overlay` in a modal scope over the list.
-    ///
-    /// The scope is owned by the picker, so it nests inside the scope that
-    /// shows the picker. It shows the overlay, dims the dialog behind it,
-    /// gives `initial_focus` the keyboard, and admits `bindings`. The list
-    /// keeps its filter and selection, and takes the keyboard back when the
-    /// host closes the scope with the returned token.
-    /// @param overlay A node added with [`Self::add_overlay`].
-    /// @param initial_focus The node inside `overlay` that takes the keyboard.
-    /// @param bindings The bindings the scope admits.
-    pub fn open_overlay(
-        &self,
-        context: &mut dyn Context,
-        overlay: NodeId,
-        initial_focus: NodeId,
-        bindings: ModalBindings,
-    ) -> Result<InteractionToken> {
-        let dialog = self
-            .dialog
-            .ok_or_else(|| Error::NotFound("picker dialog".into()))?;
-        context.open_modal(ModalOptions {
-            owner: context.node_id(),
-            modal: overlay,
-            initial_focus,
-            dim_target: Some(dialog),
-            bindings,
-        })
-    }
-
     /// Return the typed list, or an error before the picker mounts.
     fn typed_list(&self) -> Result<TypedId<PickerList<T>>> {
         self.list
@@ -200,7 +222,7 @@ where
 
 impl<T> Widget for Picker<T>
 where
-    T: Label + 'static,
+    T: ItemLabel + 'static,
 {
     fn layout(&self) -> Layout {
         // A stack centres the dialog over the dimmed application, with any
@@ -214,44 +236,38 @@ where
 
     fn on_mount(&mut self, context: &mut dyn Context) -> Result<()> {
         let root = context.node_id();
-        let dialog: NodeId = context.add_child_to(root, PickerDialog)?.into();
         // The dialog fits its contents rather than filling the view, so a
-        // short list is a small dialog. The margin above caps a long one, which
-        // then nearly fills the view. The width a narrow dialog holds comes
-        // from the list's own measurement, which the view bounds, rather than
-        // from a minimum here that a narrow terminal could not honour.
-        context.set_layout_override_of(
-            dialog,
-            LayoutOverride {
-                width: Some(Sizing::Measure),
-                height: Some(Sizing::Measure),
-                ..LayoutOverride::new()
-            },
-        )?;
-        let frame = context.add_child_to(dialog, Frame::new())?;
-        // The list and the field are siblings in a column, so the field sits
-        // outside whatever the list scrolls. However many items the list holds,
-        // the field keeps its row at the bottom of the frame.
-        let body = context.add_child_to(
-            frame,
-            Container::new(Layout::fill().direction(Direction::Column)).with_name("picker_body"),
-        )?;
-        let list = context.add_child_to(body, PickerList::<T>::new())?;
-        let filter = context.add_child_to(body, PickerFilter::new())?;
+        // short list is a small dialog. The picker's own margin caps a long
+        // one, which then nearly fills the view. The width a narrow dialog
+        // holds comes from the list's own measurement, which the view bounds,
+        // rather than from a minimum here that a narrow terminal could not
+        // honour. The list and the field are siblings in a column, so the
+        // field sits outside whatever the list scrolls. However many items the
+        // list holds, the field keeps its row at the bottom of the frame.
+        let (dialog, body) = Dialog::new()
+            .with_margin(Edges::all(0))
+            .add(context, root, PickerBody)?;
+        let dialog: NodeId = dialog.into();
+        let frame: NodeId = Dialog::frame(context, dialog)?.into();
+        let list = context.add_child(body, PickerList::<T>::new())?;
+        // The field takes no focus and no keys of its own: the list owns the
+        // keyboard while the modal is open, writes what it holds there, and
+        // lights it up while it takes filter text.
+        let filter = context.add_child(body, Input::new("").with_prompt(FILTER_PROMPT))?;
         // The list takes whatever height is left, and the field keeps its one
         // measured row, so a list too tall to fit scrolls instead of pushing
         // the field off the bottom.
         let rows: NodeId = list.into();
         let field: NodeId = filter.into();
-        context.set_layout_of(rows, Layout::fill())?;
-        context.set_layout_of(
+        context.set_layout_override(rows, Layout::fill().into())?;
+        context.set_layout_override(
             field,
             Layout::fill()
                 .height(Sizing::Measure)
-                .fixed_height(FILTER_ROWS),
+                .fixed_height(FILTER_ROWS)
+                .into(),
         )?;
 
-        let frame: NodeId = frame.into();
         let truncate = self.truncate;
         context.with_widget_mut(list, |list: &mut PickerList<T>, _| {
             list.frame = Some(frame);
@@ -278,16 +294,16 @@ where
     }
 }
 
-/// The framed dialog inside a picker, which carries the picker's style layer.
+/// The body of a picker's dialog, which carries the picker's style layer.
 ///
 /// The layer is pushed here rather than at the picker's root, so an overlay a
 /// host adds beside the dialog is styled as its own widget rather than as a
-/// part of the picker.
-struct PickerDialog;
+/// part of the picker, and the dialog's frame takes the shared dialog rules.
+struct PickerBody;
 
-impl Widget for PickerDialog {
+impl Widget for PickerBody {
     fn layout(&self) -> Layout {
-        Layout::fill()
+        Layout::fill().direction(Direction::Column)
     }
 
     fn render(&mut self, render: &mut Render, _context: &dyn ViewContext) -> Result<()> {
@@ -296,118 +312,7 @@ impl Widget for PickerDialog {
     }
 
     fn name(&self) -> NodeName {
-        NodeName::convert("picker_dialog")
-    }
-}
-
-/// The filter field under a picker's list.
-///
-/// The field takes no focus and no keys of its own: the list owns the keyboard
-/// while the modal is open and writes what it holds here. It is a sibling of
-/// the list rather than a row of it, so it stays on screen however far the
-/// list scrolls.
-pub struct PickerFilter {
-    /// Text the list is filtering by.
-    text: String,
-    /// Whether the list is taking filter text.
-    active: bool,
-}
-
-impl Default for PickerFilter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PickerFilter {
-    /// Build an empty field.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            text: String::new(),
-            active: false,
-        }
-    }
-
-    /// Return the text the field shows.
-    #[must_use]
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// Show `text`, and whether the list is taking more of it.
-    fn set(&mut self, text: String, active: bool) {
-        self.text = text;
-        self.active = active;
-    }
-}
-
-impl Widget for PickerFilter {
-    fn layout(&self) -> Layout {
-        Layout::fill()
-            .height(Sizing::Measure)
-            .fixed_height(FILTER_ROWS)
-    }
-
-    fn measure(&self, c: MeasureConstraints) -> Measurement {
-        // The field is as wide as it is given and never taller than its row,
-        // so a list beside it decides the dialog's width.
-        c.clamp(Size::new(0, FILTER_ROWS))
-    }
-
-    fn canvas(&self, view: Size, _context: &CanvasContext) -> Size {
-        // The field never scrolls: it trims its text instead.
-        view
-    }
-
-    fn render(&mut self, render: &mut Render, context: &dyn ViewContext) -> Result<()> {
-        let area = context.view().view_rect_local();
-        // Paint paths are relative to the layer the picker pushes, so these
-        // reach `picker/filter`. Taking keys adds a segment, which is what
-        // lights the field up while the list waits.
-        let (ground, prompt, text) = if self.active {
-            (
-                "filter/active",
-                "filter/active/prompt",
-                "filter/active/text",
-            )
-        } else {
-            ("filter", "filter/prompt", "filter/text")
-        };
-        render.fill(ground, area, ' ')?;
-        if area.w == 0 || area.h == 0 {
-            return Ok(());
-        }
-        let line = area.line(0)?;
-        // The prompt names the key that opened the field, so the row says what
-        // it is even before anything is typed.
-        let prompt_width = 2.min(area.w);
-        render.text(prompt, Line::new(line.tl.x, line.tl.y, prompt_width), " /")?;
-
-        let rest = area.w.saturating_sub(prompt_width);
-        if rest == 0 {
-            return Ok(());
-        }
-        let budget = (rest as usize).saturating_sub(1);
-        // The tail is what was typed last, so a filter too long to show loses
-        // its head rather than the characters under the caret.
-        let shown = Truncate::Start.apply(&self.text, budget);
-        // The caret marks where typing lands, so it belongs to the field only
-        // while the field is taking keys.
-        let caret = if self.active {
-            CARET.to_string()
-        } else {
-            String::new()
-        };
-        render.text(
-            text,
-            Line::new(line.tl.x.saturating_add(prompt_width), line.tl.y, rest),
-            &format!(" {shown}{caret}"),
-        )
-    }
-
-    fn name(&self) -> NodeName {
-        NodeName::convert("picker_filter")
+        NodeName::convert("picker_body")
     }
 }
 
@@ -418,14 +323,14 @@ impl Widget for PickerFilter {
 /// count, and writes the filter into the field below it.
 pub struct PickerList<T>
 where
-    T: Label,
+    T: ItemLabel,
 {
     /// Every item the host supplied.
     items: Vec<T>,
     /// Positions in `items` that the filter passes, in order.
     shown: Vec<usize>,
-    /// Position within `shown`, not within `items`.
-    selected: Option<usize>,
+    /// Cursor over `shown`, giving a position within it, not within `items`.
+    cursor: RowCursor,
     /// Text a label must contain, ignoring ASCII case.
     filter: String,
     /// Whether the field is taking filter text.
@@ -447,7 +352,7 @@ where
 #[derive_commands]
 impl<T> PickerList<T>
 where
-    T: Label + 'static,
+    T: ItemLabel + 'static,
 {
     /// Build an empty list.
     #[must_use]
@@ -455,7 +360,7 @@ where
         Self {
             items: Vec::new(),
             shown: Vec::new(),
-            selected: None,
+            cursor: RowCursor::new(0),
             filter: String::new(),
             filtering: false,
             label: String::new(),
@@ -467,21 +372,25 @@ where
         }
     }
 
-    /// Move the selection by a signed row count.
-    ///
-    /// The count saturates at both ends, so the smallest and largest values
-    /// select the first and the last item. There is no separate command for
-    /// either end, because it would carry no behaviour of its own.
+    /// Select the first item.
+    #[command]
+    pub fn select_first(&mut self, context: &mut dyn Context) -> Result<()> {
+        self.cursor.select_first();
+        self.refresh(context)
+    }
+
+    /// Select the last item.
+    #[command]
+    pub fn select_last(&mut self, context: &mut dyn Context) -> Result<()> {
+        self.cursor.select_last();
+        self.refresh(context)
+    }
+
+    /// Move the selection by a signed row count, saturating at both ends.
     /// @param delta Negative values move up; positive values move down.
     #[command]
     pub fn select_by(&mut self, context: &mut dyn Context, delta: i32) -> Result<()> {
-        if self.shown.is_empty() {
-            self.selected = None;
-            return self.refresh(context);
-        }
-        let last = self.shown.len() - 1;
-        let selected = self.selected.unwrap_or(0);
-        self.selected = Some(selected.saturating_add_signed(delta as isize).min(last));
+        self.cursor.select_by(delta);
         self.refresh(context)
     }
 
@@ -489,9 +398,9 @@ where
     /// @param delta Negative values move up; positive values move down.
     #[command]
     pub fn page(&mut self, context: &mut dyn Context, delta: i32) -> Result<()> {
-        let rows = context.view().view_rect().h.max(1);
-        let page = i32::try_from(rows).unwrap_or(i32::MAX);
-        self.select_by(context, delta.saturating_mul(page))
+        let rows = context.view().view_rect().h;
+        self.cursor.page(delta, rows);
+        self.refresh(context)
     }
 
     /// Open the filter field. Typed text narrows the list to the items that
@@ -547,7 +456,7 @@ where
     }
 
     /// Show `items` under `label`, dropping any filter.
-    pub fn show(
+    pub fn set_items(
         &mut self,
         context: &mut dyn Context,
         label: String,
@@ -562,15 +471,47 @@ where
         self.apply_filter();
         // The list is new, so it opens at its first row rather than wherever
         // the last one was left.
-        self.selected = (!self.shown.is_empty()).then_some(0);
-        context.scroll_to(0, 0);
+        self.cursor = RowCursor::new(self.shown.len());
+        context.scroll(ScrollOp::To(Point { x: 0, y: 0 }));
+        self.refresh(context)
+    }
+
+    /// Show `items` under `label` in place of the current items, and keep
+    /// the filter and the selected item, which `same` finds among the new
+    /// items. A selected item that left the list leaves the selection at its
+    /// row.
+    pub fn update_items(
+        &mut self,
+        context: &mut dyn Context,
+        label: String,
+        placeholder: &'static str,
+        items: Vec<T>,
+        same: impl Fn(&T, &T) -> bool,
+    ) -> Result<()> {
+        let row = self.cursor.index();
+        let kept = self
+            .selected()
+            .and_then(|old| items.iter().position(|new| same(old, new)));
+        self.items = items;
+        self.label = label;
+        self.placeholder = placeholder;
+        self.apply_filter();
+        match kept.and_then(|item| self.shown.iter().position(|&shown| shown == item)) {
+            Some(shown) => self.cursor.set_index(shown),
+            None => {
+                if let Some(row) = row.filter(|_| !self.shown.is_empty()) {
+                    self.cursor.set_index(row.min(self.shown.len() - 1));
+                }
+            }
+        }
         self.refresh(context)
     }
 
     /// Return the selected item.
     #[must_use]
     pub fn selected(&self) -> Option<&T> {
-        self.selected
+        self.cursor
+            .index()
             .and_then(|row| self.shown.get(row))
             .and_then(|&item| self.items.get(item))
     }
@@ -581,15 +522,11 @@ where
     /// to. The selection stays on the row, which now holds the item below, so
     /// repeated removals work without moving the hand.
     pub fn remove_selected(&mut self, context: &mut dyn Context) -> Result<()> {
-        let Some(&item) = self.selected.and_then(|row| self.shown.get(row)) else {
+        let Some(&item) = self.cursor.index().and_then(|row| self.shown.get(row)) else {
             return self.republish(context);
         };
         self.items.remove(item);
         self.apply_filter();
-        self.selected = match self.selected {
-            Some(row) if row < self.shown.len() => Some(row),
-            _ => self.shown.len().checked_sub(1),
-        };
         self.refresh(context)
     }
 
@@ -603,34 +540,23 @@ where
             .filter(|(_, item)| item.label().to_ascii_lowercase().contains(&needle))
             .map(|(index, _)| index)
             .collect();
-        let widest = self
+        let labels = self
             .shown
             .iter()
             .filter_map(|&item| self.items.get(item))
-            .map(|item| text::display_width(item.label()))
-            .chain(Some(text::display_width(self.placeholder)))
-            .max()
-            .unwrap_or(0);
-        self.fitted_width = u32::try_from(widest)
-            .unwrap_or(u32::MAX)
-            .saturating_add(ROW_PADDING);
+            .map(ItemLabel::label);
+        let widest = widest_label(labels.chain(Some(self.placeholder)));
+        self.fitted_width = widest.saturating_add(ROW_PADDING);
         // A filter that hides the selected row pulls the selection back into
         // range rather than leaving it past the end.
-        self.selected = match self.selected {
-            _ if self.shown.is_empty() => None,
-            Some(row) => Some(row.min(self.shown.len() - 1)),
-            None => Some(0),
-        };
+        self.cursor.set_len(self.shown.len());
     }
 
     /// Redraw the title and the field, re-measure, and reveal the selection.
     fn refresh(&self, context: &mut dyn Context) -> Result<()> {
-        context.invalidate_layout();
-        if let Some(row) = self.selected.and_then(|row| u32::try_from(row).ok()) {
-            // Nearest keeps a long list still while the selection moves within
-            // the rows already on screen.
-            context.reveal_area(Rect::new(0, row, 1, 1), RevealAlign::Nearest);
-        }
+        // Nearest keeps a long list still while the selection moves within the
+        // rows already on screen.
+        self.cursor.reveal(context);
         self.republish(context)
     }
 
@@ -643,9 +569,10 @@ where
             // show: one being typed, or one left standing after it was given.
             // Hidden, it leaves the layout entirely, so the frame gives the row
             // back to the list.
-            context.set_hidden_of(field, !active && text.is_empty())?;
-            context.with_widget_mut(field, |field: &mut PickerFilter, _| {
-                field.set(text, active);
+            context.set_hidden(field, !active && text.is_empty())?;
+            context.with_widget_mut(field, |field: &mut Input, _| {
+                field.set_value(text);
+                field.set_active(Some(active));
                 Ok(())
             })?;
         }
@@ -676,30 +603,26 @@ where
 
     /// Edit the open filter with one event.
     ///
-    /// Enter keeps the filter and closes the field, and escape drops it. Other
-    /// keys pass on, so the paging keys still reach their bindings.
+    /// Enter keeps the filter and closes the field, and escape drops it.
+    /// Other keys pass on, so the paging keys still reach their bindings.
     fn filter_event(&mut self, event: &Event, context: &mut dyn Context) -> Result<EventOutcome> {
         let mut text = self.filter.clone();
         match event {
-            Event::Key(key) => match key.key {
-                KeyCode::Enter => {
+            Event::Key(key) => match self.filter_command(*key) {
+                Some(FilterCommand::Accept) => {
                     self.filtering = false;
                     self.republish(context)?;
                     return Ok(EventOutcome::Handle);
                 }
-                KeyCode::Esc => {
+                Some(FilterCommand::Clear) => {
                     self.clear_filter(context)?;
                     return Ok(EventOutcome::Handle);
                 }
-                KeyCode::Backspace if text.pop().is_none() => {
-                    self.clear_filter(context)?;
-                    return Ok(EventOutcome::Handle);
+                Some(FilterCommand::Backspace) => {
+                    let _ = text.pop();
                 }
-                KeyCode::Backspace => {}
-                KeyCode::Char(character) if !key.mods.ctrl && !key.mods.alt => {
-                    text.push(character);
-                }
-                _ => return Ok(EventOutcome::Ignore),
+                Some(FilterCommand::Push(character)) => text.push(character),
+                None => return Ok(EventOutcome::Ignore),
             },
             Event::Paste(pasted) => {
                 text.extend(pasted.chars().filter(|character| !character.is_control()));
@@ -710,15 +633,103 @@ where
         Ok(EventOutcome::Handle)
     }
 
+    /// Classify one key while the filter is open.
+    ///
+    /// `None` means the key passes on to bindings, matching
+    /// [`PickerList::filter_event`].
+    fn filter_command(&self, key: key::Key) -> Option<FilterCommand> {
+        match key.key {
+            KeyCode::Enter => Some(FilterCommand::Accept),
+            KeyCode::Esc => Some(FilterCommand::Clear),
+            KeyCode::Backspace if self.filter.is_empty() => Some(FilterCommand::Clear),
+            KeyCode::Backspace => Some(FilterCommand::Backspace),
+            KeyCode::Char(_) => key.text_char().map(FilterCommand::Push),
+            _ => None,
+        }
+    }
+
     /// Return the row count, which is one per item or one placeholder row.
     fn rows(&self) -> u32 {
         u32::try_from(self.shown.len().max(1)).unwrap_or(u32::MAX)
     }
 }
 
+/// One open-filter action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterCommand {
+    /// Keep the filter and close the field.
+    Accept,
+    /// Drop the filter and close the field.
+    Clear,
+    /// Delete one character from the filter.
+    Backspace,
+    /// Append one character to the filter.
+    Push(char),
+}
+
+impl<T> Register for PickerList<T>
+where
+    T: ItemLabel + 'static,
+{
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        setup.add_commands::<Picker<T>>()?;
+        register_clear_intent(setup)?;
+        let nav = |intent: NavIntent| -> Result<BindingAction> {
+            Ok(BindingAction::Intent(IntentName::new(intent.name())?))
+        };
+        let bindings: [(&str, &str, BindingAction); 11] = [
+            ("Up", "Previous entry", nav(NavIntent::Up)?),
+            ("k", "Previous entry", nav(NavIntent::Up)?),
+            ("Down", "Next entry", nav(NavIntent::Down)?),
+            ("j", "Next entry", nav(NavIntent::Down)?),
+            ("PageUp", "Page up", nav(NavIntent::PageUp)?),
+            ("PageDown", "Page down", nav(NavIntent::PageDown)?),
+            ("Home", "First entry", nav(NavIntent::First)?),
+            ("End", "Last entry", nav(NavIntent::Last)?),
+            (
+                "/",
+                "Filter the list",
+                BindingAction::Command(Self::call_start_filter()),
+            ),
+            (
+                "Enter",
+                "Accept the selected entry",
+                BindingAction::Command(Picker::<T>::call_accept()),
+            ),
+            (
+                "Esc",
+                "Close the picker",
+                BindingAction::Command(Picker::<T>::call_cancel()),
+            ),
+        ];
+        for (key, description, action) in bindings {
+            // Intents always run before the widget; commands run after it, so
+            // typed filter text reaches the list first.
+            let phase = match action {
+                BindingAction::Intent(_) => None,
+                _ => Some(BindingPhase::AfterWidget),
+            };
+            setup.bind(
+                Key::parse_spec(key)?,
+                BindingOptions {
+                    show_in_help: true,
+                    path: Some("**/picker/**/".parse()?),
+                    tier: BindingTier::Framework(Picker::<T>::BINDINGS),
+                    description: description.to_string(),
+                    source: None,
+                    phase,
+                },
+                action,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl<T> Default for PickerList<T>
 where
-    T: Label + 'static,
+    T: ItemLabel + 'static,
 {
     fn default() -> Self {
         Self::new()
@@ -727,7 +738,7 @@ where
 
 impl<T> Widget for PickerList<T>
 where
-    T: Label + 'static,
+    T: ItemLabel + 'static,
 {
     fn layout(&self) -> Layout {
         Layout::fill()
@@ -762,22 +773,36 @@ where
         }
 
         let budget = (area.w as usize).saturating_sub(ROW_PADDING as usize);
-        let visible = view.view_rect();
-        for offset in 0..visible.h {
-            let row = usize::try_from(visible.tl.y.saturating_add(offset)).unwrap_or(usize::MAX);
-            let Some(item) = self.shown.get(row).and_then(|&item| self.items.get(item)) else {
-                break;
-            };
+        for (offset, row) in label_rows(self.shown.len(), view.scroll.y, area.h) {
+            let item = &self.items[self.shown[row]];
             // A filter taking keys leaves the list holding its place rather
             // than driving it, so the selection dims until the keys come back.
-            let style = if self.selected == Some(row) {
+            let style = if self.cursor.index() == Some(row) {
                 roles::selection(context.is_focused() && !self.filtering)
+            } else if item.muted() {
+                "muted"
             } else {
                 "text"
             };
-            let shown = self.truncate.apply(item.label(), budget);
             let line = Line::new(area.tl.x, area.tl.y.saturating_add(offset), area.w);
-            render.text(style, line, &format!(" {shown}"))?;
+            let label = item.label();
+            match item.runs() {
+                // A label that fits paints its runs beneath the style of the
+                // row. One that must be cut paints as one run.
+                Some(runs) if text::width(label) as usize <= budget => {
+                    render.fill(style, Rect::new(line.tl.x, line.tl.y, line.w, 1), ' ')?;
+                    let styled = runs
+                        .into_iter()
+                        .map(|(role, text)| (format!("{style}/{role}"), text))
+                        .collect::<Vec<_>>();
+                    let runs = styled.iter().map(|(role, text)| (role.as_str(), *text));
+                    render.runs(line, style, iter::once((style, " ")).chain(runs))?;
+                }
+                _ => {
+                    let shown = self.truncate.apply(label, budget);
+                    render.text(style, line, &format!(" {shown}"))?;
+                }
+            }
         }
         Ok(())
     }
@@ -793,6 +818,37 @@ where
         Ok(EventOutcome::Ignore)
     }
 
+    fn key_outcome(&self, key: key::Key, _context: &dyn ViewContext) -> EventOutcome {
+        if self.filtering && self.filter_command(key).is_some() {
+            EventOutcome::Handle
+        } else {
+            EventOutcome::Ignore
+        }
+    }
+
+    fn accepts_intent(&self, intent: &str, _context: &dyn ViewContext) -> bool {
+        (self.filtering && intent == crate::CLEAR_INTENT)
+            || (!self.shown.is_empty() && CursorMove::of(intent).is_some())
+    }
+
+    fn on_intent(&mut self, intent: &str, context: &mut dyn Context) -> Result<EventOutcome> {
+        if let Some(movement) = CursorMove::of(intent) {
+            match movement {
+                CursorMove::By(delta) => self.select_by(context, delta)?,
+                CursorMove::Page(delta) => self.page(context, delta)?,
+                CursorMove::First => self.select_first(context)?,
+                CursorMove::Last => self.select_last(context)?,
+            }
+            return Ok(EventOutcome::Handle);
+        }
+        if !self.filtering || intent != crate::CLEAR_INTENT {
+            return Ok(EventOutcome::Ignore);
+        }
+        // The filter stays open, so the next key narrows the list again.
+        self.set_filter(context, String::new())?;
+        Ok(EventOutcome::Handle)
+    }
+
     fn name(&self) -> NodeName {
         NodeName::convert("picker_list")
     }
@@ -800,12 +856,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use canopy::{Loader, geom::Size, testing::harness::Harness};
+    use canopy::{
+        commands::CommandTarget,
+        geom::Size,
+        input::{ModalBindings, ModalOptions},
+        render::cursor,
+        testing::harness::Harness,
+    };
 
     use super::*;
     use crate::Confirm;
-
-    impl Loader for Picker<String> {}
 
     /// Build a picker showing `items`, rendered once.
     fn picker(items: &[&str], width: u32, height: u32) -> Result<Harness> {
@@ -819,8 +879,8 @@ mod tests {
             .build()?;
         harness.render()?;
         let items: Vec<String> = items.iter().map(|item| (*item).to_string()).collect();
-        harness.with_root_context(|picker: &mut Picker<String>, context| {
-            picker.show(context, "Bookmarks", "<no bookmarks>", items)
+        harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
+            picker.set_items(context, "Bookmarks", "<no bookmarks>", items)
         })?;
         harness.render()?;
         Ok(harness)
@@ -831,7 +891,7 @@ mod tests {
         harness: &mut Harness,
         command: impl FnOnce(&mut PickerList<String>, &mut dyn Context) -> Result<()>,
     ) -> Result<()> {
-        harness.with_root_context(|picker: &mut Picker<String>, context| {
+        harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
             let list = picker.list()?;
             context.with_widget_mut(list, command)
         })?;
@@ -842,7 +902,7 @@ mod tests {
     /// Return a value read from the list inside the picker.
     fn from_list<R>(harness: &mut Harness, read: impl FnOnce(&PickerList<String>) -> R) -> R {
         harness
-            .with_root_context(|picker: &mut Picker<String>, context| {
+            .with_root_widget_context(|picker: &mut Picker<String>, context| {
                 let list = picker.list()?;
                 context.with_widget_mut(list, |list: &mut PickerList<String>, _| Ok(read(list)))
             })
@@ -864,9 +924,10 @@ mod tests {
 
     /// Return where the picker's frame, list, and filter field sit.
     fn parts(harness: &mut Harness) -> Result<Geometry> {
-        let (list, filter) = harness.with_root_context(|picker: &mut Picker<String>, _| {
-            Ok((picker.list()?, picker.filter()?))
-        })?;
+        let (list, filter) =
+            harness.with_root_widget_context(|picker: &mut Picker<String>, _| {
+                Ok((picker.list()?, picker.filter()?))
+            })?;
         let frame = harness
             .find_nodes("**/picker/**/frame")?
             .first()
@@ -883,6 +944,118 @@ mod tests {
             list: span(list),
             field: span(filter),
         })
+    }
+
+    /// Holds a picker, and records the selection each accept finds.
+    #[derive(Default)]
+    struct PickerHost {
+        /// The picker, until an accept closes it.
+        picker: Option<NodeId>,
+        /// The selection each accept read from the list.
+        accepted: Vec<String>,
+        /// Whether an accept removes the picker.
+        close_on_accept: bool,
+    }
+
+    #[canopy::derive_commands]
+    impl PickerHost {
+        /// Record the list's selection as it is now, and close the picker
+        /// when asked.
+        #[command]
+        fn accepted(&mut self, ctx: &mut dyn Context) -> Result<()> {
+            let picker = self
+                .picker
+                .ok_or_else(|| Error::NotFound("picker".into()))?;
+            let name = ctx.with_widget_mut(picker, |picker: &mut Picker<String>, ctx| {
+                let list = picker.list()?;
+                ctx.with_widget_mut(list, |list: &mut PickerList<String>, _| {
+                    Ok(list.selected_name())
+                })
+            })?;
+            self.accepted.push(name);
+            if self.close_on_accept {
+                self.picker = None;
+                ctx.remove_subtree(picker)?;
+            }
+            Ok(())
+        }
+
+        /// Ignore a cancel.
+        #[command]
+        fn cancelled(&self) {}
+    }
+
+    impl Widget for PickerHost {
+        fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
+            let owner = CommandTarget::Exact(ctx.node_id());
+            let mut picker = Picker::<String>::new();
+            picker.set_commands(
+                Self::call_accepted().with_target(owner),
+                Self::call_cancelled().with_target(owner),
+            );
+            self.picker = Some(ctx.add_child(ctx.node_id(), picker)?.into());
+            Ok(())
+        }
+    }
+
+    /// Build a host whose picker shows `/a`, `/b`, and `/c`.
+    fn hosting(close_on_accept: bool) -> Result<(Harness, NodeId)> {
+        let host = PickerHost {
+            close_on_accept,
+            ..PickerHost::default()
+        };
+        let mut harness = Harness::builder(host)
+            .configure(|setup| setup.add_commands::<PickerHost>())
+            .size(40, 12)
+            .build()?;
+        harness.render()?;
+        let picker = harness
+            .with_root_widget(|host: &mut PickerHost| host.picker)
+            .expect("the picker mounted");
+        harness.canopy.with_context(picker, |ctx| {
+            ctx.with_widget_mut(picker, |picker: &mut Picker<String>, ctx| {
+                let items = ["/a", "/b", "/c"].map(str::to_owned).to_vec();
+                picker.set_items(ctx, "Pick", "<none>", items)
+            })
+        })?;
+        harness.render()?;
+        Ok((harness, picker))
+    }
+
+    #[test]
+    fn an_accept_reads_the_selection_as_it_is_when_it_runs() -> Result<()> {
+        let (mut harness, picker) = hosting(false)?;
+        harness.canopy.with_context(picker, |ctx| {
+            ctx.with_widget_mut(picker, |picker: &mut Picker<String>, ctx| {
+                picker.accept(ctx)?;
+                // A later change in the same dispatch lands before the accept
+                // runs, because the accept carries no selection.
+                let list = picker.list()?;
+                ctx.with_widget_mut(list, |list: &mut PickerList<String>, ctx| {
+                    list.select_by(ctx, 1)
+                })
+            })
+        })?;
+        let accepted = harness.with_root_widget(|host: &mut PickerHost| host.accepted.clone());
+        assert_eq!(accepted, ["/b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_can_remove_the_picker_from_its_accept() -> Result<()> {
+        let (mut harness, picker) = hosting(true)?;
+        harness.canopy.with_context(picker, |ctx| {
+            ctx.with_widget_mut(picker, |picker: &mut Picker<String>, ctx| {
+                picker.accept(ctx)
+            })
+        })?;
+        let accepted = harness.with_root_widget(|host: &mut PickerHost| host.accepted.clone());
+        assert_eq!(accepted, ["/a"]);
+        let gone = harness
+            .canopy
+            .with_root_view(|ctx| ctx.type_id_of(picker).is_none());
+        assert!(gone, "the host removed the picker that accepted");
+        Ok(())
     }
 
     #[test]
@@ -957,6 +1130,78 @@ mod tests {
     }
 
     #[test]
+    fn the_clear_action_empties_the_filter_and_keeps_its_field() -> Result<()> {
+        let mut harness = picker(&["alpha", "beta"], 40, 12)?;
+        on_list(&mut harness, PickerList::start_filter)?;
+        on_list(&mut harness, |list, context| {
+            list.set_filter(context, "al".into())
+        })?;
+        assert_eq!(from_list(&mut harness, PickerList::shown_count), 1);
+
+        harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
+            let list = picker.list()?;
+            context.with_widget_mut(list, |list: &mut PickerList<String>, context| {
+                assert!(
+                    list.accepts_intent(crate::CLEAR_INTENT, context),
+                    "the open filter consumes the clear action"
+                );
+                assert_eq!(
+                    list.on_intent(crate::CLEAR_INTENT, context)?,
+                    EventOutcome::Handle
+                );
+                Ok(())
+            })
+        })?;
+        harness.render()?;
+        assert_eq!(from_list(&mut harness, PickerList::filter), "");
+        assert_eq!(from_list(&mut harness, PickerList::shown_count), 2);
+
+        // The field stays open, so the next key filters again.
+        harness.key('b')?;
+        harness.render()?;
+        assert_eq!(from_list(&mut harness, PickerList::filter), "b");
+        assert_eq!(from_list(&mut harness, PickerList::shown_count), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_keys_predict_their_handling() -> Result<()> {
+        let keys = [
+            "a",
+            "enter",
+            "esc",
+            "backspace",
+            "up",
+            "f1",
+            "ctrl-a",
+            "ctrl-x",
+            "alt-x",
+        ];
+        for filtering in [false, true] {
+            for spec in keys {
+                let mut harness = picker(&["alpha", "beta"], 40, 12)?;
+                if filtering {
+                    on_list(&mut harness, PickerList::start_filter)?;
+                    on_list(&mut harness, |list, context| {
+                        list.set_filter(context, "al".into())
+                    })?;
+                }
+                harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
+                    let list = picker.list()?;
+                    context.with_widget_mut(list, |list: &mut PickerList<String>, context| {
+                        let key = key::Key::parse_spec(spec).expect("valid key spec");
+                        let predicted = list.key_outcome(key, context);
+                        let actual = list.on_event(&Event::Key(key), context)?;
+                        assert_eq!(predicted, actual, "filtering {filtering}: {spec}");
+                        Ok(())
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn the_filter_shows_in_the_field_rather_than_the_title() -> Result<()> {
         let mut harness = picker(&["/tmp/alpha", "/tmp/beta"], 40, 12)?;
         on_list(&mut harness, PickerList::start_filter)?;
@@ -1005,7 +1250,8 @@ mod tests {
     /// The modal gives the list the keyboard, so the key reaches the filter
     /// here the way it does in an application.
     fn commit(harness: &mut Harness) -> Result<()> {
-        let list = harness.with_root_context(|picker: &mut Picker<String>, _| picker.list())?;
+        let list =
+            harness.with_root_widget_context(|picker: &mut Picker<String>, _| picker.list())?;
         harness.canopy.with_root_context(|context| {
             context.set_focus(list)?;
             Ok(())
@@ -1054,6 +1300,189 @@ mod tests {
         Ok(())
     }
 
+    /// An item that can show muted.
+    struct Entry {
+        /// Label.
+        label: String,
+        /// Whether the entry shows muted.
+        muted: bool,
+    }
+
+    impl ItemLabel for Entry {
+        fn label(&self) -> &str {
+            &self.label
+        }
+
+        fn muted(&self) -> bool {
+            self.muted
+        }
+    }
+
+    #[test]
+    fn an_update_keeps_the_filter_and_the_selected_item() -> Result<()> {
+        let mut harness = picker(&["/tmp/alpha", "/tmp/beta", "/tmp/gamma"], 40, 12)?;
+        on_list(&mut harness, |list, context| {
+            list.set_filter(context, "a".into())?;
+            list.select_by(context, 1)
+        })?;
+        let items = ["/tmp/zeta", "/tmp/alpha", "/tmp/beta", "/tmp/gamma"]
+            .map(str::to_owned)
+            .to_vec();
+        harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
+            picker.update_items(context, "Bookmarks", "<none>", items, |old, new| old == new)
+        })?;
+        on_list(&mut harness, |list, _| {
+            assert_eq!(list.filter(), "a", "the filter stays");
+            assert_eq!(list.selected_name(), "/tmp/beta", "the selected item stays");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_muted_item_takes_the_muted_foreground() -> Result<()> {
+        let mut harness = Harness::builder(Picker::<Entry>::new())
+            .size(40, 12)
+            .build()?;
+        harness.render()?;
+        let entries = vec![
+            Entry {
+                label: "first".to_owned(),
+                muted: false,
+            },
+            Entry {
+                label: "xmuted".to_owned(),
+                muted: true,
+            },
+            Entry {
+                label: "zplain".to_owned(),
+                muted: false,
+            },
+        ];
+        harness.with_root_widget_context(|picker: &mut Picker<Entry>, context| {
+            picker.set_items(context, "Entries", "<none>", entries)
+        })?;
+        harness.render()?;
+        let foreground = |needle: char| {
+            harness
+                .canopy
+                .snapshot()
+                .expect("published picker")
+                .buffer
+                .cells()
+                .iter()
+                .find(|cell| cell.ch == needle)
+                .map(|cell| cell.style.fg)
+                .unwrap_or_else(|| panic!("{needle:?} renders"))
+        };
+        assert_ne!(
+            foreground('x'),
+            foreground('z'),
+            "a muted row stands apart from a plain one"
+        );
+        Ok(())
+    }
+
+    /// An item in styled runs.
+    struct Styled {
+        /// Label.
+        label: String,
+        /// Role and text of each run.
+        runs: Vec<(&'static str, String)>,
+        /// Whether the item shows muted.
+        muted: bool,
+    }
+
+    impl Styled {
+        /// Builds an item of `runs`.
+        fn new(runs: &[(&'static str, &str)], muted: bool) -> Self {
+            Self {
+                label: runs.iter().map(|(_, text)| *text).collect(),
+                runs: runs
+                    .iter()
+                    .map(|(role, text)| (*role, (*text).to_owned()))
+                    .collect(),
+                muted,
+            }
+        }
+    }
+
+    impl ItemLabel for Styled {
+        fn label(&self) -> &str {
+            &self.label
+        }
+
+        fn muted(&self) -> bool {
+            self.muted
+        }
+
+        fn runs(&self) -> Option<Vec<(&str, &str)>> {
+            Some(
+                self.runs
+                    .iter()
+                    .map(|(role, text)| (*role, text.as_str()))
+                    .collect(),
+            )
+        }
+    }
+
+    #[test]
+    fn runs_take_their_role_beneath_the_style_of_the_row() -> Result<()> {
+        use canopy::style::Color;
+
+        let mut harness = Harness::builder(Picker::<Styled>::new())
+            .configure(|setup| {
+                setup.widget_styles(|_, rules| {
+                    rules
+                        .fg("text/tag", Color::Red)
+                        .fg("muted/tag/kept", Color::Green)
+                        .apply();
+                });
+                Ok(())
+            })
+            .size(40, 12)
+            .build()?;
+        harness.render()?;
+        let items = vec![
+            Styled::new(&[("", "aaa")], false),
+            Styled::new(&[("", "bbb "), ("tag", "Q")], false),
+            Styled::new(
+                &[("", "ccc "), ("tag", "W"), ("", " "), ("tag/kept", "K")],
+                true,
+            ),
+        ];
+        harness.with_root_widget_context(|picker: &mut Picker<Styled>, context| {
+            picker.set_items(context, "Entries", "<none>", items)
+        })?;
+        harness.render()?;
+        let snapshot = harness.canopy.snapshot().expect("published picker");
+        let cell = |needle: char| {
+            snapshot
+                .buffer
+                .cells()
+                .iter()
+                .find(|cell| cell.ch == needle)
+                .map(|cell| (cell.style.fg, cell.style.bg))
+                .unwrap_or_else(|| panic!("{needle:?} renders"))
+        };
+        assert_eq!(cell('Q').0, Color::Red, "a run takes its role");
+        assert_eq!(
+            cell('Q').1,
+            cell('b').1,
+            "a run keeps the ground of its row"
+        );
+        assert_eq!(
+            cell('W'),
+            cell('c'),
+            "a muted row mutes a run without a rule"
+        );
+        assert_eq!(
+            cell('K').0,
+            Color::Green,
+            "a rule under `muted` keeps its colour"
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_search_and_the_list_trade_emphasis() -> Result<()> {
         let mut harness = picker(&["/tmp/alpha", "/tmp/beta"], 40, 12)?;
@@ -1065,15 +1494,39 @@ mod tests {
                 .canopy
                 .snapshot()
                 .expect("published picker")
-                .cells
+                .buffer
+                .cells()
                 .iter()
                 .find(|cell| cell.ch == needle)
                 .map(|cell| cell.style.bg)
                 .unwrap_or_else(|| panic!("{needle:?} renders"))
         };
+        let caret = |harness: &Harness| {
+            harness
+                .canopy
+                .snapshot()
+                .expect("published picker")
+                .cursors
+                .iter()
+                .find(|c| c.role == cursor::INACTIVE)
+                .map(|c| c.location)
+        };
+        let field = caret(&harness).expect("the unfocused search shows where typing lands");
+        let field_ground = harness
+            .canopy
+            .snapshot()
+            .expect("published picker")
+            .buffer
+            .get(Point {
+                x: field.x + 1,
+                y: field.y,
+            })
+            .expect("the field continues past its caret")
+            .style
+            .bg;
 
         assert_ne!(
-            ground(&harness, CARET),
+            field_ground,
             ground(&harness, 'b'),
             "the field does not share the ground the rows sit on"
         );
@@ -1081,7 +1534,7 @@ mod tests {
 
         commit(&mut harness)?;
         assert!(
-            !harness.tbuf().contains_text(&CARET.to_string()),
+            caret(&harness).is_none(),
             "a search that has been given drops its caret"
         );
         assert_ne!(
@@ -1189,14 +1642,15 @@ mod tests {
         let borrowed: Vec<&str> = items.iter().map(String::as_str).collect();
         let mut harness = picker(&borrowed, 40, 12)?;
         let (overlay, focus) =
-            harness.with_root_context(|picker: &mut Picker<String>, context| {
-                let overlay = picker.add_overlay(context, Confirm::new())?;
+            harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
+                let _ = picker;
+                let overlay = context.add_modal(Confirm::new())?;
                 let focus =
                     context.with_widget_mut(overlay, |confirm: &mut Confirm, context| {
                         confirm.ask(context, "Delete", "/tmp/entry-1")?;
                         // An answer takes focus only once it has something to
                         // run, as it would in a host.
-                        confirm.set_actions(
+                        confirm.set_commands(
                             context,
                             PickerList::<String>::call_clear_filter(),
                             PickerList::<String>::call_clear_filter(),
@@ -1215,14 +1669,21 @@ mod tests {
             list.set_filter(context, "entry".into())?;
             list.select_by(context, 1)
         })?;
-        let list = harness.with_root_context(|picker: &mut Picker<String>, _| picker.list())?;
+        let list =
+            harness.with_root_widget_context(|picker: &mut Picker<String>, _| picker.list())?;
         harness.canopy.with_root_context(|context| {
             context.set_focus(list)?;
             Ok(())
         })?;
 
-        let token = harness.with_root_context(|picker: &mut Picker<String>, context| {
-            picker.open_overlay(context, overlay.into(), focus, ModalBindings::Application)
+        let token = harness.with_root_widget_context(|_: &mut Picker<String>, context| {
+            context.open_modal(ModalOptions {
+                owner: context.node_id(),
+                modal: overlay.into(),
+                initial_focus: focus,
+                dim_target: None,
+                bindings: ModalBindings::Application,
+            })
         })?;
         harness.render()?;
         assert!(
@@ -1347,8 +1808,8 @@ mod tests {
                 .size(size.w, size.h)
                 .build()?;
             harness.render()?;
-            harness.with_root_context(|picker: &mut Picker<String>, context| {
-                picker.show(
+            harness.with_root_widget_context(|picker: &mut Picker<String>, context| {
+                picker.set_items(
                     context,
                     "Bookmarks",
                     "<no bookmarks>",

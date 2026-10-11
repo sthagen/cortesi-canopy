@@ -1,27 +1,30 @@
 [package]
 name = "canopy-widgets"
-authors = ["Aldo Cortesi <aldo@corte.si>"]
 version = "0.0.1"
+authors.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "LICENSE.md"
 
 [lib]
 doctest = false
 
 [features]
-default = ["editor", "terminal-widget", "graphics", "devtools"]
-editor = ["dep:syntect", "dep:two-face"]
+default = ["syntax", "terminal-widget", "graphics", "devtools"]
+syntax = ["dep:syntect", "dep:two-face"]
 terminal-widget = ["dep:itty-core"]
 graphics = ["dep:image", "dep:fontdue"]
 devtools = ["dep:tracing-subscriber"]
 
 [dependencies]
-canopy = { path = "../canopy" }
+canopy.workspace = true
 
 # Widget-specific dependencies
+icu_segmenter.workspace = true
 textwrap.workspace = true
-unicode-width.workspace = true
 unicode-segmentation.workspace = true
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+imara-diff = "0.2.0"
 image = { version = "0.25.10", optional = true, default-features = false, features = [
     "gif",
     "jpeg",
@@ -30,11 +33,13 @@ image = { version = "0.25.10", optional = true, default-features = false, featur
 ] }
 ropey = "1.6.1"
 # The syntax definitions come from two-face, so syntect's own set is left
-# out rather than shipping two copies of it.
+# out rather than shipping two copies of it. `yaml-load` reads the bundled Luau
+# grammar, which two-face lacks.
 syntect = { version = "5.3.0", optional = true, default-features = false, features = [
     "parsing",
     "default-themes",
     "regex-onig",
+    "yaml-load",
 ] }
 tracing-subscriber = { workspace = true, optional = true }
 fontdue = { version = "0.9.4", optional = true }
@@ -42,7 +47,7 @@ itty-core = { workspace = true, optional = true }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"], optional = true }
 
 [dev-dependencies]
-canopy = { path = "../canopy", features = ["testing"] }
+canopy = { workspace = true, features = ["testing"] }
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
@@ -51,11 +56,19 @@ tempfile.workspace = true
 [[bench]]
 name = "editor"
 harness = false
-required-features = ["editor"]
+required-features = ["syntax"]
 
 [[test]]
 name = "logs_subscriber"
 required-features = ["devtools"]
+
+[[test]]
+name = "luau_grammar"
+required-features = ["syntax"]
+
+[[bench]]
+name = "keyed"
+harness = false
 
 [[bench]]
 name = "rendering"

@@ -29,10 +29,15 @@ permission profile.
 
 ## Terminal interrupts
 
-`canopy::terminal::runloop` retains the default Ctrl+C behavior: restore the
-terminal, dump the node tree, and return status 130. `runloop_with_options`
-accepts `RunOptions` with `InterruptPolicy::RouteToApplication` to deliver Ctrl+C
-through normal input routing, including to embedded terminal widgets.
+`canopy::terminal::runloop(canopy, options)` runs the terminal adapter. With
+`RunOptions::default()`, Ctrl+C restores the terminal, dumps the node tree, and
+returns status 130. Set `RunOptions::interrupt_dump` to `false` to exit without
+the dump. `Setup::on_interrupt` installs a hook that takes each Ctrl+C before
+any widget, dialog, or binding sees it. The hook returns whether it took the
+interrupt, for example to stop running work, and the adapter exits on one that
+the hook declines. `Canopy::take_interrupt` offers an interrupt to the hook as
+the adapter does. `InterruptPolicy::RouteToApplication` delivers Ctrl+C through normal
+input routing instead, including to embedded terminal widgets.
 
 `RunOptions::emergency_exit` optionally specifies a separate exact `Key` match.
 It exits with status 130 before widget dispatch and restores the terminal once.
@@ -47,16 +52,16 @@ choosing actions. The payload includes the operating guide, an API source
 inventory, an API digest, fixture metadata, current command availability, and a
 compact script-journal summary.
 
-The `metadata` record declares `app`, `execution`, `session_id`, `viewport`,
-`reset`, and `api_digest`. Headless `fresh-app-per-eval` requests reconstruct the
-UI and receive independent session IDs. `live-session` requests reuse the app
-and retain one session ID across client reconnects. Domain isolation comes from
+The `metadata` record declares `app`, `execution`, `instance_id`, `screen`,
+`reset`, `fixture`, and `api_digest`. Headless `fresh-app-per-eval` requests
+reconstruct the UI and receive independent instance IDs. `live-session`
+requests reuse the app and retain one instance ID across client reconnects.
+Domain isolation comes from
 the declared reset policy, never from UI reconstruction. A pre-build failure
 can omit the API digest. Node tokens remain temporary references within a
 session, not durable replay targets.
 
-`default_target = "root"` identifies the top-level eval anchor.
-`default_commands` reports root-relative availability, while `focus_commands`
+Top-level evaluations start at the root. `default_commands` reports root-relative availability, while `focus_commands`
 reports focus-relative availability. Choose an explicit target when multiple
 widgets share a command owner. Use `canopy.call_exact(node, id, ...)` to keep a
 selected owner stable across tree changes, or `canopy.call_focus(id, ...)` to
@@ -71,7 +76,7 @@ cargo run -p canopyctl -- bootstrap -- cargo run -p todo -- mcp :memory:
 ```
 
 Inside Luau, use `canopy.api()`, `canopy.commands()`, `canopy.bindings()`,
-`canopy.available_bindings(node?)`, and `fixtures()` when a scenario must
+`canopy.available_bindings(node?)`, and `canopy.fixtures()` when a scenario must
 inspect the app in the same eval that acts on it. `bindings()` returns the
 complete registry. `available_bindings()` returns the effective key-binding
 snapshot for one focus context.
@@ -83,7 +88,7 @@ fixture directly; live sessions apply fixtures before eval.
 
 ```sh
 cargo run -p canopyctl -- eval --fixture with_items \
-  'return #fixtures() > 0' \
+  'return #canopy.fixtures() > 0' \
   -- cargo run -p todo -- mcp :memory:
 ```
 
@@ -95,34 +100,56 @@ applied.
 
 Prefer one eval per scenario step: check availability, call commands, and
 assert the result in the same Luau program. Use typed command calls and runtime
-observation before coordinate input.
+observation before coordinate input. This example runs after the `with_items`
+fixture:
 
 ```luau
-local todo_node = canopy.resolve("todo")
+local todo_node = canopy.target("todo")
 canopy.assert(todo_node ~= nil, "todo widget should be mounted")
+canopy.assert(
+    canopy.screen_text():find("Buy milk") ~= nil,
+    "fixture should render the first item"
+)
 
 todo.select_first()
 todo.delete_item()
+canopy.prepare()
 
 local text = canopy.screen_text()
-canopy.assert(text:find("Write agent loop docs") == nil, "deleted item should disappear")
+canopy.assert(text:find("Buy milk") == nil, "deleted item should disappear")
 ```
 
 Observation helpers are script-visible:
 
-- `canopy.screen_text()` for simple text assertions.
-- `canopy.screen_cells()` for styled cell assertions.
-- `canopy.screen_region(x, y, w, h)` and `canopy.node_region(node)` for crops.
-- `canopy.route_trace()` for the most recent key or mouse route.
+- `canopy.screen_text(target?)` for text assertions, cropped to a node or a
+  `Rect` when given one.
+- `canopy.snapshot().cells` for styled cell assertions.
+- `canopy.route_trace()` for the most recent key or mouse route. Each entry
+  has a snake_case `kind`, such as `before_widget_binding` or `handled`. A
+  route whose binding or widget handler failed ends with a `notice` entry.
+- `canopy.notices()` for failures the app reported and survived, oldest first:
+  a failed command or callback that a sent key ran, a widget handler, or a
+  poll. Each record has a `message`, a `kind`, a `source`, and the `node` when
+  known. A failed binding does not fail the evaluation that sent its key, so
+  assert on the newest notice instead.
+- `canopy.mode()` for the newest active mode, or the empty string for the
+  default mode.
 - `canopy.bindings()` for the complete application and framework binding
   registry.
-- `canopy.available_bindings(node?)` for effective keys, active modes, and
-  exclusive state.
+- `canopy.available_bindings(node?)` for effective keys, active modes, and the
+  framework group an open modal admits. Every widget predicts its keys, so the
+  key list is exact for the current state.
+- `canopy.explain_key(key, node?)` to inspect the prospective route for one
+  key before sending it: the examined steps and the decisive outcome. It is
+  advisory; `canopy.route_trace()` reports what actually happened.
+- `canopy.send_key_checked(key, expectation)` to send a key only when the
+  analyzed route matches a widget, binding, transient, or unhandled
+  expectation. A mismatch is rejected without delivery.
 - `canopy.diagnostic_dump(node?)` for tree, focus, binding, and route context.
 - `canopy.script_journal()` for recent eval records.
 
 For modal automation, inspect the application snapshot before opening the
-modal. After opening, verify the exclusive group and focused modal node. Then
+modal. After opening, verify the framework group and focused modal node. Then
 close the modal and verify the exact focus before sending the next application
 input.
 
@@ -134,18 +161,17 @@ if origin == nil then
 end
 
 local before = canopy.available_bindings(origin)
-canopy.assert(before.exclusive_group == nil, "the app must not be isolated")
+canopy.assert(before.framework_group == nil, "the app must not be isolated")
 
-canopy.send_key("?")
+canopy.send_key("ctrl-g")
 local modal = canopy.available_bindings()
-canopy.assert(modal.exclusive_group == "root.help", "help must isolate its bindings")
+canopy.assert(modal.framework_group == "root.help", "help must isolate its bindings")
 
-canopy.send_key("?")
+canopy.send_key("ctrl-g")
 canopy.assert(canopy.focused() == origin, "help must restore exact focus")
 ```
 
-Use `canopy.wait_for(fn, timeout_ms?)`, `canopy.wait_for_node(owner, timeout_ms?)`,
-or `canopy.wait_for_screen_text(text, timeout_ms?)` to observe asynchronous state.
+Use `canopy.wait_for(fn, timeout_ms?)` to observe asynchronous state.
 Waits subscribe to snapshot publication and deadlines, then release runtime borrows
 while parked. The shared driver continues terminal input, timers, node wakes, and
 bounded native automation. Predicates resume after publication on a later turn.
@@ -167,18 +193,18 @@ own `setup`.
 
 ## Replay
 
-Save an eval as a replay journal when it captures a useful interaction:
+Save an eval as a replay file when it captures a useful interaction:
 
 ```sh
 cargo run -p canopyctl -- eval \
-  --journal-out tmp/todo-delete.json \
+  --replay-out tmp/todo-delete.json \
   --fixture with_items \
   'todo.select_first(); todo.delete_item(); return canopy.screen_text()' \
   -- cargo run -p todo -- mcp :memory:
 ```
 
-The journal uses `canopy.replay/1` and records application/API identity, execution
-mode, viewport, fixture and reset contracts, and ordered source/expected-success
+The replay file uses `canopy.replay/1` and records application/API identity,
+execution mode, screen size, fixture and reset contracts, and ordered source/expected-success
 steps. Replay uses the recorded fixture and dimensions:
 
 ```sh
@@ -203,3 +229,45 @@ Run top-level scripts through `script_eval` after applying the fixture.
 
 When a replay becomes part of the permanent workflow, move the Luau body into a
 smoke script under the relevant fixture directory and run `cargo xtask smoke`.
+
+## Gallery
+
+A gallery shows the screens of an app as images, for review by a person or an
+agent. `canopyctl gallery` runs each gallery script at each screen size against
+a fresh headless app, draws the shots that the script returns as PNG images,
+and writes a viewer, `index.html`, beside them. A script returns a list of
+shots. Each shot has an `id`, an optional `title` and `caption`, and a
+`capture` from `canopy.capture()`:
+
+```luau
+local shots = {}
+canopy.send_key("ctrl-o")
+table.insert(shots, {
+    id = "options",
+    title = "Options menu",
+    caption = "Ctrl-O opens the options menu.",
+    capture = canopy.capture(),
+})
+return shots
+```
+
+The `[gallery]` section of `.canopyctl.toml` sets the defaults:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `suite` | `gallery` | Directory of gallery scripts. |
+| `out` | `tmp/gallery` | Directory of the images and the viewer. |
+| `sizes` | `["100x30"]` | Screen sizes as `WIDTHxHEIGHT`. |
+| `timeout_ms` | none | Per-script timeout. |
+| `font_size` | `14` | Font size in pixels, before the scale. |
+| `scale` | `2` | Image pixels for each pixel of the font size. |
+| `title` | the config directory name | Title of the viewer. |
+
+`--size`, `--suite`, and `--out` replace the defaults for one run. Explicit
+script paths run only those scripts, and keep the pages of the other scripts
+from the last run, unless the font size or the scale changed. The run
+publishes into `out` only after every image is written, and only over a
+gallery or an empty directory. It publishes even when a script fails: the
+viewer lists each failure, and the command exits with a failure status. The
+viewer also names each character that the screenshot font lacks, which shows
+as a box.

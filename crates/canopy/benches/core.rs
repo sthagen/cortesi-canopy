@@ -3,14 +3,16 @@
 use std::hint::black_box;
 
 use canopy::{
-    Canopy, Context, ContextExt, KeyedChildren, NodeId, NodeName, Render, TermBuf, ViewContext,
-    Widget,
+    Canopy, CanopyBuilder, Context, ContextExt, NodeId, NodeName, ViewContext, Widget,
     commands::CommandTarget,
     derive_commands,
     error::Result,
-    geom::{Line, Point, Size},
-    layout::{Layout, MeasureConstraints, Measurement},
-    render::RenderBackend,
+    geom::{Line, Point, Rect, Size},
+    layout::{
+        CanvasContext, Direction, Edges, Layout, MeasureConstraints, MeasureOverflow, Measurement,
+    },
+    render::{Render, RenderBackend, TermBuf},
+    runtime::TurnInput,
     style::{AttrSet, Color, ResolvedStyle},
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -21,6 +23,10 @@ const SCREEN: Size = Size { w: 120, h: 40 };
 const TREE_DEPTH: usize = 4;
 /// Fanout used for the synthetic benchmark widget tree.
 const TREE_FANOUT: usize = 4;
+/// Framed listings side by side in the file-browser tree.
+const BROWSER_PANES: usize = 3;
+/// Rows in each file-browser listing, more than one screen shows.
+const BROWSER_ROWS: usize = 60;
 
 /// Widget used to build benchmark trees without depending on example apps.
 struct BenchNode {
@@ -134,11 +140,165 @@ impl RenderBackend for CountingBackend {
     }
 }
 
+/// Role of one node in the file-browser benchmark tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserRole {
+    /// Container that lays out its children.
+    Container,
+    /// Bordered pane around one listing.
+    Pane,
+    /// Scrolling listing whose canvas holds every row.
+    Listing,
+    /// One text cell of a row.
+    Cell,
+}
+
+/// Widget used to build a tree shaped like a file browser: framed listings
+/// of rows, each row holding a name and a size cell.
+struct BrowserNode {
+    /// Stable node name.
+    name: &'static str,
+    /// Role that selects layout, canvas, and painting.
+    role: BrowserRole,
+    /// Layout returned by the widget.
+    layout: Layout,
+    /// Text painted by a cell.
+    text: String,
+}
+
+impl BrowserNode {
+    /// Build a node with an empty text.
+    fn new(name: &'static str, role: BrowserRole, layout: Layout) -> Self {
+        Self {
+            name,
+            role,
+            layout,
+            text: String::new(),
+        }
+    }
+
+    /// Build a text cell.
+    fn cell(name: &'static str, layout: Layout, text: String) -> Self {
+        Self {
+            text,
+            ..Self::new(name, BrowserRole::Cell, layout)
+        }
+    }
+}
+
+impl Widget for BrowserNode {
+    fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    fn measure(&self, constraints: MeasureConstraints) -> Measurement {
+        match self.role {
+            BrowserRole::Cell => constraints.clamp(Size::new(self.text.len() as u32, 1)),
+            _ => constraints.wrap(),
+        }
+    }
+
+    fn canvas(&self, view: Size, ctx: &CanvasContext) -> Size {
+        if self.role != BrowserRole::Listing {
+            return view;
+        }
+        let height = ctx
+            .children()
+            .iter()
+            .map(|child| child.canvas.h)
+            .fold(0u32, u32::saturating_add);
+        Size::new(view.w, height.max(view.h))
+    }
+
+    fn render(&mut self, frame: &mut Render<'_>, ctx: &dyn ViewContext) -> Result<()> {
+        let area = ctx.view().outer_rect_local();
+        match self.role {
+            BrowserRole::Pane => {
+                frame.fill("border", Rect::new(area.tl.x, area.tl.y, area.w, 1), '─')?;
+                let bottom = area.tl.y + area.h.saturating_sub(1);
+                frame.fill("border", Rect::new(area.tl.x, bottom, area.w, 1), '─')
+            }
+            BrowserRole::Cell => frame.text("default", Line::new(0, 0, area.w), &self.text),
+            BrowserRole::Container | BrowserRole::Listing => Ok(()),
+        }
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert(self.name)
+    }
+}
+
+/// Build a file-browser tree: framed listings side by side, each listing
+/// holding rows of a name and a size cell.
+fn build_browser() -> Result<Canopy> {
+    let mut app = CanopyBuilder::new().build()?;
+    app.with_root_context(|context| {
+        let browser: NodeId = context
+            .create_detached(BrowserNode::new(
+                "browser",
+                BrowserRole::Container,
+                Layout::fill().direction(Direction::Row),
+            ))?
+            .into();
+        context.set_children(context.node_id(), vec![browser])?;
+        let mut panes = Vec::with_capacity(BROWSER_PANES);
+        for pane_index in 0..BROWSER_PANES {
+            let pane: NodeId = context
+                .create_detached(BrowserNode::new(
+                    "pane",
+                    BrowserRole::Pane,
+                    Layout::fill().padding(Edges::all(1)),
+                ))?
+                .into();
+            let listing: NodeId = context
+                .create_detached(BrowserNode::new(
+                    "listing",
+                    BrowserRole::Listing,
+                    Layout::fill().overflow_x(MeasureOverflow::Unbounded),
+                ))?
+                .into();
+            let mut rows = Vec::with_capacity(BROWSER_ROWS);
+            for row_index in 0..BROWSER_ROWS {
+                let row: NodeId = context
+                    .create_detached(BrowserNode::new(
+                        "row",
+                        BrowserRole::Container,
+                        Layout::row().flex_horizontal(1).fixed_height(1),
+                    ))?
+                    .into();
+                let name: NodeId = context
+                    .create_detached(BrowserNode::cell(
+                        "name",
+                        Layout::column().flex_horizontal(1).fixed_height(1),
+                        format!("entry-{pane_index}-{row_index:03}.rs"),
+                    ))?
+                    .into();
+                let size: NodeId = context
+                    .create_detached(BrowserNode::cell(
+                        "size",
+                        Layout::column().fixed_width(8).fixed_height(1),
+                        format!("{}K", row_index * 7),
+                    ))?
+                    .into();
+                context.set_children(row, vec![name, size])?;
+                rows.push(row);
+            }
+            context.set_children(listing, rows)?;
+            context.set_children(pane, vec![listing])?;
+            panes.push(pane);
+        }
+        context.set_children(browser, panes)
+    })?;
+    app.set_screen_size(SCREEN)?;
+    app.turn(TurnInput::Prepare)?;
+    Ok(app)
+}
+
 /// Build a deterministic tree for layout and render benchmarks.
 fn build_tree() -> Result<Canopy> {
-    let mut app = Canopy::new();
+    let mut app = CanopyBuilder::new().build()?;
     populate_tree(&mut app)?;
-    app.set_root_size(SCREEN)?;
+    app.set_screen_size(SCREEN)?;
     Ok(app)
 }
 
@@ -148,7 +308,7 @@ fn populate_tree(app: &mut Canopy) -> Result<NodeId> {
     let mut next_index = 1;
     app.with_root_context(|context| {
         let root_child: NodeId = context.create_detached(BenchNode::branch(0))?.into();
-        context.set_children(vec![root_child])?;
+        context.set_children(context.node_id(), vec![root_child])?;
         add_children(context, root_child, TREE_DEPTH, &mut next_index)?;
         Ok(root_child)
     })
@@ -157,14 +317,15 @@ fn populate_tree(app: &mut Canopy) -> Result<NodeId> {
 /// Build a benchmark tree whose command target is visited after the main
 /// subtree.
 fn build_command_tree() -> Result<Canopy> {
-    let mut app = Canopy::new();
-    app.add_commands::<CommandLeaf>()?;
+    let mut app = CanopyBuilder::new()
+        .configure(|setup| setup.add_commands::<CommandLeaf>())
+        .build()?;
     let root_child = populate_tree(&mut app)?;
     app.with_context(root_child, |context| {
         let command_leaf: NodeId = context.create_detached(CommandLeaf)?.into();
         context.attach(root_child, command_leaf)
     })?;
-    app.set_root_size(SCREEN)?;
+    app.set_screen_size(SCREEN)?;
     Ok(app)
 }
 
@@ -194,7 +355,7 @@ fn add_children(
         children.push(child);
     }
 
-    context.set_children_of(parent, children)
+    context.set_children(parent, children)
 }
 
 /// Return the solid style used in terminal buffer benchmarks.
@@ -214,13 +375,52 @@ fn filled_buffer() -> TermBuf {
     buf
 }
 
-/// Benchmark layout recomputation for a large tree.
+/// Benchmark one layout pass over a large tree, without painting.
 fn bench_layout(c: &mut Criterion) {
     c.bench_function("layout_large_tree", |b| {
         let mut app = build_tree().expect("benchmark tree should build");
+        app.turn(TurnInput::Prepare)
+            .expect("first frame should prepare");
         b.iter(|| {
-            app.set_root_size(black_box(SCREEN))
-                .expect("layout should succeed");
+            app.layout_for_testing().expect("layout should succeed");
+        });
+    });
+}
+
+/// Benchmark the per-turn cost of each invalidation level on a file-browser
+/// tree.
+///
+/// Every poll and mutable callback invalidates layout. The layout turn
+/// measures that cost; the paint turn invalidates paint only; the layout pass
+/// times layout alone.
+fn bench_turn_invalidation(c: &mut Criterion) {
+    c.bench_function("browser_turn_layout", |b| {
+        let mut app = build_browser().expect("browser tree should build");
+        b.iter(|| {
+            app.with_root_context(|_| Ok(()))
+                .expect("callback should succeed");
+            black_box(
+                app.turn(TurnInput::Prepare)
+                    .expect("turn should succeed")
+                    .frame,
+            );
+        });
+    });
+    c.bench_function("browser_turn_paint", |b| {
+        let mut app = build_browser().expect("browser tree should build");
+        b.iter(|| {
+            app.style_mut();
+            black_box(
+                app.turn(TurnInput::Prepare)
+                    .expect("turn should succeed")
+                    .frame,
+            );
+        });
+    });
+    c.bench_function("browser_layout_pass", |b| {
+        let mut app = build_browser().expect("browser tree should build");
+        b.iter(|| {
+            app.layout_for_testing().expect("layout should succeed");
         });
     });
 }
@@ -232,7 +432,7 @@ fn bench_tree_edit(c: &mut Criterion) {
             || {
                 let mut app = build_tree().expect("benchmark tree should build");
                 let child = app
-                    .create_detached(BenchNode::leaf(usize::MAX))
+                    .with_root_context(|ctx| ctx.create_detached(BenchNode::leaf(usize::MAX)))
                     .expect("detached benchmark node should build");
                 (app, child)
             },
@@ -258,7 +458,7 @@ fn bench_render_diffing(c: &mut Criterion) {
         let mut backend = CountingBackend::default();
         b.iter(|| {
             current
-                .diff(black_box(&previous), black_box(&mut backend))
+                .emit_diff(black_box(&previous), black_box(&mut backend))
                 .expect("diff render should succeed");
             black_box((backend.text_bytes, backend.char_shifts, backend.line_shifts));
         });
@@ -287,7 +487,7 @@ fn bench_render_color_cells(c: &mut Criterion) {
     c.bench_function("render_color_cells_full", |b| {
         b.iter(|| {
             current
-                .render(black_box(&mut backend))
+                .emit(black_box(&mut backend))
                 .expect("full render should succeed");
             black_box(backend.text_bytes);
         });
@@ -295,7 +495,7 @@ fn bench_render_color_cells(c: &mut Criterion) {
     c.bench_function("render_color_cells_diff", |b| {
         b.iter(|| {
             current
-                .diff(black_box(&previous), black_box(&mut backend))
+                .emit_diff(black_box(&previous), black_box(&mut backend))
                 .expect("diff render should succeed");
             black_box(backend.text_bytes);
         });
@@ -315,24 +515,21 @@ fn bench_command_resolution(c: &mut Criterion) {
 /// Benchmark first-run startup script finalization, compilation, and execution.
 fn bench_script_startup(c: &mut Criterion) {
     c.bench_function("script_startup", |b| {
-        b.iter_batched(
-            || {
-                let mut app = Canopy::new();
-                app.register_startup_script(
-                    "benchmark",
-                    "function setup() local values = { 1, 2, 3, 4 }; assert(#values == 4) end",
-                )
-                .expect("startup script should register");
-                app
-            },
-            |mut app| {
-                black_box(
-                    app.run_startup_scripts()
-                        .expect("startup script should execute"),
-                );
-            },
-            BatchSize::SmallInput,
-        );
+        b.iter(|| {
+            let mut app = CanopyBuilder::new()
+                .configure(|setup| {
+                    setup.register_startup_script(
+                        "benchmark",
+                        "function setup() local values = { 1, 2, 3, 4 }; assert(#values == 4) end",
+                    )
+                })
+                .build()
+                .expect("startup script should finalize");
+            black_box(
+                app.turn(TurnInput::Prepare)
+                    .expect("startup script should execute"),
+            );
+        });
     });
 }
 
@@ -375,51 +572,16 @@ fn bench_large_tree_render(c: &mut Criterion) {
     });
 }
 
-/// Benchmark stable and rolling key sets against an existing 1,000-row tree.
-fn bench_keyed_reconciliation(c: &mut Criterion) {
-    for (name, step) in [
-        ("keyed_reconcile_unchanged_1000", 0),
-        ("keyed_reconcile_rolling_1000", 1),
-    ] {
-        let mut app = Canopy::new();
-        let mut items = KeyedChildren::<usize, BenchNode>::new();
-        app.with_root_context(|ctx| {
-            items.reconcile(
-                ctx,
-                0..1_000,
-                |key| Ok(BenchNode::leaf(*key)),
-                |_, _, _| Ok(()),
-            )
-        })
-        .expect("keyed benchmark tree should build");
-        let mut start = 0;
-        c.bench_function(name, |b| {
-            b.iter(|| {
-                start += step;
-                app.with_root_context(|ctx| {
-                    items.reconcile(
-                        ctx,
-                        black_box(start..start + 1_000),
-                        |key| Ok(BenchNode::leaf(*key)),
-                        |_, _, _| Ok(()),
-                    )
-                })
-                .expect("keyed reconciliation should succeed")
-            });
-        });
-    }
-}
-
 criterion_group!(
     benches,
     bench_tree_edit,
     bench_layout,
+    bench_turn_invalidation,
     bench_render_diffing,
     bench_render_color_cells,
     bench_command_resolution,
     bench_script_startup,
     bench_text_buffer,
-    bench_large_tree_render,
-    bench_keyed_reconciliation
+    bench_large_tree_render
 );
 criterion_main!(benches);

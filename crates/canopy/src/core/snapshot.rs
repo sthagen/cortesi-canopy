@@ -1,17 +1,21 @@
 //! Owned observations of one successfully prepared frame.
 
+use std::sync::Arc;
+
 use super::{
     context::CoreViewContext,
+    cursor::CursorSnapshot,
     termbuf::TermBuf,
     view::View,
     world::{Core, WidgetOperation},
 };
 use crate::{
-    Cell, FrameId, NodeId, SemanticIdentity,
+    NodeId,
     commands::{ArgValue, CommandStatus},
     error::Result,
     geom::{Rect, Size},
-    layout::Display,
+    runtime::FrameId,
+    tree::NodeIdentity,
 };
 
 /// Optional application observations, without arbitrary widget serialization.
@@ -25,10 +29,12 @@ pub struct WidgetSemantics {
     pub value: Option<String>,
     /// Whether this widget is selected, when applicable.
     pub selected: Option<bool>,
-    /// Stable application keys selected by a collection.
+    /// Stable application keys under a collection's selection cursor.
     pub selected_keys: Vec<ArgValue>,
-    /// Availability of the widget's primary action.
-    pub action_status: Option<CommandStatus>,
+    /// Stable application keys a collection has checked, in display order.
+    pub checked_keys: Vec<ArgValue>,
+    /// Availability of the widget's activation command.
+    pub activation_status: Option<CommandStatus>,
 }
 
 /// Owned identity, geometry, and semantics for one live arena node.
@@ -43,10 +49,10 @@ pub struct NodeSnapshot {
     /// Widget path name.
     pub name: String,
     /// Explicit application identity.
-    pub semantic_identity: Option<SemanticIdentity>,
+    pub identity: Option<NodeIdentity>,
     /// Whether the root tree contains this node.
     pub attached: bool,
-    /// Attached with no hidden or display-suppressed ancestor.
+    /// Attached with no hidden ancestor.
     pub displayed: bool,
     /// Intersection with the viewport and all ancestor content clips.
     pub intersects_viewport: bool,
@@ -63,21 +69,33 @@ pub struct NodeSnapshot {
 pub struct FrameSnapshot {
     /// Publication generation shared with turn outcomes.
     pub frame_id: FrameId,
-    /// Dimensions of the rendered cells.
-    pub viewport: Size,
+    /// The rendered frame buffer, shared with the backend emitter.
+    pub buffer: Arc<TermBuf>,
     /// All live arena nodes, including detached trees.
     pub nodes: Vec<NodeSnapshot>,
-    /// Styled terminal cells in row-major order.
-    pub cells: Vec<Cell>,
     /// Focus owner at publication.
     pub focus: Option<NodeId>,
+    /// Cursors the frame painted, the primary cursor first.
+    pub cursors: Vec<CursorSnapshot>,
+}
+
+impl FrameSnapshot {
+    /// Return the screen size: the dimensions of the rendered buffer.
+    pub fn size(&self) -> Size {
+        self.buffer.size()
+    }
 }
 
 /// Capture fallible widget observations before replacing any published state.
-pub(super) fn capture(core: &Core, frame_id: FrameId, buffer: &TermBuf) -> Result<FrameSnapshot> {
-    let viewport = buffer.size();
+pub(super) fn capture(
+    core: &Core,
+    frame_id: FrameId,
+    buffer: Arc<TermBuf>,
+    cursors: Vec<CursorSnapshot>,
+) -> Result<FrameSnapshot> {
+    let size = buffer.size();
     let mut nodes = Vec::with_capacity(core.nodes.len());
-    let screen = Rect::new(0, 0, viewport.w, viewport.h);
+    let screen = Rect::new(0, 0, size.w, size.h);
     let mut stack: Vec<_> = core
         .nodes
         .iter()
@@ -88,7 +106,7 @@ pub(super) fn capture(core: &Core, frame_id: FrameId, buffer: &TermBuf) -> Resul
     stack.push((core.root, true, true, Some(screen)));
     while let Some((id, attached, parent_displayed, clip)) = stack.pop() {
         let node = &core.nodes[id];
-        let displayed = parent_displayed && !node.hidden && node.layout.display != Display::None;
+        let displayed = parent_displayed && !node.hidden;
         let intersects_viewport = displayed
             && clip
                 .and_then(|clip| node.view.outer.intersect_rect(clip))
@@ -103,7 +121,7 @@ pub(super) fn capture(core: &Core, frame_id: FrameId, buffer: &TermBuf) -> Resul
             parent: node.parent,
             children: node.children.clone(),
             name: node.name.to_string(),
-            semantic_identity: node.semantic_identity.clone(),
+            identity: node.identity.clone(),
             attached,
             displayed,
             intersects_viewport,
@@ -118,12 +136,11 @@ pub(super) fn capture(core: &Core, frame_id: FrameId, buffer: &TermBuf) -> Resul
                 .map(|child| (*child, attached, displayed, child_clip)),
         );
     }
-    let cells = buffer.cells.clone();
     Ok(FrameSnapshot {
         frame_id,
-        viewport,
+        buffer,
         nodes,
-        cells,
         focus: core.focus,
+        cursors,
     })
 }

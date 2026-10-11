@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     NodeId,
-    core::wake::WorkStamp,
+    core::wake::PollOwner,
     error::{Error, Result},
 };
 
@@ -39,7 +39,7 @@ struct PendingNode {
     /// Monotonic instant when this callback becomes due.
     deadline: Instant,
     /// Widget incarnation and optional attachment that own this callback.
-    stamp: WorkStamp,
+    stamp: PollOwner,
 }
 
 impl PartialOrd for PendingNode {
@@ -69,7 +69,7 @@ struct PendingHeap {
 
 impl PendingHeap {
     /// Replace one node deadline and bound obsolete heap entries.
-    fn schedule(&mut self, stamp: WorkStamp, deadline: Instant) {
+    fn schedule(&mut self, stamp: PollOwner, deadline: Instant) {
         let pending = PendingNode { deadline, stamp };
         self.deadlines.insert(stamp.node, pending);
         self.nodes.push(pending);
@@ -101,7 +101,7 @@ impl PendingHeap {
     }
 
     /// Remove and return every callback due at the supplied instant.
-    fn collect(&mut self, now: Instant) -> Vec<WorkStamp> {
+    fn collect(&mut self, now: Instant) -> Vec<PollOwner> {
         let mut due = Vec::new();
         loop {
             self.discard_stale();
@@ -126,6 +126,9 @@ impl PendingHeap {
 pub struct Poller {
     /// Scheduled callbacks owned by this application.
     pending: PendingHeap,
+    /// The delay each widget's last successful poll requested, which a failed
+    /// poll repeats.
+    intervals: HashMap<NodeId, (PollOwner, Duration)>,
     /// Time source shared with driver deadline calculations.
     clock: Arc<dyn Clock>,
 }
@@ -140,6 +143,7 @@ impl Poller {
     pub(crate) fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             pending: PendingHeap::default(),
+            intervals: HashMap::new(),
             clock,
         }
     }
@@ -148,7 +152,7 @@ impl Poller {
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>) -> Result<()> {
         if !self.pending.deadlines.is_empty() {
-            return Err(Error::InvalidOperation(
+            return Err(Error::Invalid(
                 "cannot replace a clock with pending poll deadlines".into(),
             ));
         }
@@ -163,13 +167,35 @@ impl Poller {
 
     /// Replace the pending callback, allowing the adapter to sleep between
     /// polls.
-    pub(crate) fn schedule(&mut self, stamp: WorkStamp, duration: Duration) -> Result<()> {
+    pub(crate) fn schedule(&mut self, stamp: PollOwner, duration: Duration) -> Result<()> {
         let deadline = self
             .now()
             .checked_add(duration.max(MIN_POLL_INTERVAL))
-            .ok_or_else(|| Error::RunLoop("poll deadline overflow".into()))?;
+            .ok_or_else(|| Error::Driver("poll deadline overflow".into()))?;
         self.pending.schedule(stamp, deadline);
         Ok(())
+    }
+
+    /// Remember the delay a successful poll requested, or forget it when the
+    /// poll stopped scheduled polling.
+    pub(crate) fn set_interval(&mut self, stamp: PollOwner, interval: Option<Duration>) {
+        match interval {
+            Some(interval) => {
+                self.intervals.insert(stamp.node, (stamp, interval));
+            }
+            None => {
+                self.intervals.remove(&stamp.node);
+            }
+        }
+    }
+
+    /// Return the delay the last successful poll of this widget incarnation
+    /// requested.
+    pub(crate) fn interval(&self, stamp: PollOwner) -> Option<Duration> {
+        self.intervals
+            .get(&stamp.node)
+            .filter(|(owner, _)| owner.incarnation == stamp.incarnation)
+            .map(|(_, interval)| *interval)
     }
 
     /// Cancel work belonging to the specified widget incarnation.
@@ -186,7 +212,7 @@ impl Poller {
     }
 
     /// Cancel work whose lifetime is no longer valid after a structural commit.
-    pub(crate) fn retain(&mut self, mut valid: impl FnMut(WorkStamp) -> bool) {
+    pub(crate) fn retain(&mut self, mut valid: impl FnMut(PollOwner) -> bool) {
         let expired: Vec<_> = self
             .pending
             .deadlines
@@ -197,6 +223,7 @@ impl Poller {
         for (node, incarnation) in expired {
             self.cancel_owner(node, incarnation);
         }
+        self.intervals.retain(|_, (stamp, _)| valid(*stamp));
     }
 
     /// Return the earliest pending deadline for adapter waiting.
@@ -205,7 +232,7 @@ impl Poller {
     }
 
     /// Remove callbacks due under the injected clock.
-    pub(crate) fn collect_due(&mut self) -> Vec<WorkStamp> {
+    pub(crate) fn collect_due(&mut self) -> Vec<PollOwner> {
         let now = self.now();
         self.pending.collect(now)
     }
@@ -216,8 +243,8 @@ mod tests {
     use super::*;
     use crate::{core::id::testing_node_id, testing::ManualClock};
 
-    fn stamp() -> WorkStamp {
-        WorkStamp {
+    fn stamp() -> PollOwner {
+        PollOwner {
             node: testing_node_id(),
             incarnation: 1,
             attachment: None,
@@ -230,7 +257,7 @@ mod tests {
         let mut poller = Poller::with_clock(clock.clone());
         let old = stamp();
         poller.schedule(old, Duration::from_secs(10))?;
-        let current = WorkStamp {
+        let current = PollOwner {
             incarnation: 2,
             ..old
         };
@@ -262,7 +289,7 @@ mod tests {
     fn lifetime_cancellation_discards_due_work() -> Result<()> {
         let clock = Arc::new(ManualClock::new());
         let mut poller = Poller::with_clock(clock.clone());
-        let owner = WorkStamp {
+        let owner = PollOwner {
             attachment: Some(4),
             ..stamp()
         };

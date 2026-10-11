@@ -9,24 +9,24 @@ use std::{
     time::Duration,
 };
 
-use futures::{channel::mpsc::UnboundedSender, task::noop_waker};
+use futures::{channel::mpsc, task::noop_waker};
 use tokio::{runtime::Builder, time::sleep};
 
-use super::{AdapterEvent, Canopy, EvalRequest, Work};
+use super::{AdapterEvent, Canopy, CanopyBuilder, EvalRequest, TurnInput};
 use crate::{
     Context, ViewContext,
     commands::ArgValue,
     derive_commands,
     error::{Error, Result},
-    event::Event,
     geom::Size,
+    input::Event,
     widget::{EventOutcome, Widget},
 };
 
 /// Input fixture that makes its mutation observable even when dispatch fails.
 struct CleanupProbe {
     /// Queue used by the script predicate to request a failing input event.
-    events: UnboundedSender<AdapterEvent>,
+    events: mpsc::UnboundedSender<AdapterEvent>,
     /// Mutation counter that must survive adapter cleanup.
     mutations: Arc<AtomicUsize>,
 }
@@ -38,7 +38,7 @@ impl CleanupProbe {
     fn queue_failure(&self) -> Result<()> {
         self.events
             .unbounded_send(AdapterEvent::Input(Event::Key('x'.into())))
-            .map_err(|error| Error::RunLoop(error.to_string()))
+            .map_err(|error| Error::Driver(error.to_string()))
     }
 }
 
@@ -50,9 +50,7 @@ impl Widget for CleanupProbe {
     fn on_event(&mut self, event: &Event, _ctx: &mut dyn Context) -> Result<EventOutcome> {
         if matches!(event, Event::Key(_)) {
             self.mutations.fetch_add(1, Ordering::Relaxed);
-            return Err(Error::InvalidOperation(
-                "input failed after mutation".into(),
-            ));
+            return Err(Error::Invalid("input failed after mutation".into()));
         }
         Ok(EventOutcome::Ignore)
     }
@@ -60,33 +58,32 @@ impl Widget for CleanupProbe {
 
 /// Construct a rendered application with the input probe focused.
 fn application() -> Result<(Canopy, Arc<AtomicUsize>)> {
-    let mut canopy = Canopy::new();
-    canopy.add_commands::<CleanupProbe>()?;
-    canopy.finalize_api()?;
+    let mut canopy = CanopyBuilder::new()
+        .configure(|setup| setup.add_commands::<CleanupProbe>())
+        .build()?;
     let mutations = Arc::new(AtomicUsize::new(0));
     canopy.replace_root(CleanupProbe {
         events: canopy.event_tx.clone(),
         mutations: Arc::clone(&mutations),
     })?;
-    canopy.set_root_size(Size::new(10, 3))?;
+    canopy.set_screen_size(Size::new(10, 3))?;
     canopy.core.set_focus(canopy.root_id())?;
-    canopy.turn(Work::Prepare)?;
+    canopy.turn(TurnInput::Prepare)?;
     Ok((canopy, mutations))
 }
 
 #[test]
 fn completed_script_does_not_leave_a_ready_runtime_wake() -> Result<()> {
     let (mut canopy, _) = application()?;
-    let mut outcome = canopy.turn(Work::StartEval(EvalRequest {
+    let mut outcome = canopy.turn(TurnInput::StartEval(EvalRequest {
         source: "canopy.wait_for(function() return true end); return 42".into(),
         timeout: None,
-        anchor: canopy.root_id(),
     }))?;
     for _ in 0..20 {
         if !outcome.completed.is_empty() {
             break;
         }
-        outcome = canopy.turn(Work::Wake)?;
+        outcome = canopy.turn(TurnInput::Wake)?;
     }
     assert_eq!(outcome.completed.len(), 1);
     assert!(matches!(
@@ -96,7 +93,7 @@ fn completed_script_does_not_leave_a_ready_runtime_wake() -> Result<()> {
     let waker = noop_waker();
     let context = TaskContext::from_waker(&waker);
     assert!(canopy.poll_runtime_wake(&context).is_pending());
-    canopy.turn(Work::Wake)?;
+    canopy.turn(TurnInput::Wake)?;
     assert!(canopy.poll_runtime_wake(&context).is_pending());
     Ok(())
 }
@@ -110,7 +107,7 @@ fn headless_input_failure_releases_parked_eval_and_preserves_mutation() -> Resul
         .expect_err("queued input fails while evaluation waits");
     assert!(error.to_string().contains("input failed after mutation"));
     assert_eq!(mutations.load(Ordering::Relaxed), 1);
-    assert!(!canopy.script_host.is_eval_active());
+    assert!(!canopy.script.host.is_eval_active());
     let entries: Vec<_> = canopy
         .script_journal()
         .iter()
@@ -144,7 +141,6 @@ fn cancellable_headless_waits_and_reuse_work_in_supported_contexts() -> Result<(
         let request = |source: &str| EvalRequest {
             source: source.into(),
             timeout: Some(Duration::from_secs(2)),
-            anchor: canopy.root_id(),
         };
         let ready =
             request("for _ = 1, 300 do canopy.wait_for(function() return true end) end return 42");
@@ -166,7 +162,7 @@ fn cancellable_headless_waits_and_reuse_work_in_supported_contexts() -> Result<(
                 }),
                 Err(Error::ScriptCancelled)
             ));
-            assert!(!canopy.script_host.is_eval_active());
+            assert!(!canopy.script.host.is_eval_active());
             assert!(canopy.event_rx.is_some());
             assert!(
                 canopy
@@ -178,13 +174,11 @@ fn cancellable_headless_waits_and_reuse_work_in_supported_contexts() -> Result<(
                     .expect("cancellation recorded")
                     .contains("cancel")
             );
-            let root = canopy.root_id();
             assert_eq!(
                 canopy
                     .eval(EvalRequest {
                         source: "return 7".into(),
                         timeout: None,
-                        anchor: root,
                     })?
                     .into_result()?,
                 ArgValue::Int(7)
@@ -211,8 +205,11 @@ fn cancellable_headless_waits_and_reuse_work_in_supported_contexts() -> Result<(
 
 #[test]
 fn synchronous_headless_rejects_current_thread_tasks_without_consuming_driver() -> Result<()> {
-    let mut canopy = Canopy::new();
-    canopy.register_startup_script("startup", "function setup() print('startup ran') end")?;
+    let mut canopy = CanopyBuilder::new()
+        .configure(|setup| {
+            setup.register_startup_script("startup", "function setup() print('startup ran') end")
+        })
+        .build()?;
     Builder::new_current_thread()
         .enable_time()
         .build()
@@ -221,14 +218,14 @@ fn synchronous_headless_rejects_current_thread_tasks_without_consuming_driver() 
             let error = canopy
                 .eval_script("return 1")
                 .expect_err("cannot block this task");
-            assert!(matches!(error, Error::InvalidOperation(_)));
+            assert!(matches!(error, Error::Invalid(_)));
             assert!(error.to_string().contains("blocking worker"));
             assert!(canopy.event_rx.is_some());
             assert!(!canopy.driver.startup_attempted);
             Ok::<_, Error>(())
         })?;
     assert_eq!(canopy.eval_script("return 7")?, ArgValue::Int(7));
-    assert!(canopy.startup_scripts[0].ran);
+    assert!(canopy.driver.startup_attempted);
     Ok(())
 }
 
@@ -240,15 +237,14 @@ fn dropping_live_ticket_cancels_before_admission_and_while_parked() -> Result<()
         let ticket = canopy.automation_handle().submit_eval(EvalRequest {
             source: source.into(),
             timeout: None,
-            anchor: canopy.root_id(),
         })?;
         if admitted {
-            canopy.turn(Work::Wake)?;
-            assert!(canopy.script_host.is_eval_active());
+            canopy.turn(TurnInput::Wake)?;
+            assert!(canopy.script.host.is_eval_active());
             // Drain the initial VM notification so the dropped ticket must
             // supply its own wake.
             for _ in 0..10 {
-                canopy.turn(Work::Wake)?;
+                canopy.turn(TurnInput::Wake)?;
             }
             let waker = noop_waker();
             assert!(
@@ -266,8 +262,8 @@ fn dropping_live_ticket_cancels_before_admission_and_while_parked() -> Result<()
                     .is_ready()
             );
         }
-        canopy.turn(Work::Wake)?;
-        assert!(!canopy.script_host.is_eval_active());
+        canopy.turn(TurnInput::Wake)?;
+        assert!(!canopy.script.host.is_eval_active());
         assert_eq!(
             canopy
                 .script_journal()

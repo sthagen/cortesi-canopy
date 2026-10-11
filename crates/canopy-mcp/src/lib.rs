@@ -6,6 +6,8 @@
 
 //! MCP and smoke-test helpers for canopy applications.
 
+/// User configuration homes.
+mod config;
 /// Error types shared across the automation helpers.
 mod error;
 /// Shared executable launch harness for app binaries.
@@ -19,14 +21,15 @@ mod server;
 /// Smoke-suite discovery and execution helpers.
 mod smoke;
 
+pub use config::{ConfigHome, INIT_SCRIPT, UserConfig};
 pub use error::{Error, Result};
 pub use launch::{LaunchMode, launch};
 pub use metadata::{
-    AppFactory, AppMetadata, ExecutionMetadata, ExecutionMode, ResetPolicy, Viewport,
+    AppFactory, AppMetadata, ExecutionMetadata, ExecutionMode, ResetPolicy, ScreenSize,
 };
 pub use script::{
-    BootstrapCommand, BootstrapJournalEntry, BootstrapRequest, BootstrapResponse, ScriptErrorInfo,
-    ScriptErrorType, ScriptEvalOutcome, ScriptEvalRequest, ScriptTaskState, ScriptTiming,
+    BootstrapCommand, BootstrapJournalEntry, BootstrapRequest, BootstrapResponse, EvalReport,
+    ScriptErrorInfo, ScriptErrorType, ScriptEvalRequest, ScriptTaskState, ScriptTiming,
 };
 pub use server::{
     ApplyFixtureRequest, ApplyFixtureResponse, UdsServerHandle, serve_stdio, serve_uds,

@@ -3,8 +3,8 @@
 #![cfg(not(feature = "devtools"))]
 
 use canopy::{
-    Canopy, Context, ContextExt, Loader, Widget, Work, commands::CommandNode, error::Result,
-    geom::Size,
+    CanopyBuilder, Context, ContextExt, Register, Widget, commands::CommandNode, error::Result,
+    geom::Size, runtime::TurnInput,
 };
 use canopy_widgets::{Input, List, Root, Selectable};
 
@@ -18,32 +18,33 @@ struct Form;
 impl Widget for Form {
     fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
         let parent = ctx.node_id();
-        ctx.compose(parent, |children| {
-            children.child(Input::new("entry"), |_| Ok(()))?;
-            children.child(List::<Row>::new(), |_| Ok(()))?;
-            Ok(())
-        })
+        ctx.add_child(parent, Input::new("entry"))?;
+        ctx.add_child(parent, List::<Row>::new())?;
+        Ok(())
     }
 }
 
-#[test]
-fn minimum_forms_have_help_and_no_inspector() -> Result<()> {
-    let mut app = Canopy::new();
-    Root::load(&mut app)?;
-    Root::new().install(&mut app, Form)?;
-    app.finalize_api()?;
-    app.set_root_size(Size::new(30, 10))?;
-    app.turn(Work::Prepare)?;
-    let snapshot = app.snapshot().unwrap();
-    assert!(snapshot.nodes.iter().any(|node| node.name == "input"));
-    assert!(snapshot.nodes.iter().any(|node| node.name == "list"));
-    assert!(snapshot.nodes.iter().any(|node| node.name == "help"));
-    assert!(!snapshot.nodes.iter().any(|node| node.name == "inspector"));
-    assert!(
-        !Root::commands()
-            .iter()
-            .any(|command| command.name.contains("inspector"))
-    );
-    app.eval_script("root.show_help(); root.hide_help()")?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimum_forms_have_help_and_no_inspector() -> Result<()> {
+        let mut app = CanopyBuilder::new().configure(Root::register).build()?;
+        Root::new().install(&mut app, Form)?;
+        app.set_screen_size(Size::new(30, 10))?;
+        app.turn(TurnInput::Prepare)?;
+        let snapshot = app.snapshot().unwrap();
+        assert!(snapshot.nodes.iter().any(|node| node.name == "input"));
+        assert!(snapshot.nodes.iter().any(|node| node.name == "list"));
+        assert!(snapshot.nodes.iter().any(|node| node.name == "help"));
+        assert!(!snapshot.nodes.iter().any(|node| node.name == "inspector"));
+        assert!(
+            !Root::commands()
+                .iter()
+                .any(|command| command.name.contains("inspector"))
+        );
+        app.eval_script("root.show_help(); root.hide_help()")?;
+        Ok(())
+    }
 }

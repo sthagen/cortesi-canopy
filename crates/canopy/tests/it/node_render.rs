@@ -3,10 +3,11 @@
 #[cfg(test)]
 mod tests {
     use canopy::{
-        Context, ContextExt, Loader, NodeId, NodeName, Render, ViewContext, Widget, buf,
+        Context, ContextExt, NodeId, NodeName, ViewContext, Widget, buf,
         error::Result,
         geom::Size,
-        layout::{Layout, Sizing},
+        layout::{Layout, LayoutOverride},
+        render::Render,
         testing::harness::Harness,
     };
 
@@ -57,13 +58,11 @@ mod tests {
         }
     }
 
-    impl Loader for Root {}
-
     fn style_flex_child(core: &mut dyn Context, id: NodeId) -> Result<()> {
-        core.with_layout_of(id, &mut |layout| {
-            layout.width = Sizing::Flex(1);
-            layout.height = Sizing::Flex(1);
-        })
+        core.set_layout_override(
+            id,
+            LayoutOverride::new().flex_horizontal(1).flex_vertical(1),
+        )
     }
 
     fn build_split_tree(core: &mut dyn Context, depth: usize, horizontal: bool) -> Result<NodeId> {
@@ -73,14 +72,14 @@ mod tests {
         } else {
             Layout::column()
         };
-        core.set_layout_of(node, base.min_width(1).min_height(1))?;
+        core.set_layout_override(node, base.min_width(1).min_height(1).into())?;
         if depth == 0 {
             return Ok(node);
         }
 
         let left = build_split_tree(core, depth - 1, !horizontal)?;
         let right = build_split_tree(core, depth - 1, !horizontal)?;
-        core.set_children_of(node, vec![left, right])?;
+        core.set_children(node, vec![left, right])?;
         style_flex_child(core, left)?;
         style_flex_child(core, right)?;
         Ok(node)
@@ -93,11 +92,14 @@ mod tests {
         h.canopy.with_root_context(|context| {
             let node_a: NodeId = context.create_detached(NodeA::new())?.into();
             let node_b: NodeId = context.create_detached(NodeB::new())?.into();
-            context.set_children_of(h.root, vec![node_a])?;
-            context.set_children_of(node_a, vec![node_b])?;
-            context.set_layout_of(h.root, Layout::fill())?;
-            context.set_layout_of(node_a, Layout::column().fixed_width(10).fixed_height(5))?;
-            context.set_layout_of(node_b, Layout::fill())
+            context.set_children(h.root, vec![node_a])?;
+            context.set_children(node_a, vec![node_b])?;
+            context.set_layout_override(h.root, Layout::fill().into())?;
+            context.set_layout_override(
+                node_a,
+                Layout::column().fixed_width(10).fixed_height(5).into(),
+            )?;
+            context.set_layout_override(node_b, Layout::fill().into())
         })?;
 
         h.render()?;
@@ -124,12 +126,18 @@ mod tests {
             let container: NodeId = context.create_detached(NodeA::new())?.into();
             let top: NodeId = context.create_detached(NodeB::new())?.into();
             let bottom: NodeId = context.create_detached(NodeA::new())?.into();
-            context.set_children_of(h.root, vec![container])?;
-            context.set_children_of(container, vec![top, bottom])?;
-            context.set_layout_of(h.root, Layout::fill())?;
-            context.set_layout_of(container, Layout::fill())?;
-            context.set_layout_of(top, Layout::column().fixed_width(10).fixed_height(10))?;
-            context.set_layout_of(bottom, Layout::column().fixed_width(10).fixed_height(0))?;
+            context.set_children(h.root, vec![container])?;
+            context.set_children(container, vec![top, bottom])?;
+            context.set_layout_override(h.root, Layout::fill().into())?;
+            context.set_layout_override(container, Layout::fill().into())?;
+            context.set_layout_override(
+                top,
+                Layout::column().fixed_width(10).fixed_height(10).into(),
+            )?;
+            context.set_layout_override(
+                bottom,
+                Layout::column().fixed_width(10).fixed_height(0).into(),
+            )?;
             Ok(bottom)
         })?;
 
@@ -151,15 +159,15 @@ mod tests {
 
         h.canopy.with_root_context(|context| {
             let tree = build_split_tree(context, 5, true)?;
-            context.set_children_of(h.root, vec![tree])?;
-            context.set_layout_of(h.root, Layout::fill())?;
+            context.set_children(h.root, vec![tree])?;
+            context.set_layout_override(h.root, Layout::fill().into())?;
             style_flex_child(context, tree)
         })?;
 
         h.render()?;
-        h.canopy.set_root_size(Size::new(246, 63))?;
+        h.canopy.set_screen_size(Size::new(246, 63))?;
         h.render()?;
-        h.canopy.set_root_size(Size::new(123, 31))?;
+        h.canopy.set_screen_size(Size::new(123, 31))?;
         h.render()?;
 
         h.canopy.with_root_view(|context| {

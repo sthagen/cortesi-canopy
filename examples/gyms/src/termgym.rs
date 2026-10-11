@@ -1,0 +1,494 @@
+use std::env;
+
+use canopy::{
+    CanopyBuilder, Context, ContextExt, NodeId, NodeName, Register, Setup, ViewContext,
+    ViewContextExt, Widget, derive_commands,
+    error::{Error, Result},
+    geom::Size,
+    layout::{Constraint, Direction, Layout, MeasureConstraints, Measurement},
+    render::Render,
+    style::{Attr, AttrSet, StyleRules, WidgetState, themes::Palette},
+    tree::FocusScope,
+};
+use canopy_widgets::{
+    Border, BoxGlyphs, Button, Container, Frame, List, Selectable, Text,
+    terminal::{Terminal, TerminalConfig},
+};
+use unicode_width::UnicodeWidthStr;
+
+use crate::{fixed_row, flex_row};
+
+/// Stack container for terminal widgets.
+struct TerminalStack;
+
+impl TerminalStack {
+    /// Construct a terminal stack container.
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl Widget for TerminalStack {
+    fn layout(&self) -> Layout {
+        Layout::fill().direction(Direction::Stack)
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("term_stack")
+    }
+}
+
+/// Height for each terminal entry row, including borders.
+const ENTRY_HEIGHT: u32 = 3;
+
+/// Default bindings for the terminal gym demo.
+const DEFAULT_BINDINGS: &str = r#"
+root.default_bindings()
+
+canopy.on_start(function()
+    term_gym.focus_active_terminal()
+end)
+
+canopy.bind("F6", {
+    path = "term_gym/**/",
+    phase = "before_widget",
+    description = "Toggle terminal list",
+}, command.term_gym.toggle_terminal_focus())
+canopy.keymap({
+    path = "term_gym/**/list/**/",
+    phase = "before_widget",
+    { key = "n", description = "New terminal", action = command.term_gym.new_terminal_sidebar() },
+    {
+        key = { "Down", "j" },
+        description = "Next terminal",
+        action = command.term_gym.next_terminal_sidebar(),
+    },
+    {
+        key = { "Up", "k" },
+        description = "Previous terminal",
+        action = command.term_gym.prev_terminal_sidebar(),
+    },
+    {
+        key = { "Enter", "Right" },
+        description = "Focus active terminal",
+        action = command.term_gym.focus_active_terminal(),
+    },
+    {
+        key = { "Delete", "d" },
+        description = "Close terminal",
+        action = command.term_gym.delete_terminal(),
+    },
+})
+"#;
+
+/// List item widget for the terminal sidebar.
+struct TermEntry {
+    /// Label text.
+    label: String,
+    /// Selection state.
+    selected: bool,
+}
+
+impl TermEntry {
+    /// Construct a new terminal entry.
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            selected: false,
+        }
+    }
+
+    /// Compute the display width of the label text.
+    fn label_width(&self) -> u32 {
+        UnicodeWidthStr::width(self.label.as_str()).max(1) as u32
+    }
+}
+
+impl Selectable for TermEntry {
+    fn set_selected(&mut self, selected: bool) {
+        self.selected = selected;
+    }
+}
+
+impl Widget for TermEntry {
+    fn layout(&self) -> Layout {
+        Layout::column()
+            .flex_horizontal(1)
+            .fixed_height(ENTRY_HEIGHT)
+    }
+
+    fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
+        let box_id = ctx.add_child(
+            ctx.node_id(),
+            Border::new().with_glyphs(BoxGlyphs::SINGLE).with_fill(),
+        )?;
+        let center_id = ctx.add_child(box_id, Container::center())?;
+        ctx.add_child(
+            center_id,
+            Text::new(self.label.clone()).with_wrap_width(self.label_width()),
+        )?;
+        Ok(())
+    }
+
+    fn render(&mut self, rndr: &mut Render, _ctx: &dyn ViewContext) -> Result<()> {
+        rndr.push_layer("entry");
+        if self.selected {
+            rndr.push_layer(WidgetState::Selected.layer());
+        }
+        Ok(())
+    }
+
+    fn measure(&self, c: MeasureConstraints) -> Measurement {
+        let width = match c.width {
+            Constraint::Exact(n) | Constraint::AtMost(n) => n.max(1),
+            Constraint::Unbounded => self.label_width().saturating_add(2),
+        };
+        c.clamp(Size::new(width, ENTRY_HEIGHT))
+    }
+
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn name(&self) -> NodeName {
+        NodeName::convert("term_entry")
+    }
+}
+
+/// Multi-terminal demo widget.
+pub struct TermGym {
+    /// Index of the active terminal.
+    active: usize,
+}
+
+impl Default for TermGym {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive_commands]
+impl TermGym {
+    /// Construct the terminal gym demo.
+    pub fn new() -> Self {
+        Self { active: 0 }
+    }
+
+    /// Execute a closure with the terminal list widget.
+    fn with_list<F, R>(&self, c: &mut dyn Context, mut f: F) -> Result<R>
+    where
+        F: FnMut(&mut List<TermEntry>, &mut dyn Context) -> Result<R>,
+    {
+        c.with_unique_descendant::<List<TermEntry>, _>(|list, ctx| f(list, ctx))
+    }
+
+    /// Execute a closure with the terminal stack widget.
+    fn with_stack<F, R>(&self, c: &mut dyn Context, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut TerminalStack, &mut dyn Context) -> Result<R>,
+    {
+        c.with_unique_descendant::<TerminalStack, _>(f)
+    }
+
+    /// Return terminal stack children in order.
+    fn terminal_ids(&self, c: &mut dyn Context) -> Result<Vec<NodeId>> {
+        self.with_stack(c, |_stack, ctx| {
+            Ok(ctx
+                .children_of(ctx.node_id())
+                .into_iter()
+                .filter(|node| ctx.typed_id::<Terminal>(*node).is_ok())
+                .collect())
+        })
+    }
+
+    /// Create and mount a new terminal instance.
+    fn add_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
+        let cwd = env::current_dir().map_err(|err| Error::Internal(err.to_string()))?;
+        self.with_stack(c, |_, ctx| {
+            let terminal_id = ctx.add_child(
+                ctx.node_id(),
+                Terminal::new(TerminalConfig::new().with_cwd(cwd)),
+            )?;
+            ctx.set_layout_override(terminal_id.into(), Layout::fill().into())?;
+            Ok(())
+        })?;
+
+        let index = self.terminal_ids(c)?.len();
+        self.with_list(c, |list, ctx| {
+            let entry = TermEntry::new(index.to_string());
+            list.append(ctx, entry)?;
+            Ok(())
+        })?;
+
+        self.set_active(c, index.saturating_sub(1))?;
+        Ok(())
+    }
+
+    /// Activate a specific terminal by index.
+    fn set_active(&mut self, c: &mut dyn Context, index: usize) -> Result<()> {
+        let terminals = self.terminal_ids(c)?;
+        if terminals.is_empty() {
+            return Ok(());
+        }
+        let target = index.min(terminals.len() - 1);
+        self.active = target;
+
+        for (idx, terminal_id) in terminals.iter().enumerate() {
+            let active = self.active;
+            c.set_layout_override(*terminal_id, Layout::fill().into())?;
+            c.set_hidden(*terminal_id, idx != active)?;
+        }
+
+        let active = self.active;
+        self.with_list(c, |list, ctx| list.select(ctx, active))?;
+
+        if let Some(active_id) = terminals.get(self.active).copied() {
+            c.set_focus(active_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Move the active terminal selection forward or backward.
+    fn shift_terminal(&mut self, c: &mut dyn Context, forward: bool) -> Result<()> {
+        let terminals = self.terminal_ids(c)?;
+        if terminals.is_empty() {
+            return Ok(());
+        }
+        let next = if forward {
+            (self.active + 1) % terminals.len()
+        } else {
+            (self.active + terminals.len() - 1) % terminals.len()
+        };
+        self.set_active(c, next)
+    }
+
+    /// Rebuild the sidebar list to match the current terminal set.
+    fn rebuild_list(&self, c: &mut dyn Context) -> Result<()> {
+        let count = self.terminal_ids(c)?.len();
+        self.with_list(c, |list, ctx| {
+            list.clear(ctx)?;
+            for index in 1..=count {
+                let entry = TermEntry::new(index.to_string());
+                list.append(ctx, entry)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove a terminal at a specific index.
+    fn remove_terminal(&mut self, c: &mut dyn Context, index: usize) -> Result<()> {
+        let terminals = self.terminal_ids(c)?;
+        if index >= terminals.len() {
+            return Ok(());
+        }
+
+        let removed_id = terminals[index];
+        c.remove_subtree(removed_id)?;
+
+        self.rebuild_list(c)?;
+
+        let remaining = self.terminal_ids(c)?;
+        if remaining.is_empty() {
+            self.active = 0;
+            return Ok(());
+        }
+
+        let next_active = if index < self.active {
+            self.active.saturating_sub(1)
+        } else {
+            self.active.min(remaining.len() - 1)
+        };
+
+        self.set_active(c, next_active)?;
+        Ok(())
+    }
+
+    /// Focus the selected sidebar entry if the list exists.
+    fn focus_sidebar_list(&self, c: &mut dyn Context) -> Result<()> {
+        self.with_list(c, |list, ctx| {
+            if let Some(selected) = list.selected_item() {
+                ctx.set_focus(NodeId::from(selected))?;
+            } else {
+                ctx.focus_first(FocusScope::Current)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Shift terminal selection and keep focus on the sidebar list.
+    fn shift_terminal_in_sidebar(&mut self, c: &mut dyn Context, forward: bool) -> Result<()> {
+        self.shift_terminal(c, forward)?;
+        self.focus_sidebar_list(c)?;
+        Ok(())
+    }
+
+    #[command]
+    /// Create a new terminal instance.
+    pub(crate) fn new_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
+        self.add_terminal(c)
+    }
+
+    #[command]
+    /// Create a new terminal instance while keeping focus on the sidebar.
+    pub(crate) fn new_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
+        self.add_terminal(c)?;
+        self.focus_sidebar_list(c)?;
+        Ok(())
+    }
+
+    #[command]
+    /// Switch to the next terminal while keeping focus on the sidebar.
+    pub(crate) fn next_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
+        self.shift_terminal_in_sidebar(c, true)
+    }
+
+    #[command]
+    /// Switch to the previous terminal while keeping focus on the sidebar.
+    pub(crate) fn prev_terminal_sidebar(&mut self, c: &mut dyn Context) -> Result<()> {
+        self.shift_terminal_in_sidebar(c, false)
+    }
+
+    #[command]
+    /// Close the active terminal and keep focus on the sidebar.
+    pub(crate) fn delete_terminal(&mut self, c: &mut dyn Context) -> Result<()> {
+        let terminals = self.terminal_ids(c)?;
+        if terminals.len() <= 1 {
+            return Ok(());
+        }
+
+        let target = self.active.min(terminals.len() - 1);
+        self.remove_terminal(c, target)?;
+        self.focus_sidebar_list(c)?;
+        Ok(())
+    }
+
+    #[command]
+    /// Focus the active terminal instance.
+    pub(crate) fn focus_active_terminal(&self, c: &mut dyn Context) -> Result<()> {
+        let terminals = self.terminal_ids(c)?;
+        if let Some(active_id) = terminals.get(self.active).copied() {
+            c.set_focus(active_id)?;
+        }
+        Ok(())
+    }
+
+    #[command]
+    /// Toggle focus between the terminal list and the active terminal.
+    pub(crate) fn toggle_terminal_focus(&self, c: &mut dyn Context) -> Result<()> {
+        let terminals = self.terminal_ids(c)?;
+        if terminals
+            .iter()
+            .any(|terminal| c.is_on_focus_path(*terminal))
+        {
+            self.focus_sidebar_list(c)
+        } else {
+            self.focus_active_terminal(c)
+        }
+    }
+
+    #[command]
+    /// Activate a terminal from a sidebar row selection.
+    pub(crate) fn activate_terminal(&mut self, c: &mut dyn Context, index: usize) -> Result<()> {
+        self.set_active(c, index)?;
+        self.focus_sidebar_list(c)?;
+        Ok(())
+    }
+}
+
+impl Widget for TermGym {
+    fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
+        true
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::fill().direction(Direction::Row)
+    }
+
+    fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
+        let list_id = c.create_detached(
+            List::<TermEntry>::new().with_command(Self::spec_activate_terminal().call()),
+        )?;
+        let button_id = c.create_detached(
+            Button::new("+ New terminal").with_command(Self::call_new_terminal()),
+        )?;
+        let sidebar_id = c.add_child(c.node_id(), Container::column())?;
+        c.set_children(sidebar_id.into(), vec![button_id.into(), list_id.into()])?;
+        c.set_layout_override(button_id.into(), fixed_row(1))?;
+        c.set_layout_override(list_id.into(), flex_row(1))?;
+
+        let term_frame_id = c.add_child(
+            c.node_id(),
+            Frame::new()
+                .with_glyphs(BoxGlyphs::SINGLE_THICK)
+                .with_title("terminal"),
+        )?;
+        c.add_child(term_frame_id, TerminalStack::new())?;
+
+        c.set_layout_override(
+            sidebar_id.into(),
+            Layout::column().fixed_width(24).flex_vertical(1).into(),
+        )?;
+
+        self.add_terminal(c)?;
+
+        Ok(())
+    }
+
+    fn render(&mut self, r: &mut Render, _ctx: &dyn ViewContext) -> Result<()> {
+        r.push_layer("termgym");
+        Ok(())
+    }
+}
+
+impl Register for TermGym {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
+        setup.add_commands::<List<TermEntry>>()?;
+        Ok(())
+    }
+}
+
+/// Install native styles during the configuration phase.
+fn setup_style(palette: &Palette, rules: StyleRules<'_>) {
+    use canopy::style::PartialStyle;
+
+    let selected_attrs = AttrSet {
+        bold: true,
+        ..AttrSet::default()
+    };
+    let button_normal = PartialStyle::new().fg(palette.fg).bg(palette.element_bg);
+    let button_selected = PartialStyle::new()
+        .fg(palette.bg)
+        .bg(palette.accent)
+        .attrs(selected_attrs);
+
+    let rules = crate::selectable_entry_styles(palette, rules, "termgym/entry");
+    rules
+        .prefix("termgym/button")
+        .style_all(&["border", "fill", "text"], button_normal)
+        .style_all(
+            &["selected/border", "selected/fill", "selected/text"],
+            button_selected,
+        )
+        .prefix("termgym/frame")
+        .fg("", palette.frame)
+        .style(
+            "focused",
+            PartialStyle::new().fg(palette.yellow).attr(Attr::Bold),
+        )
+        .fg("active", palette.orange)
+        .style("title", PartialStyle::new().fg(palette.fg).attr(Attr::Bold))
+        .apply();
+}
+
+/// Queue this demo's bindings and native configuration in their builder phases.
+#[must_use]
+pub fn binding_setup(builder: CanopyBuilder) -> CanopyBuilder {
+    builder
+        .configure(|setup| {
+            setup.widget_styles(setup_style);
+            Ok(())
+        })
+        .script("termgym", DEFAULT_BINDINGS)
+}

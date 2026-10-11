@@ -1,6 +1,6 @@
 //! Tests for the Luau scripting host.
 
-use std::{any::Any, collections::BTreeMap};
+use std::collections::BTreeMap;
 
 use proptest::{
     prelude::*,
@@ -11,11 +11,10 @@ use tokio::runtime::Builder;
 
 use super::{base_api::read_node_id, bridge::REENTRANT_CANOPY, *};
 use crate::{
-    Widget,
-    core::{id::testing_node_id, testing::model::trace_result},
+    CanopyBuilder, Widget,
+    core::{id::testing_node_id, inputmap::IntentCatalog, testing::model::trace_result},
     derive_commands,
     error::Result,
-    state::NodeName,
     testing::ttree::{get_state, run_ttree},
 };
 
@@ -68,7 +67,7 @@ fn closure_key(index: u8) -> char {
 
 fn execute_registry_script(canopy: &mut Canopy, host: &LuauHost, source: &str) -> Result<()> {
     let script = host.compile(source)?;
-    host.execute(canopy, canopy.core.root_id(), script, None)
+    host.execute(canopy, canopy.core.root_id(), script)
         .map(|_| ())
 }
 
@@ -164,11 +163,10 @@ proptest! {
 
     #[test]
     fn script_closure_registry_matches_model(operations in closure_operation_strategy()) {
-        let mut canopy = Canopy::new();
-        canopy
-            .finalize_api()
+        let mut canopy = CanopyBuilder::new()
+            .build()
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        let host = canopy.script_host.clone();
+        let host = canopy.script.host.clone();
         let mut model = ClosureModel::new();
         for (index, operation) in operations.iter().enumerate() {
             trace_result(
@@ -181,15 +179,27 @@ proptest! {
 }
 
 #[test]
+fn script_check_severity_serializes_to_stable_strings() {
+    assert_eq!(
+        serde_json::to_value(ScriptCheckSeverity::Error).unwrap(),
+        serde_json::json!("error"),
+    );
+    assert_eq!(
+        serde_json::to_value(ScriptCheckSeverity::Warning).unwrap(),
+        serde_json::json!("warning"),
+    );
+}
+
+#[test]
 fn reentrant_canopy_guard_restores_nested_stack() -> Result<()> {
     REENTRANT_CANOPY.with(|stack| assert!(stack.borrow().is_empty()));
-    let mut outer = Canopy::new();
-    let mut inner = Canopy::new();
+    let mut outer = CanopyBuilder::new().build()?;
+    let mut inner = CanopyBuilder::new().build()?;
 
     {
         let _outer_guard = ReentrantCanopyGuard::push(&mut outer);
         with_reentrant_canopy(|canopy| {
-            canopy.script_context_stack.push(canopy.root_id());
+            canopy.script.context_stack.push(canopy.root_id());
             Ok(())
         })
         .expect("outer guard installed")?;
@@ -197,21 +207,21 @@ fn reentrant_canopy_guard_restores_nested_stack() -> Result<()> {
         {
             let _inner_guard = ReentrantCanopyGuard::push(&mut inner);
             with_reentrant_canopy(|canopy| {
-                canopy.script_context_stack.push(canopy.root_id());
+                canopy.script.context_stack.push(canopy.root_id());
                 Ok(())
             })
             .expect("inner guard installed")?;
         }
 
         with_reentrant_canopy(|canopy| {
-            canopy.script_context_stack.push(canopy.root_id());
+            canopy.script.context_stack.push(canopy.root_id());
             Ok(())
         })
         .expect("outer guard restored")?;
     }
 
-    assert_eq!(outer.script_context_stack.len(), 2);
-    assert_eq!(inner.script_context_stack.len(), 1);
+    assert_eq!(outer.script.context_stack.len(), 2);
+    assert_eq!(inner.script.context_stack.len(), 1);
     assert!(with_reentrant_canopy(|_| Ok(())).is_none());
     Ok(())
 }
@@ -339,7 +349,7 @@ fn marshaled_table_policy_uses_shared_layouts_and_paths() {
 #[test]
 fn live_and_marshaled_value_policy_agree_without_erasing_node_identity() {
     let surface = Surface::builder()
-        .module(build_base_module().expect("base module builds"))
+        .module(build_base_module(&IntentCatalog::default()).expect("base module builds"))
         .build()
         .expect("surface builds");
     let mut vm = surface
@@ -399,6 +409,102 @@ fn live_and_marshaled_value_policy_agree_without_erasing_node_identity() {
     .expect("live conversion scope succeeds");
 }
 
+/// Strip a conversion error's root path label so scoped ("value") and
+/// marshaled ("result") error text can be compared for agreement.
+fn strip_error_root(message: String, root: &str) -> String {
+    match message.strip_prefix(root) {
+        Some(rest) => format!("<root>{rest}"),
+        None => message,
+    }
+}
+
+#[test]
+fn scoped_and_marshaled_value_policy_agree_on_layouts_and_errors() {
+    let surface = Surface::builder()
+        .module(build_base_module(&IntentCatalog::default()).expect("base module builds"))
+        .build()
+        .expect("surface builds");
+    let mut vm = surface
+        .vm_builder(&VmConfig::untrusted(
+            Ambient::deterministic(0),
+            Limits::unlimited(),
+        ))
+        .build()
+        .expect("VM builds");
+    vm.step(|scope| {
+        // Dense array: both paths assemble the same sequence.
+        let dense = scope.create_table()?;
+        dense.set_index(scope, 1, "a")?;
+        dense.set_index(scope, 2, "b")?;
+        let dense_marshaled = scope.marshal(ScopedValue::Table(dense))?;
+        assert_eq!(
+            scoped_to_arg_value(scope, ScopedValue::Table(dense)),
+            marshaled_to_arg_value(&dense_marshaled),
+        );
+
+        // String map: both paths assemble the same map.
+        let map = scope.create_table()?;
+        map.set(scope, "x", 1)?;
+        map.set(scope, "y", 2)?;
+        let map_marshaled = scope.marshal(ScopedValue::Table(map))?;
+        assert_eq!(
+            scoped_to_arg_value(scope, ScopedValue::Table(map)),
+            marshaled_to_arg_value(&map_marshaled),
+        );
+
+        // Sparse array: both paths reject with the same reason.
+        let sparse = scope.create_table()?;
+        sparse.set_index(scope, 1, true)?;
+        sparse.set_index(scope, 3, true)?;
+        let sparse_marshaled = scope.marshal(ScopedValue::Table(sparse))?;
+        let scoped_error = scoped_to_arg_value(scope, ScopedValue::Table(sparse))
+            .map_err(|error| strip_error_root(error, "value"));
+        let marshaled_error = marshaled_to_arg_value(&sparse_marshaled)
+            .map_err(|error| strip_error_root(error, "result"));
+        assert_eq!(scoped_error, marshaled_error);
+        assert_eq!(
+            scoped_error,
+            Err("<root>: sparse table missing index 2".to_string())
+        );
+
+        // Mixed integer and string keys: both paths reject with the same
+        // reason.
+        let mixed = scope.create_table()?;
+        mixed.set_index(scope, 1, true)?;
+        mixed.set(scope, "name", "mixed")?;
+        let mixed_marshaled = scope.marshal(ScopedValue::Table(mixed))?;
+        let scoped_error = scoped_to_arg_value(scope, ScopedValue::Table(mixed))
+            .map_err(|error| strip_error_root(error, "value"));
+        let marshaled_error = marshaled_to_arg_value(&mixed_marshaled)
+            .map_err(|error| strip_error_root(error, "result"));
+        assert_eq!(scoped_error, marshaled_error);
+        assert_eq!(
+            scoped_error,
+            Err("<root>: mixed integer and string table keys are not supported".to_string())
+        );
+
+        // Nested error paths: both paths report the same failing sub-path.
+        let nested = scope.create_table()?;
+        nested.set_index(scope, 1, true)?;
+        nested.set_index(scope, 3, true)?;
+        let outer = scope.create_table()?;
+        outer.set(scope, "items", nested)?;
+        let outer_marshaled = scope.marshal(ScopedValue::Table(outer))?;
+        let scoped_error = scoped_to_arg_value(scope, ScopedValue::Table(outer))
+            .map_err(|error| strip_error_root(error, "value"));
+        let marshaled_error = marshaled_to_arg_value(&outer_marshaled)
+            .map_err(|error| strip_error_root(error, "result"));
+        assert_eq!(scoped_error, marshaled_error);
+        assert_eq!(
+            scoped_error,
+            Err("<root>.items: sparse table missing index 2".to_string())
+        );
+
+        Ok(())
+    })
+    .expect("agreement scope succeeds");
+}
+
 #[test]
 fn tcompile_error_reports_details() {
     let host = LuauHost::new();
@@ -423,13 +529,12 @@ fn execute_with_many_waits_survives_tokio_coop_budget() -> Result<()> {
         .expect("test runtime")
         .block_on(async {
             run_ttree(|c, _, _| {
-                c.finalize_api()?;
-                let host = c.script_host.clone();
+                let host = c.script.host.clone();
                 let script = host.compile(
                     "for _ = 1, 300 do canopy.wait_for(function() return true end, 50) end return 42",
                 )?;
                 assert_eq!(
-                    host.execute(c, c.core.root_id(), script, Some(Duration::from_secs(2)))?,
+                    host.execute(c, c.core.root_id(), script)?,
                     ArgValue::Int(42)
                 );
                 Ok(())
@@ -440,10 +545,9 @@ fn execute_with_many_waits_survives_tokio_coop_budget() -> Result<()> {
 #[test]
 fn tprint_output_lands_in_script_logs() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.finalize_api()?;
-        let scr = c.script_host.compile(r#"print("plain print", 42)"#)?;
-        let host = c.script_host.clone();
-        host.execute(c, c.core.root_id(), scr, None)?;
+        let scr = c.script.host.compile(r#"print("plain print", 42)"#)?;
+        let host = c.script.host.clone();
+        host.execute(c, c.core.root_id(), scr)?;
         let logs = host.take_logs();
         assert!(
             logs.iter().any(|line| line.contains("plain print")),
@@ -456,10 +560,9 @@ fn tprint_output_lands_in_script_logs() -> Result<()> {
 #[test]
 fn print_quota_and_sequential_diagnostics_are_per_invocation() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.finalize_api()?;
-        let host = c.script_host.clone();
+        let host = c.script.host.clone();
         let noisy = host.compile("for i = 1, 5000 do print(i) end")?;
-        host.execute(c, c.core.root_id(), noisy, None)?;
+        host.execute(c, c.core.root_id(), noisy)?;
         let logs = host.take_logs();
         let marker = String::from_utf8_lossy(SinkQuota::TRUNCATION_MARKER)
             .trim_end()
@@ -468,7 +571,7 @@ fn print_quota_and_sequential_diagnostics_are_per_invocation() -> Result<()> {
         assert!(logs.len() <= 4097, "quota should bound captured calls");
 
         let quiet = host.compile("return true")?;
-        host.execute(c, c.core.root_id(), quiet, None)?;
+        host.execute(c, c.core.root_id(), quiet)?;
         assert!(host.take_logs().is_empty());
         Ok(())
     })
@@ -477,8 +580,7 @@ fn print_quota_and_sequential_diagnostics_are_per_invocation() -> Result<()> {
 #[test]
 fn node_handle_marshal_hook_returns_external_token_record() -> Result<()> {
     run_ttree(|c, _, tree| {
-        c.finalize_api()?;
-        let host = c.script_host.clone();
+        let host = c.script.host.clone();
         let mut runtime_cell = host.runtime.borrow_mut();
         let runtime = runtime_cell.as_mut().expect("finalized runtime");
         let mut marshaled = None;
@@ -501,11 +603,10 @@ fn node_handle_marshal_hook_returns_external_token_record() -> Result<()> {
 #[test]
 fn retained_node_handle_is_rejected_after_removal() -> Result<()> {
     run_ttree(|c, _, tree| {
-        c.finalize_api()?;
-        let host = c.script_host.clone();
+        let host = c.script.host.clone();
         c.core.remove_subtree(tree.a)?;
-        let anchor = c.core.root_id();
-        c.script_context_stack.push(anchor);
+        let origin = c.core.root_id();
+        c.script.context_stack.push(origin);
         let mut runtime_cell = host.runtime.borrow_mut();
         let runtime = runtime_cell.as_mut().expect("finalized runtime");
         runtime
@@ -522,7 +623,7 @@ fn retained_node_handle_is_rejected_after_removal() -> Result<()> {
                 Ok(())
             })
             .map_err(|error| error::Error::script(error.to_string()))?;
-        assert_eq!(c.script_context_stack.pop(), Some(anchor));
+        assert_eq!(c.script.context_stack.pop(), Some(origin));
         Ok(())
     })
 }
@@ -530,29 +631,28 @@ fn retained_node_handle_is_rejected_after_removal() -> Result<()> {
 #[test]
 fn binding_replacement_releases_old_and_failed_callbacks() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.finalize_api()?;
-        let host = c.script_host.clone();
+        let host = c.script.host.clone();
         let install = host.compile(
             r#"canopy.bind("a", { path = "", description = "First binding" }, function() local value = true end)"#,
         )?;
-        host.execute(c, c.core.root_id(), install, None)?;
+        host.execute(c, c.core.root_id(), install)?;
         assert_eq!(host.state.borrow().closures.functions.len(), 1);
 
         let replace = host.compile(
             r#"canopy.bind("a", { path = "", description = "Second binding" }, function() local value = false end)"#,
         )?;
-        host.execute(c, c.core.root_id(), replace, None)?;
+        host.execute(c, c.core.root_id(), replace)?;
         assert_eq!(host.state.borrow().closures.functions.len(), 1);
 
         let invalid =
             host.compile(r#"canopy.bind("a", { path = "invalid-name", description = "Invalid path" }, function() end)"#)?;
-        host.execute(c, c.core.root_id(), invalid, None)
+        host.execute(c, c.core.root_id(), invalid)
             .expect_err("invalid replacement path should fail");
         assert_eq!(host.state.borrow().closures.functions.len(), 1);
 
         let exhausted = host.compile("canopy.on_start(function() end)")?;
         host.state.borrow_mut().closures.next_function_id = u64::MAX;
-        host.execute(c, c.core.root_id(), exhausted, None)
+        host.execute(c, c.core.root_id(), exhausted)
             .expect_err("closure identifier exhaustion should fail");
         assert_eq!(host.state.borrow().closures.functions.len(), 1);
         Ok(())
@@ -562,12 +662,13 @@ fn binding_replacement_releases_old_and_failed_callbacks() -> Result<()> {
 #[test]
 fn script_identifier_exhaustion_is_reported() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.script_host.state.borrow_mut().scripts.next_script_id = u64::MAX;
+        c.script.host.state.borrow_mut().scripts.next_script_id = u64::MAX;
         let error = c
-            .script_host
+            .script
+            .host
             .compile("return true")
             .expect_err("script identifier exhaustion should fail");
-        assert!(matches!(error, error::Error::InvalidOperation(_)));
+        assert!(matches!(error, error::Error::Invalid(_)));
         Ok(())
     })
 }
@@ -598,13 +699,13 @@ fn wait_for_timeout_surfaces_as_script_timeout() -> Result<()> {
 #[test]
 fn tscript_bindings_carry_declaration_sites() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.finalize_api()?;
         let scr = c
-            .script_host
+            .script
+            .host
             .compile("canopy.bind(\"z\", { description = \"Test binding\" }, function() end)")?;
-        let host = c.script_host.clone();
-        host.execute(c, c.core.root_id(), scr, None)?;
-        let check = c.script_host.compile(
+        let host = c.script.host.clone();
+        host.execute(c, c.core.root_id(), scr)?;
+        let check = c.script.host.compile(
             r#"
             for _, binding in canopy.bindings() do
                 if binding.input == "z" then
@@ -620,7 +721,7 @@ fn tscript_bindings_carry_declaration_sites() -> Result<()> {
             canopy.assert(false, "binding for z not found")
             "#,
         )?;
-        host.execute(c, c.core.root_id(), check, None)?;
+        host.execute(c, c.core.root_id(), check)?;
         Ok(())
     })
 }
@@ -628,10 +729,9 @@ fn tscript_bindings_carry_declaration_sites() -> Result<()> {
 #[test]
 fn texecute() -> Result<()> {
     run_ttree(|c, _, tree| {
-        c.finalize_api()?;
-        let scr = c.script_host.compile(r#"bb_la.c_leaf()"#)?;
-        let host = c.script_host.clone();
-        host.execute(c, tree.b_a, scr, None)?;
+        let scr = c.script.host.compile(r#"bb_la.c_leaf()"#)?;
+        let host = c.script.host.clone();
+        host.execute(c, tree.b_a, scr)?;
         assert_eq!(get_state().path, ["bb_la.c_leaf()"]);
         Ok(())
     })?;
@@ -641,10 +741,9 @@ fn texecute() -> Result<()> {
 #[test]
 fn truntime_error_returns_script_error() -> Result<()> {
     run_ttree(|c, _, tree| {
-        c.finalize_api()?;
-        let scr = c.script_host.compile(r#"canopy.assert(false, "boom")"#)?;
-        let host = c.script_host.clone();
-        let err = host.execute(c, tree.b_a, scr, None);
+        let scr = c.script.host.compile(r#"canopy.assert(false, "boom")"#)?;
+        let host = c.script.host.clone();
+        let err = host.execute(c, tree.b_a, scr);
         assert!(matches!(
             err,
             Err(error::Error::ScriptStructured {
@@ -659,10 +758,9 @@ fn truntime_error_returns_script_error() -> Result<()> {
 #[test]
 fn script_context_stack_pops_after_runtime_error() -> Result<()> {
     run_ttree(|c, _, tree| {
-        c.finalize_api()?;
-        let scr = c.script_host.compile(r#"error("boom")"#)?;
-        let host = c.script_host.clone();
-        let err = host.execute(c, tree.a, scr, None);
+        let scr = c.script.host.compile(r#"error("boom")"#)?;
+        let host = c.script.host.clone();
+        let err = host.execute(c, tree.a, scr);
         assert!(matches!(
             err,
             Err(error::Error::ScriptStructured {
@@ -670,7 +768,7 @@ fn script_context_stack_pops_after_runtime_error() -> Result<()> {
                 ..
             })
         ));
-        assert!(c.script_context_stack.is_empty());
+        assert!(c.script.context_stack.is_empty());
         Ok(())
     })
 }
@@ -678,11 +776,10 @@ fn script_context_stack_pops_after_runtime_error() -> Result<()> {
 #[test]
 fn tcheck_script_reports_type_errors() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.finalize_api()?;
         let result = c
-            .script_host
+            .script
+            .host
             .check_script("tests/type-error.luau", "local value: string = 1")?;
-        assert!(!result.is_ok());
         assert!(result.has_errors());
         assert!(
             result
@@ -703,93 +800,8 @@ fn tcheck_script_reports_type_errors() -> Result<()> {
 #[test]
 fn tcompile_rejects_type_errors_when_finalized() -> Result<()> {
     run_ttree(|c, _, _| {
-        c.finalize_api()?;
-        let err = c.script_host.compile("local value: string = 1");
+        let err = c.script.host.compile("local value: string = 1");
         assert!(matches!(err, Err(error::Error::Parse(_))));
-        Ok(())
-    })
-}
-
-/// Mounted owner used to distinguish free commands from node dispatch.
-struct WaitFreeOwner;
-
-impl crate::Widget for WaitFreeOwner {
-    fn name(&self) -> NodeName {
-        NodeName::convert("wait_free")
-    }
-}
-
-fn wait_command_invoke(
-    _target: Option<&mut dyn Any>,
-    _ctx: &mut dyn crate::Context,
-    _invocation: &commands::CommandInvocation,
-) -> StdResult<ArgValue, commands::CommandError> {
-    Ok(ArgValue::Null)
-}
-
-fn wait_command_check(_args: &CommandArgs) -> StdResult<(), commands::CommandError> {
-    Ok(())
-}
-
-static WAIT_EXTRA_NODE: CommandSpec = CommandSpec {
-    id: commands::CommandId("ba_la::wait_extra"),
-    name: "wait_extra",
-    dispatch: commands::CommandDispatchKind::Node { owner: "ba_la" },
-    params: &[],
-    ret: commands::CommandReturnSpec::Unit,
-    doc: None,
-    invoke: wait_command_invoke,
-    check: wait_command_check,
-    status: None,
-};
-
-static WAIT_FREE: CommandSpec = CommandSpec {
-    id: commands::CommandId("wait_free::run"),
-    name: "run",
-    dispatch: commands::CommandDispatchKind::Free,
-    params: &[],
-    ret: commands::CommandReturnSpec::Unit,
-    doc: None,
-    invoke: wait_command_invoke,
-    check: wait_command_check,
-    status: None,
-};
-
-#[test]
-fn wait_for_node_preserves_registration_and_focus_resolution() -> Result<()> {
-    run_ttree(|canopy, _, tree| {
-        static WAIT_COMMANDS: &[&CommandSpec] = &[&WAIT_EXTRA_NODE, &WAIT_FREE];
-        canopy.core.commands.add(WAIT_COMMANDS)?;
-        canopy
-            .core
-            .add_child_to_boxed(tree.root, Box::new(WaitFreeOwner))?;
-        canopy.core.set_focus(tree.root)?;
-        assert_eq!(
-            canopy.eval_script(r#"return canopy.wait_for_node("ba_la", 10)"#)?,
-            ArgValue::Bool(true)
-        );
-        for owner in ["ba", "wait_free", "missing"] {
-            let error = canopy
-                .eval_script(&format!("return canopy.wait_for_node({owner:?}, 1)"))
-                .expect_err("unregistered or absent node owner must time out");
-            assert!(matches!(
-                error,
-                error::Error::ScriptTimeout { timeout_ms: 1 }
-            ));
-        }
-        canopy.core.set_focus(tree.b)?;
-        let error = canopy
-            .eval_script(r#"return canopy.wait_for_node("ba_la", 1)"#)
-            .expect_err("owner outside focus subtree and ancestors must time out");
-        assert!(matches!(
-            error,
-            error::Error::ScriptTimeout { timeout_ms: 1 }
-        ));
-        canopy.core.set_focus(tree.a_a)?;
-        assert_eq!(
-            canopy.eval_script(r#"return canopy.wait_for_node("ba_la", 10)"#)?,
-            ArgValue::Bool(true)
-        );
         Ok(())
     })
 }
@@ -841,15 +853,15 @@ impl Widget for ScriptCallProbe {
 
 /// Construct two owners of the same command, with the second focused.
 fn script_call_probes() -> Result<(Canopy, NodeId, NodeId)> {
-    let mut canopy = Canopy::new();
+    let mut canopy = CanopyBuilder::new()
+        .configure(|setup| setup.add_commands::<ScriptCallProbe>())
+        .build()?;
     let first = canopy.core.create_detached(ScriptCallProbe { value: 1 })?;
     let second = canopy.core.create_detached(ScriptCallProbe { value: 2 })?;
     canopy
         .core
         .set_children(canopy.core.root_id(), vec![first, second])?;
-    canopy.add_commands::<ScriptCallProbe>()?;
     canopy.core.set_focus(second)?;
-    canopy.finalize_api()?;
     Ok((canopy, first, second))
 }
 
@@ -857,13 +869,13 @@ fn script_call_probes() -> Result<(Canopy, NodeId, NodeId)> {
 fn explicit_script_targets_match_discovery_and_survive_owner_insertion() -> Result<()> {
     let (mut canopy, first, second) = script_call_probes()?;
     assert_eq!(canopy.eval_script(r#"
-        local children = canopy.children(canopy.root())
+        local children = canopy.node_info(canopy.root()).children
         local first, second = children[1], children[2]
         assert(first and second)
         assert(canopy.call_from(canopy.root(), "script_call_probe::identify") == 1)
         assert(canopy.call_focus("script_call_probe::identify") == 2)
         assert(canopy.call_exact(second, "script_call_probe::identify") == 2)
-        assert(canopy.cmd_on(canopy.root(), "script_call_probe::identify") == 1)
+        assert(canopy.call_from(canopy.root(), "script_call_probe::identify") == 1)
         for _, command in canopy.commands({kind = "exact", node = second}) do
             if command.name == "identify" then
                 assert(command.available and command.target == second and command.status == "enabled")
@@ -881,7 +893,7 @@ fn explicit_script_targets_match_discovery_and_survive_owner_insertion() -> Resu
     assert_eq!(
         canopy.eval_script(
             r#"
-        local second = canopy.children(canopy.root())[3]
+        local second = canopy.node_info(canopy.root()).children[3]
         assert(canopy.call_from(canopy.root(), "script_call_probe::identify") == 3)
         return canopy.call_exact(second, "script_call_probe::identify")
     "#
@@ -919,7 +931,9 @@ fn explicit_script_arguments_do_not_infer_named_maps() -> Result<()> {
         assert(canopy.call_named("script_call_probe::optional", {}) == nil)
         local optional = canopy.call_named("script_call_probe::optional", {options = {theme = "light"}})
         assert(optional.theme == "light")
-        assert(canopy.cmd("script_call_probe::echo", {options = "legacy"}) == "legacy")
+        -- Owner functions are positional: a single table is the first argument.
+        local positional = script_call_probe.echo({options = "dark"})
+        assert(positional.options == "dark")
         return true
     "#)?, ArgValue::Bool(true));
     for source in [
@@ -949,7 +963,7 @@ fn declarative_script_binding_exposes_arguments_phase_and_route_target() -> Resu
         }, command.script_call_probe.set_value(7))
         for _, binding in canopy.bindings() do
             if binding.input == "x" then
-                assert(binding.target == "command")
+                assert(binding.action == "command")
                 assert(binding.command == "script_call_probe::set_value")
                 assert(binding.arguments[1] == 7)
                 local target = binding.command_target
@@ -967,7 +981,10 @@ fn declarative_script_binding_exposes_arguments_phase_and_route_target() -> Resu
     // A mouse binding declares its phase the same way a key does.
     canopy.eval_script(
         r#"
-        canopy.bind_mouse("LeftDown", {description = "Early click", phase = "before_widget"}, function() end)
+        canopy.keymap({
+            phase = "before_widget",
+            {mouse = "LeftDown", description = "Early click", action = function() end},
+        })
         for _, binding in canopy.bindings() do
             if binding.input == "LeftDown" then
                 assert(binding.phase == "before_widget")
@@ -979,21 +996,75 @@ fn declarative_script_binding_exposes_arguments_phase_and_route_target() -> Resu
 }
 
 #[test]
+fn bindings_can_hide_from_help_without_changing_discovery_or_dispatch() -> Result<()> {
+    let (mut canopy, _, _) = script_call_probes()?;
+    canopy.eval_script(
+        r#"
+        canopy.bind("x", {
+            description = "Hidden command",
+            show_in_help = false,
+        }, command.script_call_probe.set_value(11))
+        canopy.keymap({
+            show_in_help = false,
+            {key = "y", description = "Hidden by keymap", action = command.script_call_probe.set_value(12)},
+            {key = "z", description = "Visible override", show_in_help = true, action = function() end},
+            {mouse = "LeftDown", description = "Hidden mouse", action = function() end},
+        })
+        canopy.keymap({
+            {key = "v", description = "Visible default", action = function() end},
+            {key = "w", description = "Hidden entry", show_in_help = false, action = function() end},
+        })
+        local expected = {x = false, y = false, z = true, v = true, w = false, LeftDown = false}
+        for _, binding in canopy.bindings() do
+            assert(binding.show_in_help == expected[binding.input])
+        end
+        local available = canopy.available_bindings()
+        assert(#available.bindings == 5)
+        assert(#available.mouse_bindings == 1)
+        for _, binding in available.bindings do
+            assert(binding.show_in_help == expected[binding.input])
+        end
+        assert(available.mouse_bindings[1].show_in_help == false)
+        local before = #canopy.bindings()
+        assert(not pcall(function()
+            canopy.keymap({
+                {key = "a", description = "First", action = function() end},
+                {key = "b", description = "Bad flag", show_in_help = ("no" :: any), action = function() end},
+            })
+        end))
+        assert(#canopy.bindings() == before, "invalid visibility must not install any entries")
+        "#,
+    )?;
+    for (key, value) in [('x', 11), ('y', 12)] {
+        canopy.key(None, key)?;
+        assert_eq!(
+            canopy.eval_script(r#"return canopy.call_focus("script_call_probe::identify")"#)?,
+            ArgValue::Int(value)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn availability_reports_key_and_mouse_bindings_in_separate_lists() -> Result<()> {
     let (mut canopy, _, _) = script_call_probes()?;
     canopy.eval_script(
         r#"
         canopy.bind("x", {description = "Set value"}, command.script_call_probe.set_value(7))
-        canopy.bind_mouse(
-            "ctrl-LeftDown",
-            {description = "Set value", phase = "before_widget"},
-            command.script_call_probe.set_value(7)
-        )
-        canopy.bind_mouse("ScrollUp", {description = "Scroll"}, function() end)
+        canopy.keymap({
+            phase = "before_widget",
+            {
+                mouse = "ctrl-LeftDown",
+                description = "Set value",
+                action = command.script_call_probe.set_value(7),
+            },
+        })
+        canopy.keymap({{mouse = "ScrollUp", description = "Scroll", action = function() end}})
 
         local available = canopy.available_bindings()
-        canopy.assert(#available.bindings == 1, "the key list stays key-only")
+        canopy.assert(#available.bindings == 1, "the key list holds the key")
         canopy.assert(available.bindings[1].input == "x", "the key reports its own spec")
+        canopy.assert(available.bindings[1].tier == "default", "the key reports its tier")
 
         local mice = available.mouse_bindings
         canopy.assert(#mice == 2, "one winner per mouse input, got " .. #mice)
@@ -1017,10 +1088,45 @@ fn availability_reports_key_and_mouse_bindings_in_separate_lists() -> Result<()>
         r#"
         canopy.unbind_key("x", {})
         for _, binding in canopy.available_bindings().mouse_bindings do
-            canopy.bind_mouse(binding.input, {description = "Rebound"}, function() end)
+            canopy.keymap({{mouse = binding.input, description = "Rebound", action = function() end}})
         end
         canopy.assert(#canopy.available_bindings().mouse_bindings == 2, "every label parsed back")
     "#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn script_explains_routes_and_checks_dispatch() -> Result<()> {
+    let (mut canopy, _, _) = script_call_probes()?;
+    canopy.eval_script(
+        r#"
+        canopy.bind("x", {description = "Set value"}, command.script_call_probe.set_value(7))
+
+        local explanation = canopy.explain_key("x")
+        local outcome = explanation.outcome
+        canopy.assert(outcome.kind == "binding", "the binding would run")
+        canopy.assert(outcome.phase == "after_widget", "after the widget ignores the key")
+        canopy.assert(outcome.action == "command", "the binding runs a command")
+        canopy.assert(#explanation.steps == 1, "the walk stops at the winner")
+        local step = explanation.steps[1]
+        canopy.assert(step.widget == "ignore", "every widget predicts its keys")
+        local selected = step.binding
+        canopy.assert(selected ~= nil, "the step names a binding")
+        if selected ~= nil then
+            canopy.assert(selected.id == outcome.binding, "the step names the winner")
+            canopy.assert(selected.phase == "after_widget", "the step names the phase")
+        end
+        canopy.assert(step.path == outcome.path, "the winner resolves at the step")
+
+        local active = canopy.available_bindings()
+        canopy.assert(active.bindings[1].id == outcome.binding, "discovery agrees with the analysis")
+        local ok = pcall(function()
+            canopy.send_key_checked("x", {kind = "unhandled"})
+        end)
+        canopy.assert(not ok, "a mismatched expectation is rejected")
+        canopy.send_key_checked("x", {kind = "binding", binding = outcome.binding})
+        "#,
     )?;
     Ok(())
 }

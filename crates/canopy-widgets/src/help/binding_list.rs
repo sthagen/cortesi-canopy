@@ -3,16 +3,21 @@
 use std::mem;
 
 use canopy::{
-    Canopy, Context, Loader, NodeName, Render, ViewContext, Widget,
+    NodeName, Register, Setup, ViewContext, Widget,
     commands::CommandStatus,
     derive_commands,
     error::Result,
-    event::key::{Empty, Key, KeyCode},
     geom::{Line, Size},
-    help::{AvailableBinding, BindingSnapshot},
-    layout::{CanvasContext, Layout, MeasureOverflow},
+    input::{
+        AvailableBinding, BindingActionKind, BindingSnapshot,
+        key::{Empty, Key, KeyCode},
+    },
+    layout::{
+        CanvasContext, Constraint, Edges, Layout, MeasureConstraints, MeasureOverflow, Measurement,
+    },
+    render::Render,
+    text,
 };
-use unicode_width::UnicodeWidthStr;
 
 /// Widest row of keys for one action before further keys continue below.
 const KEY_ROW_WIDTH: usize = 20;
@@ -29,7 +34,8 @@ pub(super) struct DisplayLine {
 
 /// Scrollable list of effective key bindings.
 ///
-/// The list uses its full width. An enclosing frame draws its scroll position.
+/// The list uses its full width, keeping a one-column margin on each side. An
+/// enclosing frame draws its scroll position.
 pub struct BindingList {
     /// Captured application context, absent while help is closed.
     snapshot: Option<BindingSnapshot>,
@@ -56,43 +62,6 @@ impl BindingList {
         self.snapshot.as_ref()
     }
 
-    #[command]
-    /// Scroll up by one line.
-    pub fn scroll_up(&self, context: &mut dyn Context) {
-        context.scroll_up();
-    }
-
-    #[command]
-    /// Scroll down by one line.
-    pub fn scroll_down(&self, context: &mut dyn Context) {
-        context.scroll_down();
-    }
-
-    #[command]
-    /// Scroll up by one viewport.
-    pub fn page_up(&self, context: &mut dyn Context) {
-        context.page_up();
-    }
-
-    #[command]
-    /// Scroll down by one viewport.
-    pub fn page_down(&self, context: &mut dyn Context) {
-        context.page_down();
-    }
-
-    #[command]
-    /// Scroll to the first row.
-    pub fn scroll_to_top(&self, context: &mut dyn Context) {
-        context.scroll_to(0, 0);
-    }
-
-    #[command]
-    /// Scroll to the last row.
-    pub fn scroll_to_bottom(&self, context: &mut dyn Context) {
-        let view = context.view();
-        context.scroll_to(0, view.canvas.h.saturating_sub(view.view_rect().h));
-    }
-
     /// Build the exact vertical canvas for one viewport width.
     pub(super) fn display_lines(&self, width: u32) -> Vec<DisplayLine> {
         let rows = self.snapshot.as_ref().map_or_else(Vec::new, snapshot_rows);
@@ -100,9 +69,9 @@ impl BindingList {
     }
 }
 
-impl Loader for BindingList {
-    fn load(canopy: &mut Canopy) -> Result<()> {
-        canopy.add_commands::<Self>()
+impl Register for BindingList {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()
     }
 }
 
@@ -112,7 +81,23 @@ impl Widget for BindingList {
     }
 
     fn layout(&self) -> Layout {
-        Layout::fill().overflow_y(MeasureOverflow::Unbounded)
+        // The list starts at the frame's top edge, so only the sides keep a
+        // margin.
+        Layout::fill()
+            .overflow_y(MeasureOverflow::Unbounded)
+            .padding(Edges::symmetric(0, 1))
+    }
+
+    fn measure(&self, constraints: MeasureConstraints) -> Measurement {
+        let rows = self.snapshot.as_ref().map_or_else(Vec::new, snapshot_rows);
+        let natural = u32::try_from(natural_width(&rows)).unwrap_or(u32::MAX);
+        let width = match constraints.width {
+            Constraint::Exact(width) => width,
+            Constraint::AtMost(width) => natural.min(width),
+            Constraint::Unbounded => natural,
+        };
+        let lines = self.display_lines(width).len();
+        constraints.clamp(Size::new(width, u32::try_from(lines).unwrap_or(u32::MAX)))
     }
 
     fn canvas(&self, view: Size, _context: &CanvasContext) -> Size {
@@ -121,11 +106,12 @@ impl Widget for BindingList {
     }
 
     fn render(&mut self, render: &mut Render, context: &dyn ViewContext) -> Result<()> {
+        // The list paints the help panel's parts wherever it is mounted.
+        render.push_layer("help");
         let view = context.view();
-        let rect = view.outer_rect_local();
-        render.fill("help/panel", rect, ' ')?;
-        let width = view.content.w;
-        let lines = self.display_lines(width);
+        render.fill("panel", view.outer_rect_local(), ' ')?;
+        let content = view.view_rect_local();
+        let lines = self.display_lines(content.w);
         let viewport = view.view_rect();
         for (index, line) in lines
             .iter()
@@ -134,7 +120,7 @@ impl Widget for BindingList {
             .take(viewport.h as usize)
         {
             let y = u32::try_from(index).unwrap_or(u32::MAX) - viewport.tl.y;
-            render_line(render, line, 0, y, width)?;
+            render_line(render, line, content.tl.x, content.tl.y + y, content.w)?;
         }
         Ok(())
     }
@@ -165,17 +151,21 @@ pub(super) struct BindingRow {
     description: String,
 }
 
-/// Return the rows for every effective binding in `snapshot`.
+/// Return the rows for effective bindings that opt into help in `snapshot`.
 ///
 /// Mouse inputs sort after every key, so the familiar key list keeps its order
 /// and the pointer rows gather at the end. An input that shares an action with
 /// a key joins that action's row rather than repeating it.
 pub(super) fn snapshot_rows(snapshot: &BindingSnapshot) -> Vec<BindingRow> {
-    let mice = snapshot.mouse_bindings.iter().map(|binding| BindingRow {
-        sort: (MOUSE_SORT_GROUP, binding.input.to_string()),
-        label: binding.input.to_string(),
-        description: binding_description(binding),
-    });
+    let mice = snapshot
+        .mouse_bindings
+        .iter()
+        .filter(|binding| binding.show_in_help)
+        .map(|binding| BindingRow {
+            sort: (MOUSE_SORT_GROUP, binding.input.to_string()),
+            label: binding.input.to_string(),
+            description: binding_description(binding),
+        });
     key_rows_of(&snapshot.bindings)
         .into_iter()
         .chain(mice)
@@ -186,9 +176,10 @@ pub(super) fn snapshot_rows(snapshot: &BindingSnapshot) -> Vec<BindingRow> {
 pub(super) fn key_rows_of(bindings: &[AvailableBinding<Key>]) -> Vec<BindingRow> {
     bindings
         .iter()
+        .filter(|binding| binding.show_in_help)
         .map(|binding| BindingRow {
             sort: key_sort_key(binding.input),
-            label: key_label(binding.input),
+            label: Key::label(&binding.input),
             description: binding_description(binding),
         })
         .collect()
@@ -200,7 +191,7 @@ pub(super) fn display_lines(rows: &[BindingRow], width: u32) -> Vec<DisplayLine>
         return vec![DisplayLine {
             key: None,
             text: "No key bindings in this context".to_string(),
-            style: "help/label",
+            style: "label",
         }];
     }
 
@@ -234,6 +225,9 @@ pub(super) fn natural_width(rows: &[BindingRow]) -> usize {
     keys + 2 + description
 }
 
+/// Separator between keys that share one action.
+const KEY_SEPARATOR: &str = ", ";
+
 /// Render one display line from column `x` of row `y`, within `width` cells.
 pub(super) fn render_line(
     render: &mut Render,
@@ -245,14 +239,42 @@ pub(super) fn render_line(
     let Some(key) = &line.key else {
         return render.text(line.style, Line::new(x, y, width), &line.text);
     };
-    let key_width = text_width(key) as u32;
-    render.text("help/key", Line::new(x, y, key_width.min(width)), key)?;
+    let key_width = u32::try_from(text_width(key)).unwrap_or(u32::MAX);
+    render_keys(render, key, x, y, width)?;
     let start = key_width.saturating_add(2).min(width);
     render.text(
         line.style,
         Line::new(x + start, y, width.saturating_sub(start)),
         &line.text,
     )
+}
+
+/// Render a packed key row, drawing the separators apart from the keys.
+fn render_keys(render: &mut Render, key: &str, x: u32, y: u32, width: u32) -> Result<()> {
+    let limit = x.saturating_add(width);
+    let mut cursor = x;
+    for (index, piece) in key.split(KEY_SEPARATOR).enumerate() {
+        if index > 0 {
+            let separator = u32::try_from(text_width(KEY_SEPARATOR)).unwrap_or(u32::MAX);
+            render.text(
+                "key/separator",
+                Line::new(cursor, y, separator.min(limit.saturating_sub(cursor))),
+                KEY_SEPARATOR,
+            )?;
+            cursor = cursor.saturating_add(separator);
+        }
+        let piece_width = u32::try_from(text_width(piece)).unwrap_or(u32::MAX);
+        render.text(
+            "key",
+            Line::new(cursor, y, piece_width.min(limit.saturating_sub(cursor))),
+            piece,
+        )?;
+        cursor = cursor.saturating_add(piece_width);
+        if cursor >= limit {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Merge bindings that show the same action into groups, ordered by their
@@ -280,14 +302,13 @@ fn binding_groups(rows: &[BindingRow]) -> Vec<BindingGroup> {
 /// Pack key labels into rows no wider than [`KEY_ROW_WIDTH`], with at least one
 /// label on each row.
 ///
-/// A space separates keys. No key label contains one, so the split is never
-/// ambiguous.
+/// A comma and a space separate keys.
 fn key_rows(keys: &[String]) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     for key in keys {
         match rows.last_mut() {
-            Some(row) if text_width(row) + 1 + text_width(key) <= KEY_ROW_WIDTH => {
-                row.push(' ');
+            Some(row) if text_width(row) + 2 + text_width(key) <= KEY_ROW_WIDTH => {
+                row.push_str(", ");
                 row.push_str(key);
             }
             _ => rows.push(key.clone()),
@@ -296,29 +317,9 @@ fn key_rows(keys: &[String]) -> Vec<String> {
     rows
 }
 
-/// Return the label help shows for `key`, with arrow keys drawn as arrows.
-///
-/// Arrows are ambiguous-width characters, and many terminal fonts draw them
-/// wider than their one cell. Each arrow keeps a blank cell after it for the
-/// glyph to spill into, so it never covers the next key.
-fn key_label(key: Key) -> String {
-    let code = match key.key {
-        KeyCode::Left => "← ".to_string(),
-        KeyCode::Right => "→ ".to_string(),
-        KeyCode::Up => "↑ ".to_string(),
-        KeyCode::Down => "↓ ".to_string(),
-        code => code.to_string(),
-    };
-    if key.mods == Empty {
-        code
-    } else {
-        format!("{}+{code}", key.mods)
-    }
-}
-
 /// Return the terminal-cell width of text.
 fn text_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    text::width(text) as usize
 }
 
 /// Build aligned shortcut rows, stacking keys above actions on narrow screens.
@@ -349,7 +350,7 @@ fn binding_lines(
                     DisplayLine {
                         key: None,
                         text: text.into_owned(),
-                        style: "help/key",
+                        style: "key",
                     }
                 }));
             }
@@ -358,7 +359,7 @@ fn binding_lines(
                 lines.push(DisplayLine {
                     key: None,
                     text: format!("  {text}"),
-                    style: "help/label",
+                    style: "label",
                 });
             }
         } else {
@@ -375,12 +376,12 @@ fn binding_lines(
                             " ".repeat(max_key_width.saturating_sub(text_width(key)))
                         )),
                         text,
-                        style: "help/label",
+                        style: "label",
                     },
                     None => DisplayLine {
                         key: None,
                         text: format!("{}  {text}", " ".repeat(max_key_width)),
-                        style: "help/label",
+                        style: "label",
                     },
                 });
             }
@@ -389,14 +390,26 @@ fn binding_lines(
     lines
 }
 
+/// Marker after the description of a binding that opens a menu, so a key that
+/// leads to another choice reads apart from one that acts. It is ASCII, so no
+/// terminal or font draws it wider than the cells it is counted in.
+const MENU_MARKER: &str = "...";
+
 /// Show the action and useful availability feedback, leaving diagnostics to
-/// inspection APIs.
+/// inspection APIs. A binding that opens a menu carries [`MENU_MARKER`].
 pub(super) fn binding_description<I>(binding: &AvailableBinding<I>) -> String {
-    let Some(command) = &binding.command else {
-        return binding.description.clone();
-    };
     let mut description = binding.description.clone();
-    match &command.status {
+    if binding.action == BindingActionKind::Menu {
+        description.push_str(MENU_MARKER);
+    }
+    let Some(command) = &binding.command else {
+        return description;
+    };
+    match command
+        .availability
+        .as_ref()
+        .and_then(|availability| availability.status.as_ref())
+    {
         Some(CommandStatus::Disabled(reason)) => {
             description.push_str(&format!(" — Unavailable: {reason}"));
         }
@@ -406,21 +419,35 @@ pub(super) fn binding_description<I>(binding: &AvailableBinding<I>) -> String {
     description
 }
 
+/// Sort category for every key with a modifier, after each plain key category.
+const MODIFIED_SORT_GROUP: u8 = 5;
 /// Sort category for every mouse input, after each key category.
 const MOUSE_SORT_GROUP: u8 = 6;
 
-/// Sort keys by requested category and display string.
+/// Sort keys: plain keys first, by category, then keys with modifiers.
+///
+/// Keys with modifiers group by their modifier set, so every `ctrl` key sits
+/// together and apart from every `shift` key. Within a category or a modifier
+/// set, keys order alphabetically by the name the list shows, ignoring case.
+/// A NUL ends the modifiers, so one set's keys never interleave with a longer
+/// set's.
 fn key_sort_key(key: Key) -> (u8, String) {
-    let group = if key.mods != Empty {
-        5
-    } else {
-        match key.key {
-            KeyCode::Char(character) if character.is_ascii_lowercase() => 0,
-            KeyCode::Char(character) if character.is_ascii_uppercase() => 1,
-            KeyCode::Char(character) if character.is_ascii_digit() => 2,
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => 3,
-            _ => 4,
-        }
+    let name = Key {
+        mods: Empty,
+        key: key.key,
+    }
+    .label();
+    let name = format!("{}\0{name}", name.to_lowercase());
+    if key.mods != Empty {
+        let mods = key.mods.to_string().to_ascii_lowercase();
+        return (MODIFIED_SORT_GROUP, format!("{mods}\0{name}"));
+    }
+    let group = match key.key {
+        KeyCode::Char(character) if character.is_ascii_lowercase() => 0,
+        KeyCode::Char(character) if character.is_ascii_uppercase() => 1,
+        KeyCode::Char(character) if character.is_ascii_digit() => 2,
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => 3,
+        _ => 4,
     };
-    (group, key.to_string())
+    (group, name)
 }

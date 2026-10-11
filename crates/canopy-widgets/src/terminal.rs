@@ -1,11 +1,19 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use canopy::{
-    Context, EventOutcome, NodeName, Render, ViewContext, Widget, cursor, derive_commands,
+    Context, EventOutcome, NodeName, ViewContext, Widget,
+    commands::CommandCall,
+    derive_commands,
     error::{Error, Result},
-    event::{self, key, mouse},
-    geom::{self, Size},
+    geom,
+    geom::Size,
+    input,
+    input::{key, mouse},
     layout::{CanvasContext, MeasureConstraints, Measurement},
+    render::{
+        Render,
+        cursor::{self, CursorRequest},
+    },
     rgb,
     style::{AttrSet, Color, ResolvedStyle, Style},
     text,
@@ -29,8 +37,6 @@ const DEFAULT_LINES: usize = 24;
 const DEFAULT_SCROLLBACK: usize = 10_000;
 /// Poll interval for draining PTY output.
 const POLL_INTERVAL_MS: u64 = 16;
-/// Maximum delay between clicks to count as a multi-click selection.
-const DOUBLE_CLICK_MS: u64 = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Terminal grid sizing metadata.
@@ -101,6 +107,8 @@ pub struct TerminalConfig {
     command: Option<Vec<String>>,
     /// Working directory for the terminal process.
     cwd: Option<PathBuf>,
+    /// Call posted once when the process exits.
+    on_exit: Option<CommandCall>,
 }
 
 impl TerminalConfig {
@@ -110,7 +118,8 @@ impl TerminalConfig {
     }
 
     /// Configure the command argv to run instead of the default shell.
-    pub fn with_command<I, S>(mut self, command: I) -> Self
+    #[must_use]
+    pub fn with_program<I, S>(mut self, command: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -120,8 +129,22 @@ impl TerminalConfig {
     }
 
     /// Configure the working directory for the terminal process.
+    #[must_use]
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Post `call` once when the process exits, with the terminal's node
+    /// appended as the last argument (or as `node` among named ones).
+    ///
+    /// The terminal already watches its process, so a host learns of the exit
+    /// here rather than by polling [`Terminal::exited`]. The terminal posts the
+    /// call with [`Context::post`], so it runs once the terminal's poll has
+    /// returned, and the host may remove the terminal.
+    #[must_use]
+    pub fn with_on_exit(mut self, call: CommandCall) -> Self {
+        self.on_exit = Some(call);
         self
     }
 }
@@ -134,14 +157,16 @@ pub struct Terminal {
     session: Option<Session>,
     /// Most recent terminal size.
     last_size: TerminalSize,
-    /// Cached cursor for rendering.
-    cursor: Option<cursor::Cursor>,
+    /// Cursor the child program shows, cached for rendering.
+    cursor: Option<(geom::Point, CursorRequest)>,
     /// Whether a selection drag is active.
     selection_active: bool,
     /// Selection anchor in viewport coordinates.
     selection_anchor: Option<geom::Point>,
     /// Multi-click tracking state.
     last_click: ClickTracker,
+    /// Whether the exit call has run.
+    exit_reported: bool,
 }
 
 #[derive_commands]
@@ -158,7 +183,8 @@ impl Terminal {
             cursor: None,
             selection_active: false,
             selection_anchor: None,
-            last_click: ClickTracker::new(Duration::from_millis(DOUBLE_CLICK_MS)),
+            last_click: ClickTracker::default(),
+            exit_reported: false,
         }
     }
 
@@ -393,39 +419,53 @@ impl Terminal {
 
     /// Encode and send a keyboard event to the backend session.
     fn handle_key(&mut self, key: key::Key) -> bool {
+        match self.classify_key(key) {
+            Some(TerminalKey::ScrollPageUp) => {
+                if let Some(session) = self.session_mut() {
+                    session.scroll_page_up();
+                }
+                true
+            }
+            Some(TerminalKey::ScrollPageDown) => {
+                if let Some(session) = self.session_mut() {
+                    session.scroll_page_down();
+                }
+                true
+            }
+            Some(TerminalKey::CopySelection) => {
+                self.copy_selection();
+                true
+            }
+            Some(TerminalKey::Forward(mapped)) => {
+                self.clear_selection();
+                if let Some(session) = self.session() {
+                    drop(session.send_key(mapped));
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Classify one key without running its effect.
+    ///
+    /// This is the only place the terminal decides which keys it consumes, so
+    /// prediction and dispatch cannot drift.
+    fn classify_key(&self, key: key::Key) -> Option<TerminalKey> {
+        self.session.as_ref()?;
         if key.mods.shift {
             match key.key {
-                key::KeyCode::PageUp => {
-                    if let Some(session) = self.session_mut() {
-                        session.scroll_page_up();
-                    }
-                    return true;
-                }
-                key::KeyCode::PageDown => {
-                    if let Some(session) = self.session_mut() {
-                        session.scroll_page_down();
-                    }
-                    return true;
-                }
+                key::KeyCode::PageUp => return Some(TerminalKey::ScrollPageUp),
+                key::KeyCode::PageDown => return Some(TerminalKey::ScrollPageDown),
                 _ => {}
             }
         }
-
         if key.mods.ctrl && key.mods.shift && matches!(key.key, key::KeyCode::Char('c' | 'C')) {
-            self.copy_selection();
-            return true;
+            return Some(TerminalKey::CopySelection);
         }
-
-        let Some(mapped) = map_key(key) else {
-            return false;
-        };
-
-        self.clear_selection();
-        if let Some(session) = self.session() {
-            drop(session.send_key(mapped));
-            return true;
-        }
-        false
+        map_key(key).map(TerminalKey::Forward)
     }
 
     /// Return the focus report the terminal expects, if it enabled focus
@@ -472,7 +512,7 @@ impl Widget for Terminal {
         let child_exited = session.child_exited();
         let child_exit_code = session.child_exit_code().unwrap_or(1);
         let default_bg = DEFAULT_BACKGROUND;
-        self.cursor = cursor_from_state(&state);
+        self.cursor = cursor_from_state(&state, session.cursor_blink_enabled());
 
         for (row_idx, line) in runs.iter().enumerate() {
             for run in line {
@@ -503,28 +543,42 @@ impl Widget for Terminal {
             }
         }
 
+        if ctx.is_focused()
+            && let Some((location, request)) = &self.cursor
+        {
+            let origin = view.content_origin();
+            let location = geom::Point {
+                x: origin.x.saturating_add(location.x),
+                y: origin.y.saturating_add(location.y),
+            };
+            rndr.cursor(location, request.clone());
+        }
+
         Ok(())
     }
 
-    fn on_event(&mut self, event: &event::Event, ctx: &mut dyn Context) -> Result<EventOutcome> {
+    fn on_event(&mut self, event: &input::Event, ctx: &mut dyn Context) -> Result<EventOutcome> {
         if self.session.is_none() {
             return Ok(EventOutcome::Ignore);
         }
 
         match event {
-            event::Event::Key(key) => {
+            input::Event::Key(key) => {
                 if self.handle_key(*key) {
                     Ok(EventOutcome::Handle)
                 } else {
                     Ok(EventOutcome::Ignore)
                 }
             }
-            event::Event::Paste(content) => {
+            input::Event::Paste(content) => {
                 self.clear_selection();
                 self.handle_paste(content);
                 Ok(EventOutcome::Handle)
             }
-            event::Event::Mouse(mouse_event) => {
+            input::Event::Mouse(mouse_event) if mouse_event.action == mouse::Action::Leave => {
+                Ok(EventOutcome::Ignore)
+            }
+            input::Event::Mouse(mouse_event) => {
                 ctx.set_focus(ctx.node_id())?;
                 let Some(state) = self.state() else {
                     return Ok(EventOutcome::Ignore);
@@ -576,15 +630,23 @@ impl Widget for Terminal {
                 };
                 Ok(outcome)
             }
-            event::Event::FocusGained => {
+            input::Event::FocusGained => {
                 self.sync_focus(true);
                 Ok(EventOutcome::Handle)
             }
-            event::Event::FocusLost => {
+            input::Event::FocusLost => {
                 self.sync_focus(false);
                 Ok(EventOutcome::Handle)
             }
             _ => Ok(EventOutcome::Ignore),
+        }
+    }
+
+    fn key_outcome(&self, key: key::Key, _context: &dyn ViewContext) -> EventOutcome {
+        if self.classify_key(key).is_some() {
+            EventOutcome::Handle
+        } else {
+            EventOutcome::Ignore
         }
     }
 
@@ -600,12 +662,14 @@ impl Widget for Terminal {
         true
     }
 
-    fn cursor(&self) -> Option<cursor::Cursor> {
-        self.cursor
-    }
-
-    fn poll(&mut self, _ctx: &mut dyn Context) -> Option<Duration> {
-        Some(Duration::from_millis(POLL_INTERVAL_MS))
+    fn poll(&mut self, ctx: &mut dyn Context) -> Result<Option<Duration>> {
+        if !self.exit_reported && self.exited() {
+            self.exit_reported = true;
+            if let Some(call) = &self.config.on_exit {
+                ctx.post(&call.with_arg("node", ctx.node_id()))?;
+            }
+        }
+        Ok(Some(Duration::from_millis(POLL_INTERVAL_MS)))
     }
 
     fn on_mount(&mut self, _ctx: &mut dyn Context) -> Result<()> {
@@ -642,6 +706,19 @@ fn terminal_config(config: &TerminalConfig, size: TerminalSize) -> EguiTTYConfig
         builder = builder.pty_working_dir(cwd.display().to_string());
     }
     builder.build()
+}
+
+/// One key action the terminal can take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalKey {
+    /// Scroll the scrollback up one page.
+    ScrollPageUp,
+    /// Scroll the scrollback down one page.
+    ScrollPageDown,
+    /// Copy the current selection to the system clipboard.
+    CopySelection,
+    /// Forward an encoded key to the process.
+    Forward(IttyKey),
 }
 
 /// Convert a Canopy key into an `itty` key.
@@ -691,25 +768,41 @@ fn map_key(key: key::Key) -> Option<IttyKey> {
     Some(IttyKey { code, modifiers })
 }
 
-/// Convert backend cursor state into Canopy's cursor model.
-fn cursor_from_state(state: &TerminalState) -> Option<cursor::Cursor> {
+/// Convert the child program's cursor into a cursor declaration.
+///
+/// The child sets the color and the blink. A block stays a block. An
+/// underline or a bar becomes an underline: a bar cannot be drawn in a cell
+/// grid, and a thin cursor keeps its meaning of insertion.
+fn cursor_from_state(state: &TerminalState, blink: bool) -> Option<(geom::Point, CursorRequest)> {
     let (row, col) = state.cursor.grid_pos?;
     if !state.cursor.visible_in_viewport {
         return None;
     }
 
     let shape = match state.cursor.shape.as_str() {
-        "Underline" => cursor::CursorShape::Underscore,
-        "Beam" => cursor::CursorShape::Line,
+        "Underline" | "Beam" => cursor::CursorShape::Underline,
         _ => cursor::CursorShape::Block,
     };
-    Some(cursor::Cursor {
-        location: geom::Point {
+    let color = state.cursor.color;
+    let request = CursorRequest::new(cursor::TERMINAL)
+        .with_shape(shape)
+        .with_color(Color::Rgb {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+        })
+        .with_motion(if blink {
+            cursor::CursorMotion::BLINK
+        } else {
+            cursor::CursorMotion::Steady
+        });
+    Some((
+        geom::Point {
             x: col as u32,
             y: row as u32,
         },
-        shape,
-    })
+        request,
+    ))
 }
 
 /// Render one styled run from the backend snapshot into Canopy cells.
@@ -871,18 +964,60 @@ mod tests {
     use std::sync::Arc;
 
     use canopy::{
-        ContextExt, TermBuf,
-        event::{key, mouse},
+        CanopyBuilder, ContextExt,
+        input::{key, mouse},
         layout::Layout,
+        render::TermBuf,
         style::{
-            GradientSpec, GradientStop, Paint, StyleManager, StyleMap,
-            effects::{self, Effect, StyleEffect},
+            GradientSpec, GradientStop, Paint, effects,
+            effects::{Effect, StyleEffect},
         },
         testing::harness::Harness,
     };
     use itty_core::{colors::Rgba8, palette::builtin};
 
     use super::*;
+
+    #[test]
+    fn key_capture_matches_event_handling() -> Result<()> {
+        let (mut terminal, _receiver) = stream_terminal();
+        let mut app = CanopyBuilder::new().build()?;
+        for spec in [
+            "a",
+            "Z",
+            "2",
+            "ctrl-a",
+            "alt-x",
+            "ctrl-shift-c",
+            "shift-pageup",
+            "pagedown",
+            "up",
+            "f1",
+            "esc",
+            "enter",
+            "backspace",
+            "tab",
+            "insert",
+            "delete",
+            "home",
+            "end",
+            "capslock",
+            "printscreen",
+            "null",
+            "keypadbegin",
+        ] {
+            let key = key::Key::parse_spec(spec).expect("valid key spec");
+            let (predicted, outcome) = app.with_root_context(|ctx| {
+                let predicted = terminal.key_outcome(key, ctx);
+                Ok((predicted, terminal.on_event(&input::Event::Key(key), ctx)?))
+            })?;
+            assert_eq!(
+                predicted, outcome,
+                "prediction must match handling for {spec}"
+            );
+        }
+        Ok(())
+    }
 
     fn stream_terminal() -> (Terminal, itty_core::StreamInputReceiver) {
         let (session, receiver) =
@@ -903,12 +1038,10 @@ mod tests {
 
         fn on_mount(&mut self, ctx: &mut dyn Context) -> Result<()> {
             let terminal = self.0.take().expect("terminal mounts once");
-            let terminal = ctx.add_child(terminal)?;
-            ctx.set_layout_of(terminal, Layout::fill())
+            let terminal = ctx.add_child(ctx.node_id(), terminal)?;
+            ctx.set_layout_override(terminal.into(), Layout::fill().into())
         }
     }
-
-    impl canopy::Loader for TerminalHost {}
 
     #[test]
     fn terminal_wheel_input_never_scrolls_an_enclosing_viewport() -> Result<()> {
@@ -951,40 +1084,34 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn renders_terminal_graphemes_with_their_cell_widths() {
-        let base_style = ResolvedStyle::new(Color::White, Color::Black, AttrSet::default());
-        let mut buf = TermBuf::new(geom::Size::new(6, 1), '\0', base_style).expect("buffer");
-        let stylemap = StyleMap::new();
-        let mut styles = StyleManager::new();
-        let run = StyledRunPublic {
-            text: "A⚡e\u{301}B".to_string(),
-            fg: Rgba8 {
-                r: 255,
-                g: 255,
-                b: 255,
-                a: 255,
-            },
-            bg: None,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            bold: false,
-            hyperlink: None,
-            start_col: 0,
-            end_col: 5,
-        };
+    /// Paint one run of mixed-width graphemes.
+    struct GraphemeRun;
 
-        {
-            let mut rndr = Render::new(
-                &stylemap,
-                &mut styles,
-                &mut buf,
-                geom::Rect::new(0, 0, 6, 1),
-                geom::Point::default(),
-            );
+    impl Widget for GraphemeRun {
+        fn layout(&self) -> Layout {
+            Layout::fill()
+        }
+
+        fn render(&mut self, render: &mut Render, _ctx: &dyn ViewContext) -> Result<()> {
+            let run = StyledRunPublic {
+                text: "A⚡e\u{301}B".to_string(),
+                fg: Rgba8 {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                bg: None,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                bold: false,
+                hyperlink: None,
+                start_col: 0,
+                end_col: 5,
+            };
             render_run(
-                &mut rndr,
+                render,
                 geom::Point::default(),
                 0,
                 &run,
@@ -992,10 +1119,23 @@ mod tests {
                 0,
                 Color::Black,
             )
-            .expect("render terminal run");
         }
+    }
 
-        assert_eq!(buf.rows()[0], ["A", "⚡", "", "e\u{301}", "B", " "]);
+    #[test]
+    fn renders_terminal_graphemes_with_their_cell_widths() -> Result<()> {
+        let mut canopy = CanopyBuilder::new().build()?;
+        canopy.with_root_context(|ctx| {
+            ctx.set_layout_override(ctx.node_id(), Layout::fill().into())?;
+            ctx.add_child(ctx.node_id(), GraphemeRun).map(|_| ())
+        })?;
+        let mut harness = Harness::from_canopy(canopy, geom::Size::new(6, 1))?;
+        harness.render()?;
+        assert_eq!(
+            harness.buf().rows()[0],
+            ["A", "⚡", "", "e\u{301}", "B", " "]
+        );
+        Ok(())
     }
 
     /// Exercise the run renderer as a child that inherits its parent's effects.
@@ -1048,10 +1188,10 @@ mod tests {
     }
 
     fn render_effect_run(effects: Vec<Effect>) -> Result<TermBuf> {
-        let mut canopy = canopy::Canopy::new();
+        let mut canopy = CanopyBuilder::new().build()?;
         canopy.with_root_context(|ctx| {
-            ctx.set_layout(Layout::fill())?;
-            let _ = ctx.add_child(EffectRun)?;
+            ctx.set_layout_override(ctx.node_id(), Layout::fill().into())?;
+            let _ = ctx.add_child(ctx.node_id(), EffectRun)?;
             for effect in effects {
                 ctx.push_effect(ctx.node_id(), effect)?;
             }
@@ -1245,7 +1385,7 @@ mod tests {
         use std::{thread, time::Instant};
 
         let mut terminal =
-            Terminal::new(TerminalConfig::new().with_command(["sh", "-c", "exit 0"]));
+            Terminal::new(TerminalConfig::new().with_program(["sh", "-c", "exit 0"]));
         assert!(!terminal.exited(), "an unmounted terminal has no process");
         terminal.mount_session()?;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1253,6 +1393,132 @@ mod tests {
             assert!(Instant::now() < deadline, "the process should exit");
             thread::sleep(Duration::from_millis(20));
         }
+        Ok(())
+    }
+
+    /// Records the terminal that told it its process ended.
+    #[derive(Default)]
+    struct ExitHost {
+        /// Terminals whose exit call ran.
+        exited: Vec<canopy::NodeId>,
+    }
+
+    #[derive_commands]
+    impl ExitHost {
+        /// Record an exit.
+        #[command]
+        fn ended(&mut self, _c: &mut dyn Context, node: canopy::NodeId) {
+            self.exited.push(node);
+        }
+    }
+
+    impl Widget for ExitHost {
+        fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
+            use canopy::{ContextExt, commands::CommandTarget};
+            let owner = CommandTarget::Exact(c.node_id());
+            c.add_child(
+                c.node_id(),
+                Terminal::new(
+                    TerminalConfig::new()
+                        .with_program(["sh", "-c", "exit 0"])
+                        .with_on_exit(Self::spec_ended().call().with_target(owner)),
+                ),
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_exit_call_runs_once_when_the_process_ends() -> Result<()> {
+        use canopy::testing::harness::Harness;
+        let mut harness = Harness::builder(ExitHost::default())
+            .configure(|setup| setup.add_commands::<ExitHost>())
+            .size(20, 5)
+            .build()?;
+        harness.wait_until(Duration::from_secs(10), |harness| {
+            Ok(harness.with_root_widget(|host: &mut ExitHost| !host.exited.is_empty()))
+        })?;
+        harness
+            .wait_until(Duration::from_millis(100), |_| Ok(false))
+            .ok();
+        let exited = harness.with_root_widget(|host: &mut ExitHost| host.exited.clone());
+        let terminal = harness.find_nodes("**/terminal")?;
+        assert_eq!(exited, terminal, "one call, naming the terminal");
+        Ok(())
+    }
+
+    /// Removes each terminal whose exit call reaches it, as a host that reaps
+    /// its terminals does.
+    #[derive(Default)]
+    struct ReapHost {
+        /// The terminal the host mounted.
+        terminal: Option<canopy::NodeId>,
+        /// Terminals whose exit call ran, and whether each was removed.
+        reaped: Vec<(canopy::NodeId, bool)>,
+    }
+
+    #[derive_commands]
+    impl ReapHost {
+        /// Remove the terminal that ended.
+        #[command]
+        fn ended(&mut self, c: &mut dyn Context, node: canopy::NodeId) -> Result<()> {
+            let removed = c.remove_subtree(node).is_ok();
+            self.reaped.push((node, removed));
+            Ok(())
+        }
+    }
+
+    impl Widget for ReapHost {
+        fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
+            use canopy::{ContextExt, commands::CommandTarget};
+            let owner = CommandTarget::Exact(c.node_id());
+            self.terminal = Some(
+                c.add_child(
+                    c.node_id(),
+                    Terminal::new(
+                        TerminalConfig::new()
+                            .with_program(["sh", "-c", "exit 0"])
+                            .with_on_exit(Self::spec_ended().call().with_target(owner)),
+                    ),
+                )?
+                .into(),
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_host_removes_an_ended_terminal_from_its_exit_call() -> Result<()> {
+        use canopy::testing::harness::Harness;
+        let mut harness = Harness::builder(ReapHost::default())
+            .configure(|setup| setup.add_commands::<ReapHost>())
+            .size(20, 5)
+            .build()?;
+        // The shell can exit before a lookup finds the terminal, so the host
+        // names it.
+        let terminal = harness.with_root_widget(|host: &mut ReapHost| host.terminal);
+        harness.wait_until(Duration::from_secs(10), |harness| {
+            Ok(harness.with_root_widget(|host: &mut ReapHost| !host.reaped.is_empty()))
+        })?;
+        // Later turns must not poll the removed terminal.
+        harness
+            .wait_until(Duration::from_millis(200), |_| Ok(false))
+            .ok();
+        let reaped = harness.with_root_widget(|host: &mut ReapHost| host.reaped.clone());
+        assert_eq!(reaped.len(), 1, "one exit call");
+        assert_eq!(Some(reaped[0].0), terminal);
+        assert!(
+            reaped[0].1,
+            "the host removed the terminal from its exit call"
+        );
+        assert!(
+            harness.find_nodes("**/terminal")?.is_empty(),
+            "the terminal is gone"
+        );
+        assert!(
+            harness.canopy.notices().is_empty(),
+            "no failure, then or later"
+        );
         Ok(())
     }
 

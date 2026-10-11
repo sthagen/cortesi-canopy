@@ -11,11 +11,11 @@ use std::{
 };
 
 use canopy::{
-    Canopy, Context, ContextExt, FocusDirection, Loader, NodeName, Render, ViewContext, Widget,
-    derive_commands,
+    Context, ContextExt, NodeName, Register, Setup, ViewContext, Widget, derive_commands,
     error::{Error, Result},
     geom::Size,
     layout::{CanvasContext, Constraint, Layout, MeasureConstraints, Measurement},
+    render::Render,
 };
 use tracing_subscriber::fmt;
 
@@ -126,15 +126,14 @@ impl Widget for Logs {
     }
 
     fn on_mount(&mut self, c: &mut dyn Context) -> Result<()> {
-        c.add_slot::<ListSlot>(List::<Text, u64>::new().with_selection_indicator(
-            "list/selected",
-            "█ ",
-            true,
-        ))?;
+        c.add_slot::<ListSlot>(
+            c.node_id(),
+            List::<Text, u64>::new().with_selection_indicator("list/selected", "█ ", true),
+        )?;
         Ok(())
     }
 
-    fn poll(&mut self, c: &mut dyn Context) -> Option<Duration> {
+    fn poll(&mut self, c: &mut dyn Context) -> Result<Option<Duration>> {
         if self.install == InstallState::Unattempted {
             let format = fmt::format()
                 .with_level(true)
@@ -159,7 +158,7 @@ impl Widget for Logs {
         }
 
         self.flush_buffer(c).ok();
-        Some(Duration::from_millis(100))
+        Ok(Some(Duration::from_millis(100)))
     }
 
     fn accept_focus(&self, _ctx: &dyn ViewContext) -> bool {
@@ -187,7 +186,7 @@ impl Logs {
     where
         F: FnOnce(&mut List<Text, u64>, &mut dyn Context) -> Result<R>,
     {
-        c.with_typed_slot::<ListSlot, _>(f)
+        c.with_slot::<ListSlot, _>(c.node_id(), f)
     }
 
     /// Drain buffered log lines into the list.
@@ -280,30 +279,11 @@ impl Logs {
     pub fn select_by(&self, c: &mut dyn Context, delta: i32) -> Result<()> {
         self.with_list(c, |list, ctx| list.select_by(ctx, delta))
     }
-
-    /// Scroll the view by one line in the specified direction.
-    /// @param dir The direction to scroll.
-    #[command]
-    pub fn scroll(&self, c: &mut dyn Context, dir: FocusDirection) -> Result<()> {
-        self.with_list(c, |list, ctx| {
-            list.scroll(ctx, dir);
-            Ok(())
-        })
-    }
-
-    /// Page through the log view.
-    /// Positive values move down; negative values move up.
-    /// @param delta Signed page delta. Positive moves down and negative moves
-    /// up.
-    #[command]
-    pub fn page(&self, c: &mut dyn Context, delta: i32) -> Result<()> {
-        self.with_list(c, |list, ctx| list.page(ctx, delta))
-    }
 }
 
-impl Loader for Logs {
-    fn load(c: &mut Canopy) -> Result<()> {
-        c.add_commands::<Self>()?;
+impl Register for Logs {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()?;
         Ok(())
     }
 }
@@ -363,8 +343,11 @@ mod tests {
             install: InstallState::Active,
             ..Logs::new()
         };
-        let mut harness = Harness::builder(logs).size(80, 4).build()?;
-        harness.with_root_context(|logs: &mut Logs, ctx| {
+        let mut harness = Harness::builder(logs)
+            .register::<Logs>()
+            .size(80, 4)
+            .build()?;
+        harness.with_root_widget_context(|logs: &mut Logs, ctx| {
             let mut writer = LogWriter {
                 buf: logs.buf.clone(),
             };
@@ -396,7 +379,7 @@ mod tests {
         })?;
         harness.render()?;
         assert!(harness.tbuf().contains_text("entry 15"));
-        harness.with_root_context(|logs: &mut Logs, ctx| logs.select_last(ctx))?;
+        harness.with_root_widget_context(|logs: &mut Logs, ctx| logs.select_last(ctx))?;
         harness.render()?;
         assert!(harness.tbuf().contains_text("entry 1014"));
         Ok(())
@@ -404,9 +387,15 @@ mod tests {
 
     #[test]
     fn failed_log_updates_keep_pending_entries_for_retry() -> Result<()> {
-        let mut harness = Harness::builder(Logs::new()).size(80, 4).build()?;
-        harness.with_root_context(|logs: &mut Logs, ctx| {
-            let list = ctx.get_slot::<ListSlot>()?.expect("list mounted");
+        let mut harness = Harness::builder(Logs {
+            install: InstallState::Active,
+            ..Logs::new()
+        })
+        .register::<Logs>()
+        .size(80, 4)
+        .build()?;
+        harness.with_root_widget_context(|logs: &mut Logs, ctx| {
+            let list = ctx.get_slot::<ListSlot>(ctx.node_id())?;
             ctx.remove_subtree(list.into())?;
             LogWriter {
                 buf: logs.buf.clone(),
@@ -419,7 +408,7 @@ mod tests {
                 logs.buf.lock().unwrap().front().map(String::as_str),
                 Some("keep this entry")
             );
-            ctx.add_slot::<ListSlot>(List::new())?;
+            ctx.add_slot::<ListSlot>(ctx.node_id(), List::new())?;
             logs.flush_buffer(ctx)?;
             assert_eq!(logs.next_key, 1);
             assert!(logs.buf.lock().unwrap().is_empty());
@@ -445,8 +434,14 @@ mod tests {
 
     #[test]
     fn a_long_log_line_wraps_to_the_wrap_width() -> Result<()> {
-        let mut harness = Harness::builder(Logs::new()).size(80, 4).build()?;
-        harness.with_root_context(|logs: &mut Logs, ctx| {
+        let mut harness = Harness::builder(Logs {
+            install: InstallState::Active,
+            ..Logs::new()
+        })
+        .register::<Logs>()
+        .size(80, 4)
+        .build()?;
+        harness.with_root_widget_context(|logs: &mut Logs, ctx| {
             logs.buf.lock().unwrap().push_back("a".repeat(80));
             logs.flush_buffer(ctx)
         })?;

@@ -1,16 +1,17 @@
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
-use super::*;
+use super::{focus::FocusRecoveryHint, *};
 use crate::{
     core::{
         context::CoreContext,
         node::Node,
         view::View,
-        wake::WorkStamp,
-        widget_access::{WidgetSlotPolicy, validate_slot},
+        wake::PollOwner,
+        widget_access::{WidgetCellPolicy, validate_slot},
     },
-    layout::{Layout, LayoutOverride},
+    layout::LayoutOverride,
     path::Path,
+    runtime::PollLifetime,
     widget::Widget,
 };
 
@@ -24,14 +25,13 @@ impl TreeStateSnapshot {
             removal_checkpoint: core.completion.requests.len(),
             nodes: core.nodes.clone(),
             semantic_keys: core.semantic_keys.clone(),
-            interaction: core.interaction.clone(),
+            modals: core.modals.clone(),
             root: core.root,
             focus: core.focus,
             exit_requested: core.exit_requested,
             pending_style: core.pending_style.clone(),
             mouse_capture: core.mouse_capture,
-            focus_hint: core.focus_hint,
-            pending_diagnostic_dump: core.pending_diagnostic_dump,
+            deferred_focus_repair: core.deferred_focus_repair,
         }
     }
 
@@ -40,15 +40,14 @@ impl TreeStateSnapshot {
         core.completion.requests.truncate(self.removal_checkpoint);
         core.nodes = self.nodes;
         core.semantic_keys = self.semantic_keys;
-        core.interaction = self.interaction;
+        core.modals = self.modals;
         core.sync_modal_bindings();
         core.root = self.root;
         core.focus = self.focus;
         core.exit_requested = self.exit_requested;
         core.pending_style = self.pending_style;
         core.mouse_capture = self.mouse_capture;
-        core.focus_hint = self.focus_hint;
-        core.pending_diagnostic_dump = self.pending_diagnostic_dump;
+        core.deferred_focus_repair = self.deferred_focus_repair;
     }
 }
 
@@ -64,7 +63,7 @@ impl TreeEditJournal {
 }
 
 impl MountedWidget {
-    /// Return the stable identity of this widget slot.
+    /// Return the stable identity of this widget cell.
     fn identity(&self) -> usize {
         Rc::as_ptr(&self.widget) as usize
     }
@@ -80,23 +79,23 @@ impl Core {
         generation
     }
 
-    /// Update provisional attachment identities after topology changes.
-    fn refresh_attachment_generations(&mut self) {
-        let nodes: Vec<_> = self.nodes.keys().collect();
-        for id in nodes {
-            let attached = self.is_attached_to_root(id);
-            let generation = self.nodes[id].attachment_generation;
-            if attached && generation.is_none() {
-                let generation = self.next_generation();
-                self.nodes[id].attachment_generation = Some(generation);
-                if self.nodes[id].poll_lifetime == crate::WorkLifetime::Attachment {
-                    self.nodes[id].initialized = false;
-                }
-            } else if !attached && generation.is_some() {
-                self.nodes[id].attachment_generation = None;
-                if self.nodes[id].poll_lifetime == crate::WorkLifetime::Attachment {
-                    self.nodes[id].initialized = false;
-                }
+    /// Update provisional attachment identities in the subtree at `root`
+    /// after it moved.
+    ///
+    /// Every node in a subtree shares its root's attachment, so an edit
+    /// refreshes only the subtree it moved. A node that joins the tree gets a
+    /// new generation, and one that leaves loses its generation.
+    fn refresh_attachment_generations(&mut self, root: NodeId) {
+        let attached = self.is_attached_to_root(root);
+        for id in self.subtree_pre_order(root) {
+            if self.nodes[id].attachment_generation.is_some() == attached {
+                continue;
+            }
+            let generation = attached.then(|| self.next_generation());
+            let node = &mut self.nodes[id];
+            node.attachment_generation = generation;
+            if node.poll_lifetime == PollLifetime::Attachment {
+                node.initialized = false;
             }
         }
     }
@@ -104,35 +103,15 @@ impl Core {
     /// Commit live work identities and expire provisional or retired handles.
     fn sync_work_stamps(&self) -> Result<()> {
         self.wake_registry
-            .sync(self.nodes.iter().map(|(node, entry)| WorkStamp {
+            .sync(self.nodes.iter().map(|(node, entry)| PollOwner {
                 node,
                 incarnation: entry.incarnation,
                 attachment: entry.attachment_generation,
             }))
     }
 
-    /// Update the layout for a node.
-    pub fn with_layout_of(
-        &mut self,
-        node: impl Into<NodeId>,
-        f: impl FnOnce(&mut Layout),
-    ) -> Result<()> {
-        let node = node.into();
-        let current = self.nodes.get(node).ok_or(Error::NodeNotFound(node))?;
-        let before = current.layout;
-        let mut layout = before;
-        f(&mut layout);
-        let mut overrides = current.layout_override;
-        overrides.record_changes(before, layout);
-        self.set_layout_override_of(node, overrides)
-    }
-
     /// Replace all persistent parent constraints for a node.
-    pub fn set_layout_override_of(
-        &mut self,
-        node: NodeId,
-        overrides: LayoutOverride,
-    ) -> Result<()> {
+    pub fn set_layout_override(&mut self, node: NodeId, overrides: LayoutOverride) -> Result<()> {
         let current = self.nodes.get_mut(node).ok_or(Error::NodeNotFound(node))?;
         let layout = overrides.apply(current.base_layout)?;
         if current.layout_override != overrides || current.layout != layout {
@@ -146,13 +125,13 @@ impl Core {
     /// Restore the widget's base layout.
     #[cfg(test)]
     pub fn clear_layout_override_of(&mut self, node: NodeId) -> Result<()> {
-        self.set_layout_override_of(node, LayoutOverride::default())
+        self.set_layout_override(node, LayoutOverride::default())
     }
 
     /// Override every field of a node's layout.
     #[cfg(test)]
     pub fn set_layout_of(&mut self, node: impl Into<NodeId>, layout: Layout) -> Result<()> {
-        self.set_layout_override_of(node.into(), LayoutOverride::full(layout))
+        self.set_layout_override(node.into(), LayoutOverride::from(layout))
     }
 
     /// Replace a widget and remove all descendant nodes.
@@ -177,31 +156,10 @@ impl Core {
         let widget_type = widget.as_ref().type_id();
         let poll_lifetime = widget.poll_lifetime();
 
-        let plan = self.plan_subtree_removal(node_id, "replace subtree")?;
-        let removed_focus_root = self.removed_focus_root(&plan);
-        let focus_hint = removed_focus_root.map(|root| self.focus_recovery_hint(root));
-        self.run_removal_hooks(&plan)?;
-
-        for removed_node in plan.post_order.iter().copied() {
-            if removed_node != plan.root {
-                self.clear_semantic_key(removed_node)?;
-                self.nodes.remove(removed_node);
-            }
-        }
-        let node = self
-            .nodes
-            .get_mut(node_id)
-            .ok_or(Error::NodeNotFound(node_id))?;
-        node.children.clear();
-        node.child_keys.clear();
-        self.clear_removed_targets(&plan.pre_order[1..]);
-
-        self.clear_semantic_key(node_id)?;
+        let lost = self.delete_subtree(node_id, "replace subtree", true)?;
+        self.clear_identity(node_id)?;
         let incarnation = self.next_generation();
-        let node = self
-            .nodes
-            .get_mut(node_id)
-            .ok_or(Error::NodeNotFound(node_id))?;
+        let node = &mut self.nodes[node_id];
         node.incarnation = incarnation;
         node.reveal = None;
         node.reveal_in_ancestors = None;
@@ -217,13 +175,11 @@ impl Core {
         node.mounted = false;
         node.initialized = false;
 
-        self.refresh_attachment_generations();
+        self.refresh_attachment_generations(node_id);
         if self.is_attached_to_root(node_id) {
             self.mount_node(node_id)?;
         }
-        self.focus_hint = focus_hint;
-        self.ensure_invariants(removed_focus_root)?;
-        Ok(())
+        self.repair_focus_and_capture(lost)
     }
 
     /// Run the mount hook for a node if it has not been mounted yet.
@@ -298,9 +254,8 @@ impl Core {
         match result {
             Ok(value) => {
                 self.prune_semantic_keys();
-                self.refresh_attachment_generations();
                 self.sync_work_stamps()?;
-                self.retire_invalid_interactions()?;
+                self.retire_invalid_modals()?;
                 Ok(value)
             }
             Err(err) => {
@@ -350,7 +305,7 @@ impl Core {
             return Ok(());
         }
         let widget = Rc::clone(&node.widget);
-        self.with_widget_ctx(node_id, |widget, ctx| widget.on_unmount(ctx))?;
+        self.sealed(|core| core.with_widget_ctx(node_id, |widget, ctx| widget.on_unmount(ctx)))?;
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.mounted = false;
         }
@@ -380,11 +335,11 @@ impl Core {
 
     /// Validate structural and cached state invariants for the core arena.
     pub fn validate_invariants(&self) -> Result<()> {
-        self.validate_invariants_with(WidgetSlotPolicy::RequirePresent)
+        self.validate_invariants_with(WidgetCellPolicy::RequirePresent)
     }
 
-    /// Validate core invariants using a caller-specific widget slot policy.
-    fn validate_invariants_with(&self, widget_slot_policy: WidgetSlotPolicy) -> Result<()> {
+    /// Validate core invariants using a caller-specific widget cell policy.
+    fn validate_invariants_with(&self, widget_slot_policy: WidgetCellPolicy) -> Result<()> {
         self.validate_root()?;
         for (node_id, node) in self.nodes.iter() {
             validate_slot(node_id, node, widget_slot_policy)?;
@@ -394,7 +349,6 @@ impl Core {
             self.validate_cached_state(node_id, node)?;
         }
         self.validate_focus_and_capture()?;
-        self.validate_pending_targets()?;
         self.validate_semantic_keys()?;
         Ok(())
     }
@@ -402,7 +356,7 @@ impl Core {
     /// Assert structural invariants on the node tree in debug builds.
     #[cfg(debug_assertions)]
     pub(crate) fn debug_assert_tree_invariants(&self) {
-        if let Err(error) = self.validate_invariants_with(WidgetSlotPolicy::AllowBorrowed) {
+        if let Err(error) = self.validate_invariants_with(WidgetCellPolicy::AllowBorrowed) {
             debug_assert!(false, "{error}");
         }
     }
@@ -447,7 +401,7 @@ impl Core {
             }
         }
 
-        for (key, child) in &node.child_keys {
+        for (key, child) in &node.slots {
             if !node.children.contains(child) {
                 return Err(invariant_violation(format!(
                     "child key {key:?} points to non-child {child:?} under {node_id:?}"
@@ -526,23 +480,18 @@ impl Core {
         Ok(())
     }
 
-    /// Validate pending target references stored by auxiliary runtime features.
-    fn validate_pending_targets(&self) -> Result<()> {
-        if let Some(target) = self.pending_diagnostic_dump
-            && !self.nodes.contains_key(target)
-        {
-            return Err(invariant_violation(format!(
-                "pending diagnostic dump points at missing node {target:?}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Validate lifecycle flags that are independent of widget behavior.
+    /// Validate lifecycle flags and attachment generations, which are
+    /// independent of widget behavior.
     fn validate_lifecycle_state(&self, node_id: NodeId, node: &Node) -> Result<()> {
-        if node.initialized && !node.mounted && self.is_attached_to_root(node_id) {
+        let attached = self.is_attached_to_root(node_id);
+        if node.initialized && !node.mounted && attached {
             return Err(invariant_violation(format!(
                 "attached node {node_id:?} is initialized before it is mounted"
+            )));
+        }
+        if node.attachment_generation.is_some() != attached {
+            return Err(invariant_violation(format!(
+                "node {node_id:?} attachment generation disagrees with its attachment"
             )));
         }
         Ok(())
@@ -617,6 +566,7 @@ impl Core {
     }
 
     /// Create a node in the arena detached from the tree.
+    #[cfg(test)]
     pub fn create_detached<W>(&mut self, widget: W) -> Result<NodeId>
     where
         W: Widget + 'static,
@@ -644,6 +594,7 @@ impl Core {
 
     /// Add a boxed widget as a child of a specific parent and return the new
     /// node ID.
+    #[cfg(test)]
     pub fn add_child_to_boxed(
         &mut self,
         parent: impl Into<NodeId>,
@@ -659,6 +610,7 @@ impl Core {
 
     /// Add a boxed widget as a keyed child of a specific parent and return the
     /// new node ID.
+    #[cfg(test)]
     pub fn add_child_to_slot_boxed(
         &mut self,
         parent: impl Into<NodeId>,
@@ -668,7 +620,7 @@ impl Core {
         let parent = parent.into();
         self.with_tree_edit("add keyed child", |core| {
             if core.child_slot(parent, key).is_some() {
-                return Err(Error::DuplicateChildKey(key.to_string()));
+                return Err(Error::DuplicateSlot(key.to_string()));
             }
             let child = core.create_detached_boxed(widget)?;
             core.attach_inner(parent, child, Some(key))?;
@@ -680,7 +632,7 @@ impl Core {
     pub fn child_slot(&self, parent: impl Into<NodeId>, key: &str) -> Option<NodeId> {
         self.nodes
             .get(parent.into())
-            .and_then(|node| node.child_keys.get(key).copied())
+            .and_then(|node| node.slots.get(key).copied())
     }
 
     /// Attach a detached child under a parent.
@@ -710,32 +662,7 @@ impl Core {
         if self.is_attached_to_root(parent) {
             self.mount_subtree_pre_order(child)?;
         }
-        self.ensure_invariants(None)?;
-        Ok(())
-    }
-
-    /// Attach all configured topology and identities before invoking mount
-    /// hooks.
-    pub(crate) fn attach_composed(
-        &mut self,
-        parent: NodeId,
-        roots: &[(NodeId, Option<&str>)],
-        keys: &[(NodeId, NodeId, String)],
-    ) -> Result<()> {
-        self.with_tree_edit("attach composition", |core| {
-            for (node, key) in roots {
-                core.attach_topology(parent, *node, *key)?;
-            }
-            for (node, scope, key) in keys {
-                core.set_semantic_key(*node, *scope, key)?;
-            }
-            if core.is_attached_to_root(parent) {
-                for (node, _) in roots {
-                    core.mount_subtree_pre_order(*node)?;
-                }
-            }
-            core.ensure_invariants(None)
-        })
+        self.repair_focus_and_capture(None)
     }
 
     /// Update validated topology without running mount callbacks yet.
@@ -743,77 +670,82 @@ impl Core {
         if !self.nodes.contains_key(parent) {
             return Err(Error::NodeNotFound(parent));
         }
+        if self
+            .nodes
+            .get(child)
+            .is_some_and(|node| node.parent.is_some())
+        {
+            return Err(Error::AlreadyAttached(child));
+        }
+        if let Some(key) = key
+            && self.nodes[parent].slots.contains_key(key)
+        {
+            return Err(Error::DuplicateSlot(key.to_string()));
+        }
+        self.validate_attach(parent, child, "attach")?;
+
+        let node = &mut self.nodes[parent];
+        if let Some(key) = key {
+            node.slots.insert(key.to_string(), child);
+        }
+        node.children.push(child);
+        self.nodes[child].parent = Some(parent);
+        self.refresh_attachment_generations(child);
+        Ok(())
+    }
+
+    /// Check that `child` can move under `parent`: it exists, it is not the
+    /// root, and the move makes no cycle. Under an attached parent, the
+    /// child's unmounted widgets must be available to mount.
+    fn validate_attach(
+        &self,
+        parent: NodeId,
+        child: NodeId,
+        operation: &'static str,
+    ) -> Result<()> {
         if !self.nodes.contains_key(child) {
             return Err(Error::NodeNotFound(child));
         }
-        let child_parent = self.nodes.get(child).and_then(|node| node.parent);
-        if child_parent.is_some() {
-            return Err(Error::AlreadyAttached(child));
-        }
         if child == self.root {
-            return Err(Error::InvalidOperation(
-                "cannot attach root as a child".into(),
-            ));
+            return Err(Error::Invalid("cannot attach root as a child".into()));
         }
         if self.is_ancestor_or_self(child, parent) {
             return Err(Error::WouldCreateCycle { parent, child });
         }
-        if let Some(key) = key
-            && self
-                .nodes
-                .get(parent)
-                .is_some_and(|node| node.child_keys.contains_key(key))
-        {
-            return Err(Error::DuplicateChildKey(key.to_string()));
+        if self.is_attached_to_root(parent) {
+            self.ensure_unmounted_widget_slots_available(child, operation)?;
         }
-
-        let parent_attached = self.is_attached_to_root(parent);
-        if parent_attached {
-            self.ensure_unmounted_widget_slots_available(child, "attach")?;
-        }
-
-        if let Some(key) = key
-            && let Some(node) = self.nodes.get_mut(parent)
-        {
-            node.child_keys.insert(key.to_string(), child);
-        }
-
-        if let Some(node) = self.nodes.get_mut(child) {
-            node.parent = Some(parent);
-        }
-        if let Some(node) = self.nodes.get_mut(parent) {
-            node.children.push(child);
-        }
-
-        self.refresh_attachment_generations();
         Ok(())
+    }
+
+    /// Take `child` out of its parent's children and slots, and clear its
+    /// parent link.
+    fn unlink(&mut self, child: NodeId) {
+        let Some(parent) = self
+            .nodes
+            .get_mut(child)
+            .and_then(|node| node.parent.take())
+        else {
+            return;
+        };
+        if let Some(node) = self.nodes.get_mut(parent) {
+            node.children.retain(|id| *id != child);
+            node.slots.retain(|_, id| *id != child);
+        }
     }
 
     /// Detach a child from its parent if attached.
     pub fn detach(&mut self, child: impl Into<NodeId>) -> Result<()> {
         let child = child.into();
         self.with_tree_edit("detach", |core| {
-            if !core.nodes.contains_key(child) {
-                return Err(Error::NodeNotFound(child));
-            }
-            let parent = core.nodes.get(child).and_then(|node| node.parent);
-            let hint = parent
-                .filter(|_| core.is_attached_to_root(child))
-                .map(|_| core.focus_recovery_hint(child));
-            let Some(parent) = parent else {
+            let node = core.nodes.get(child).ok_or(Error::NodeNotFound(child))?;
+            if node.parent.is_none() {
                 return Ok(());
-            };
-            if let Some(node) = core.nodes.get_mut(parent) {
-                node.children.retain(|id| *id != child);
-                node.child_keys.retain(|_, id| *id != child);
             }
-            if let Some(node) = core.nodes.get_mut(child) {
-                node.parent = None;
-            }
-            core.refresh_attachment_generations();
-            core.focus_hint = hint;
-            core.ensure_invariants(Some(child))?;
-            Ok(())
+            let lost = core.focus_loss(child);
+            core.unlink(child);
+            core.refresh_attachment_generations(child);
+            core.repair_focus_and_capture(lost)
         })
     }
 
@@ -838,16 +770,12 @@ impl Core {
         Ok(())
     }
 
-    /// Retain only keyed mappings that still point to direct children.
-    fn retain_child_keys(&mut self, parent: NodeId) {
-        let Some(node) = self.nodes.get_mut(parent) else {
-            return;
-        };
-        let keep: HashSet<NodeId> = node.children.iter().copied().collect();
-        node.child_keys.retain(|_, id| keep.contains(id));
-    }
-
     /// Replace the children list for a parent in the arena tree.
+    ///
+    /// The list reorders the current children and may add new ones, including
+    /// nodes taken from another parent. It must keep every current child: a
+    /// caller that wants a child out detaches or removes it first, so no
+    /// child is left detached in the arena by omission.
     pub fn set_children(&mut self, parent: impl Into<NodeId>, children: Vec<NodeId>) -> Result<()> {
         let parent = parent.into();
         self.with_tree_edit("set children", move |core| {
@@ -870,72 +798,46 @@ impl Core {
                 });
             }
         }
+        if let Some(omitted) = self.nodes[parent]
+            .children
+            .iter()
+            .find(|child| !seen.contains(*child))
+        {
+            return Err(Error::Invalid(format!(
+                "set children omits child {omitted:?} of {parent:?}; detach or remove it first"
+            )));
+        }
 
         for child in &children {
-            if self.is_ancestor_or_self(*child, parent) {
-                return Err(Error::WouldCreateCycle {
-                    parent,
-                    child: *child,
-                });
-            }
-            if !self.nodes.contains_key(*child) {
-                return Err(Error::NodeNotFound(*child));
-            }
-            if *child == self.root {
-                return Err(Error::InvalidOperation(
-                    "cannot attach root as a child".into(),
-                ));
-            }
+            self.validate_attach(parent, *child, "set children")?;
         }
 
         let parent_attached = self.is_attached_to_root(parent);
+        let moved: Vec<NodeId> = children
+            .iter()
+            .copied()
+            .filter(|child| self.nodes[*child].parent != Some(parent))
+            .collect();
+        // A focused child that moves under a detached parent leaves the tree.
+        let lost = if parent_attached {
+            None
+        } else {
+            moved.iter().find_map(|child| self.focus_loss(*child))
+        };
+        for child in &moved {
+            self.unlink(*child);
+            self.nodes[*child].parent = Some(parent);
+        }
+        self.nodes[parent].children = children.clone();
+        for child in &moved {
+            self.refresh_attachment_generations(*child);
+        }
         if parent_attached {
-            for child in &children {
-                self.ensure_unmounted_widget_slots_available(*child, "set children")?;
-            }
-        }
-
-        for child in &children {
-            let old_parent = self.nodes.get(*child).and_then(|n| n.parent);
-            if let Some(old_parent) = old_parent
-                && old_parent != parent
-            {
-                if let Some(node) = self.nodes.get_mut(old_parent) {
-                    node.children.retain(|id| *id != *child);
-                    node.child_keys.retain(|_, id| *id != *child);
-                }
-                if let Some(node) = self.nodes.get_mut(*child) {
-                    node.parent = None;
-                }
-            }
-        }
-
-        let old_children = self.nodes[parent].children.clone();
-        for child in old_children {
-            if let Some(node) = self.nodes.get_mut(child) {
-                node.parent = None;
-            }
-        }
-
-        for child in &children {
-            if let Some(node) = self.nodes.get_mut(*child) {
-                node.parent = Some(parent);
-            }
-        }
-
-        self.nodes[parent].children = children;
-        self.retain_child_keys(parent);
-
-        let new_children = self.nodes[parent].children.clone();
-        self.refresh_attachment_generations();
-        if parent_attached {
-            for child in new_children {
+            for child in children {
                 self.mount_subtree_pre_order(child)?;
             }
         }
-
-        self.ensure_invariants(None)?;
-        Ok(())
+        self.repair_focus_and_capture(lost)
     }
 
     /// Remove a node and all descendants from the arena.
@@ -947,45 +849,71 @@ impl Core {
     /// Remove a subtree inside an active tree edit.
     fn remove_subtree_inner(&mut self, root_id: NodeId) -> Result<()> {
         if root_id == self.root {
-            return Err(Error::InvalidOperation("cannot remove root".into()));
+            return Err(Error::Invalid("cannot remove root".into()));
         }
         if !self.nodes.contains_key(root_id) {
             return Err(Error::NodeNotFound(root_id));
         }
-        let hint = if self.is_attached_to_root(root_id) {
-            Some(self.focus_recovery_hint(root_id))
+        let lost = self.delete_subtree(root_id, "remove subtree", false)?;
+        self.repair_focus_and_capture(lost)
+    }
+
+    /// Run removal hooks for the subtree at `root`, then delete its nodes.
+    ///
+    /// Removal and replacement share this. With `keep_root`, the root node
+    /// stays in place without children, ready for a replacement widget.
+    /// Returns the focus recovery candidates when the deleted nodes held
+    /// focus.
+    fn delete_subtree(
+        &mut self,
+        root: NodeId,
+        operation: &'static str,
+        keep_root: bool,
+    ) -> Result<Option<FocusRecoveryHint>> {
+        let plan = self.plan_subtree_removal(root, operation)?;
+        // Focus is lost from the topmost deleted node on its path. A replaced
+        // root survives, so that is its child on the path.
+        let lost_root = if keep_root {
+            self.focus.and_then(|focus| {
+                self.nodes[root]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|child| self.is_ancestor_or_self(*child, focus))
+            })
         } else {
-            None
+            Some(root)
         };
-        let plan = self.plan_subtree_removal(root_id, "remove subtree")?;
+        let lost = lost_root.and_then(|node| self.focus_loss(node));
         self.run_removal_hooks(&plan)?;
 
-        let parent = self.nodes.get(root_id).and_then(|node| node.parent);
-        if let Some(parent) = parent
-            && let Some(node) = self.nodes.get_mut(parent)
-        {
-            node.children.retain(|id| *id != root_id);
-            node.child_keys.retain(|_, id| *id != root_id);
+        if keep_root {
+            let node = &mut self.nodes[root];
+            node.children.clear();
+            node.slots.clear();
+        } else {
+            self.unlink(root);
         }
-
-        for node_id in &plan.post_order {
-            self.clear_semantic_key(*node_id)?;
-            self.nodes.remove(*node_id);
+        for node_id in plan.post_order {
+            if !keep_root || node_id != root {
+                self.clear_identity(node_id)?;
+                self.nodes.remove(node_id);
+            }
         }
-
-        self.clear_removed_targets(&plan.pre_order);
-        self.focus_hint = hint;
-        self.ensure_invariants(Some(root_id))?;
-        Ok(())
+        Ok(lost)
     }
 
     /// Build a stable plan for removing a complete subtree.
+    ///
+    /// A node whose widget runs a callback fails the plan with an error that
+    /// names the ways out.
     fn plan_subtree_removal(&self, root: NodeId, operation: &'static str) -> Result<RemovalPlan> {
         let pre_order = self
             .subtree_pre_order(root)
             .into_iter()
             .map(|node_id| {
-                self.ensure_widget_slot_available(node_id, operation)?;
+                self.ensure_widget_slot_available(node_id, operation)
+                    .map_err(name_running_widget)?;
                 let node = self
                     .nodes
                     .get(node_id)
@@ -1015,7 +943,9 @@ impl Core {
     /// Run fallible removal hooks in deterministic pre-order.
     fn run_pre_remove_plan(&mut self, plan: &RemovalPlan) -> Result<()> {
         for entry in &plan.pre_order {
-            self.with_widget_ctx(entry.node_id, |widget, ctx| widget.pre_remove(ctx))??;
+            self.sealed(|core| {
+                core.with_widget_ctx(entry.node_id, |widget, ctx| widget.pre_remove(ctx))
+            })??;
         }
         Ok(())
     }
@@ -1036,7 +966,7 @@ impl Core {
             .iter()
             .eq(plan.pre_order.iter().map(|entry| &entry.node_id))
         {
-            return Err(Error::InvalidOperation(
+            return Err(Error::Invalid(
                 "removal target changed during lifecycle hooks".into(),
             ));
         }
@@ -1046,32 +976,12 @@ impl Core {
                 .get(entry.node_id)
                 .ok_or(Error::NodeNotFound(entry.node_id))?;
             if !Rc::ptr_eq(&node.widget, &entry.widget) {
-                return Err(Error::InvalidOperation(
+                return Err(Error::Invalid(
                     "removal widget changed during lifecycle hooks".into(),
                 ));
             }
         }
         Ok(())
-    }
-
-    /// Find the direct child whose removal invalidates focus, if any.
-    fn removed_focus_root(&self, plan: &RemovalPlan) -> Option<NodeId> {
-        let focus = self.focus?;
-        self.nodes[plan.root]
-            .children
-            .iter()
-            .copied()
-            .find(|child| self.is_ancestor_or_self(*child, focus))
-    }
-
-    /// Clear auxiliary targets that point into a removed set.
-    fn clear_removed_targets(&mut self, removed: &[RemovalEntry]) {
-        if self
-            .pending_diagnostic_dump
-            .is_some_and(|target| removed.iter().any(|entry| entry.node_id == target))
-        {
-            self.pending_diagnostic_dump = None;
-        }
     }
 
     /// Collect a subtree in pre-order, including the root.
@@ -1105,7 +1015,7 @@ impl Core {
         Ok(())
     }
 
-    /// Ensure one widget slot is present and not held by a callback.
+    /// Ensure one widget cell is present and not held by a callback.
     fn ensure_widget_slot_available(&self, node_id: NodeId, operation: &'static str) -> Result<()> {
         self.with_widget(
             node_id,
@@ -1149,7 +1059,7 @@ impl Core {
         node.hidden = hidden;
         if changed {
             self.invalidate(crate::Invalidation::Layout);
-            self.ensure_invariants(None)?;
+            self.repair_focus_and_capture(None)?;
             Ok(ChangeOutcome::Changed)
         } else {
             Ok(ChangeOutcome::Unchanged)
@@ -1183,10 +1093,33 @@ impl Core {
 
 /// Build an invariant violation error.
 fn invariant_violation(message: impl Into<String>) -> Error {
-    Error::Invariant(message.into())
+    Error::Internal(message.into())
 }
 
 /// Return true when a view contains computed cache data.
 fn view_has_cached_state(view: View) -> bool {
     view != View::default()
+}
+
+/// Name the remedies when a removal meets a widget whose callback runs.
+///
+/// Access to a node fails this way when its cell is out for a callback. The
+/// error keeps its operation, node, and path.
+fn name_running_widget(error: Error) -> Error {
+    match error {
+        Error::NodeOperation {
+            kind,
+            operation,
+            node,
+            path,
+            source,
+        } if matches!(*source, Error::ReentrantWidgetBorrow(_)) => Error::NodeOperation {
+            kind,
+            operation,
+            node,
+            path,
+            source: Box::new(Error::WidgetRunning(node)),
+        },
+        error => error,
+    }
 }

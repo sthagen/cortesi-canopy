@@ -6,31 +6,20 @@
 //! command, a [`CanopyBuilder`] pipeline, an optional trusted user
 //! configuration directory, and a factory that every launch mode shares.
 
-use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
-    path::{Path, PathBuf},
-};
-
 use canopy::{
-    Canopy, CanopyBuilder, Context, Loader, NodeName, Render, ScriptTrust, ViewContext, Widget,
+    Canopy, CanopyBuilder, Context, ContextExt, NodeName, Register, Setup, ViewContext, Widget,
     derive_commands,
     error::Result,
-    layout::Layout,
-    style::{StyleBuilder, canopy as palette},
+    layout::{Align, Direction, Layout},
+    render::Render,
+    style::{StyleRules, themes::Palette},
 };
-use canopy_widgets::Root;
+use canopy_mcp::{ConfigHome, UserConfig};
+use canopy_widgets::{KeyHint, Root, StatusBar, Text};
 
-/// Default keymap copied to a user's configuration directory on first use.
-pub const DEFAULT_BINDINGS: &str = include_str!("default_bindings.luau");
-
-/// Startup module that loads the editable user keymap.
-pub const DEFAULT_INIT: &str = r#"local bindings = require("./bindings")
-
-function setup()
-    bindings.setup()
-end
-"#;
+/// Default configuration: the startup script that runs when the user has no
+/// `init.luau`, and the file a first run writes for them to edit.
+pub const DEFAULT_CONFIG: &str = include_str!("default_config.luau");
 
 /// A greeting and a counter driven by one command.
 pub struct Hello {
@@ -55,7 +44,10 @@ impl Hello {
 
 impl Widget for Hello {
     fn layout(&self) -> Layout {
+        // The footer bar keeps the last row, so align the greeting above it.
         Layout::fill()
+            .direction(Direction::Column)
+            .align_vertical(Align::End)
     }
 
     fn render(&mut self, render: &mut Render, context: &dyn ViewContext) -> Result<()> {
@@ -70,17 +62,16 @@ impl Widget for Hello {
         if area.h > 1 {
             render.text("count", area.line(1)?, &format!("count: {}", self.count))?;
         }
-        if area.h > 2 {
-            render.text(
-                "status",
-                area.line(area.h - 1)?,
-                " +/- count  ? help  q quit ",
-            )?;
-        }
         Ok(())
     }
 
     fn on_mount(&mut self, context: &mut dyn Context) -> Result<()> {
+        context.add_child(
+            context.node_id(),
+            StatusBar::new()
+                .with_left(Text::new("hello"))
+                .with_right(KeyHint::for_command(Root::call_toggle_help(), "help")),
+        )?;
         context.set_focus(context.node_id()).map(|_| ())
     }
 
@@ -93,97 +84,40 @@ impl Widget for Hello {
     }
 }
 
-impl Loader for Hello {
-    fn load(canopy: &mut Canopy) -> Result<()> {
-        canopy.add_commands::<Self>()
+impl Register for Hello {
+    fn register(setup: &mut Setup) -> Result<()> {
+        setup.add_commands::<Self>()
     }
 }
 
 /// Create the full Canopy application.
 ///
-/// Pass `Some(root)` to mount a trusted user configuration directory, and
-/// `None` to fall back to the compiled-in defaults. Headless and API launch
-/// modes must always pass `None` so they never read or create user state.
-pub fn create_app(user_script_root: Option<PathBuf>) -> Result<Canopy> {
-    let mut builder = CanopyBuilder::new()
-        .configure(|canopy| {
-            Root::load(canopy)?;
-            Hello::load(canopy)?;
-            install_styles(canopy);
+/// A `home` holding `init.luau` is mounted as the trusted user configuration;
+/// otherwise the application runs [`DEFAULT_CONFIG`]. Headless and API launch
+/// modes pass `None` so they never read user state.
+pub fn create_app(home: Option<&ConfigHome>) -> Result<Canopy> {
+    CanopyBuilder::new()
+        .configure(|setup| {
+            Root::register(setup)?;
+            Hello::register(setup)?;
+            setup.widget_styles(install_styles);
             Ok(())
         })
         .assemble(|canopy| {
             Root::new().install(canopy, Hello::new())?;
             Ok(())
-        });
-
-    if let Some(root) = user_script_root {
-        builder = builder.user_script_root(root, ScriptTrust::TrustedLocal);
-    } else {
-        builder = builder.bindings("hello-defaults", DEFAULT_BINDINGS);
-    }
-    builder.build()
-}
-
-/// Create the default user config without replacing existing files.
-///
-/// A first run writes `init.luau` and `bindings.luau`. Every later run leaves
-/// whatever the user has since edited in place.
-pub fn ensure_user_config(root: &Path) -> io::Result<()> {
-    fs::create_dir_all(root)?;
-    create_new_file(&root.join("init.luau"), DEFAULT_INIT)?;
-    let module = format!(
-        "local bindings = {{}}\n\nfunction bindings.setup()\n{}\nend\n\nreturn bindings\n",
-        indent(DEFAULT_BINDINGS, "    ")
-    );
-    create_new_file(&root.join("bindings.luau"), &module)
-}
-
-/// Create a file atomically with respect to concurrent first runs.
-///
-/// `create_new` is the point of this helper. `fs::write` would silently
-/// replace a configuration file the user had already edited.
-fn create_new_file(path: &Path, contents: &str) -> io::Result<()> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => file.write_all(contents.as_bytes()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Indent non-empty source lines for a generated Luau function body.
-fn indent(source: &str, prefix: &str) -> String {
-    source
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}{line}")
-            }
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .user_config(home, DEFAULT_CONFIG)
+        .build()
 }
 
-/// Install the application palette and per-element styles.
-fn install_styles(canopy: &mut Canopy) {
-    *canopy.style_mut() = palette::canopy_dark();
-    canopy
-        .style_mut()
-        .rules()
-        .fg("hello/greeting", palette::ACCENT)
-        .style(
-            "hello/status",
-            StyleBuilder::new().fg(palette::SUBTEXT).bg(palette::PANEL),
-        )
-        .apply();
+/// Install the per-element styles from the active palette.
+fn install_styles(palette: &Palette, rules: StyleRules<'_>) {
+    rules.fg("hello/greeting", palette.accent).apply();
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use canopy::{geom::Size, testing::harness::Harness};
     use tempfile::tempdir;
 
@@ -196,6 +130,7 @@ mod tests {
         harness.render()?;
         assert!(harness.tbuf().contains_text("Hello, Canopy!"));
         assert!(harness.tbuf().contains_text("count: 0"));
+        assert!(harness.tbuf().contains_text("ctrl+g: help"));
         assert!(
             harness
                 .canopy
@@ -206,37 +141,23 @@ mod tests {
     }
 
     #[test]
-    fn first_run_config_preserves_existing_bindings() -> anyhow::Result<()> {
+    fn a_written_home_loads_the_default_bindings() -> anyhow::Result<()> {
         let directory = tempdir()?;
-        ensure_user_config(directory.path())?;
-        let bindings = directory.path().join("bindings.luau");
-        fs::write(&bindings, "return { setup = function() end }")?;
-        ensure_user_config(directory.path())?;
-        assert_eq!(
-            fs::read_to_string(bindings)?,
-            "return { setup = function() end }"
-        );
-        assert!(fs::read_to_string(directory.path().join("init.luau"))?.contains("setup"));
-        Ok(())
-    }
-
-    #[test]
-    fn persistent_user_root_loads_default_bindings() -> anyhow::Result<()> {
-        let directory = tempdir()?;
-        ensure_user_config(directory.path())?;
-        let canopy = create_app(Some(directory.path().to_path_buf()))?;
+        let home = ConfigHome::new(directory.path());
+        assert!(home.write_defaults(DEFAULT_CONFIG)?);
+        let canopy = create_app(Some(&home))?;
         let mut harness = Harness::from_canopy(canopy, Size::new(40, 6))?;
         harness.render()?;
         harness.script(
             r#"
             canopy.send_key("+")
-            canopy.flush()
+            canopy.prepare()
             canopy.assert(
                 canopy.screen_text():find("count: 1") ~= nil,
                 "the user + binding should run the command"
             )
             canopy.send_key("-")
-            canopy.flush()
+            canopy.prepare()
             canopy.assert(
                 canopy.screen_text():find("count: 0") ~= nil,
                 "the user - binding should run the command"

@@ -1,14 +1,16 @@
 use canopy::{
-    Context, EventOutcome, NodeId, NodeName, Render, ViewContext, Widget, derive_commands,
+    Context, EventOutcome, NodeId, NodeName, ViewContext, Widget,
     error::Result,
-    event::Event,
-    geom::{self, Rect},
-    layout::{Edges, Layout},
+    geom,
+    geom::Rect,
+    input::Event,
+    layout::{Edges, Layout, ScrollAxis},
+    render::Render,
+    text,
 };
-use unicode_width::UnicodeWidthStr;
 
-use super::boxed::{BoxGlyphs, ROUND};
-use crate::scrollbar::{Axis, Scrollbar, ScrollbarGlyphs, THIN, edge_track, scroll_target};
+use super::border::BoxGlyphs;
+use crate::scrollbar::{Scrollbar, ScrollbarGlyphs, edge_track, scroll_target};
 
 /// A frame around an element with an optional title and scroll positions.
 ///
@@ -32,15 +34,14 @@ pub struct Frame {
     horizontal: Scrollbar,
 }
 
-#[derive_commands]
 impl Frame {
     /// Construct a frame.
     pub fn new() -> Self {
-        let (vertical, horizontal) = Self::scrollbars(THIN);
+        let (vertical, horizontal) = Self::scrollbars(ScrollbarGlyphs::THIN);
         Self {
-            box_glyphs: ROUND,
+            box_glyphs: BoxGlyphs::ROUND,
             title: None,
-            scrollbar_glyphs: THIN,
+            scrollbar_glyphs: ScrollbarGlyphs::THIN,
             vertical,
             horizontal,
         }
@@ -50,6 +51,7 @@ impl Frame {
     ///
     /// Rebuilding the thumbs drops a drag in progress, so configure glyphs
     /// before mounting.
+    #[must_use]
     pub fn with_scrollbar_glyphs(mut self, glyphs: ScrollbarGlyphs) -> Self {
         self.scrollbar_glyphs = glyphs;
         (self.vertical, self.horizontal) = Self::scrollbars(glyphs);
@@ -66,18 +68,15 @@ impl Frame {
         )
     }
 
-    /// Return the scrollbar glyphs this frame draws with.
-    pub fn scrollbar_glyphs(&self) -> ScrollbarGlyphs {
-        self.scrollbar_glyphs
-    }
-
     /// Build a frame with a specified glyph set.
+    #[must_use]
     pub fn with_glyphs(mut self, glyphs: BoxGlyphs) -> Self {
         self.box_glyphs = glyphs;
         self
     }
 
     /// Build a frame with a specified title.
+    #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
@@ -89,15 +88,15 @@ impl Frame {
     }
 
     /// Return the border track on one axis and the node it scrolls.
-    fn track(ctx: &dyn ViewContext, axis: Axis) -> Result<Option<(NodeId, Rect)>> {
+    fn track(ctx: &dyn ViewContext, axis: ScrollAxis) -> Result<Option<(NodeId, Rect)>> {
         let frame = ctx.node_id();
         let Some(target) = scroll_target(ctx, frame, axis)? else {
             return Ok(None);
         };
         let border = geom::FrameRects::new(ctx.view().outer_rect_local(), 1);
         let edge = match axis {
-            Axis::Vertical => border.right,
-            Axis::Horizontal => border.bottom,
+            ScrollAxis::Vertical => border.right,
+            ScrollAxis::Horizontal => border.bottom,
         };
         Ok(edge_track(ctx, &target, frame, axis, edge).map(|track| (target.node, track)))
     }
@@ -113,7 +112,7 @@ impl Widget for Frame {
     fn render(&mut self, rndr: &mut Render, ctx: &dyn ViewContext) -> Result<()> {
         let outer = ctx.view().outer_rect_local();
         let f = geom::FrameRects::new(outer, 1);
-        let style = if ctx.is_on_focus_path() {
+        let style = if ctx.is_on_focus_path(ctx.node_id()) {
             "frame/focused"
         } else {
             "frame"
@@ -126,21 +125,17 @@ impl Widget for Frame {
             && f.top.h > 0
         {
             let title_with_spaces = format!(" {title} ");
-            let title_len = UnicodeWidthStr::width(title_with_spaces.as_str());
+            let title_len = text::width(&title_with_spaces);
 
             let title_line = f.top.line(0)?;
-            let title_rect = geom::Rect::new(
-                title_line.tl.x,
-                title_line.tl.y,
-                title_len.min(f.top.w as usize) as u32,
-                1,
-            );
+            let title_rect =
+                geom::Rect::new(title_line.tl.x, title_line.tl.y, title_len.min(f.top.w), 1);
             rndr.text("frame/title", title_rect.line(0)?, &title_with_spaces)?;
         }
 
-        let vertical = Self::track(ctx, Axis::Vertical)?;
+        let vertical = Self::track(ctx, ScrollAxis::Vertical)?;
         self.vertical.render(rndr, ctx, vertical.as_slice())?;
-        let horizontal = Self::track(ctx, Axis::Horizontal)?;
+        let horizontal = Self::track(ctx, ScrollAxis::Horizontal)?;
         self.horizontal.render(rndr, ctx, horizontal.as_slice())
     }
 
@@ -148,7 +143,7 @@ impl Widget for Frame {
         let Event::Mouse(mouse) = event else {
             return Ok(EventOutcome::Ignore);
         };
-        let vertical = Self::track(ctx, Axis::Vertical)?;
+        let vertical = Self::track(ctx, ScrollAxis::Vertical)?;
         if self
             .vertical
             .handle_mouse(ctx, mouse, vertical.as_slice())?
@@ -156,7 +151,7 @@ impl Widget for Frame {
         {
             return Ok(EventOutcome::Handle);
         }
-        let horizontal = Self::track(ctx, Axis::Horizontal)?;
+        let horizontal = Self::track(ctx, ScrollAxis::Horizontal)?;
         self.horizontal
             .handle_mouse(ctx, mouse, horizontal.as_slice())
     }
